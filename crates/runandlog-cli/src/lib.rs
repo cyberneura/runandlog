@@ -1,6 +1,7 @@
-//! Run and Log の CLI / TUI 本体。
+//! The Run and Log CLI / TUI itself.
 //!
-//! バイナリからも結合テストからも使えるよう、実体はライブラリ側に置いている。
+//! The implementation lives in the library so that both the binary and the
+//! integration tests can use it.
 
 pub mod session;
 pub mod tui;

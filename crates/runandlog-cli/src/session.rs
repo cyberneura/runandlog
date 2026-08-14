@@ -1,4 +1,5 @@
-//! Markdown ファイルと実行状態をまとめて扱う。TUI と非対話実行の共通経路。
+//! Holds a Markdown file together with its run state. Shared by the TUI and
+//! non-interactive runs.
 
 use std::io;
 use std::io::Write;
@@ -8,7 +9,7 @@ use runandlog_core::{
     Document, ExecOptions, ExecOutcome, RenderContext, render_result, run, splice,
 };
 
-/// 対象の Markdown ファイル 1 つ分の状態。
+/// State for a single Markdown file.
 pub struct Session {
     path: PathBuf,
     doc: Document,
@@ -17,10 +18,10 @@ pub struct Session {
 }
 
 impl Session {
-    /// ファイルを読み込む。
+    /// Loads the file.
     pub fn load(path: &Path, exec: ExecOptions, max_inline_lines: usize) -> io::Result<Session> {
-        // シンボリックリンクを解決しておく。解決しないと、書き戻しの rename がリンクを
-        // 実ファイルで置き換えてしまう。
+        // Resolve symlinks up front. Without this, the rename used to write back
+        // would replace the link with a regular file.
         let path = path.canonicalize()?;
         let text = std::fs::read_to_string(&path)?;
         let md_dir = path
@@ -51,7 +52,7 @@ impl Session {
         &self.doc
     }
 
-    /// セル数。
+    /// Number of cells.
     pub fn len(&self) -> usize {
         self.doc.cells.len()
     }
@@ -60,24 +61,26 @@ impl Session {
         self.doc.cells.is_empty()
     }
 
-    /// セルのコマンド。別スレッドで実行するために取り出す。
+    /// The command of a cell, taken out so it can be run on another thread.
     pub fn command_of(&self, index: usize) -> String {
         self.doc.cells[index].command.clone()
     }
 
-    /// 実行時の設定。別スレッドで実行するために取り出す。
+    /// The execution settings, taken out so a run can happen on another thread.
     pub fn exec_options(&self) -> ExecOptions {
         self.exec.clone()
     }
 
-    /// セルを実行し、結果を Markdown (と必要なら別ファイル) に書き戻す。
+    /// Runs a cell and writes the result back to the Markdown (and to a separate
+    /// file when needed).
     pub fn run_cell(&mut self, index: usize) -> io::Result<ExecOutcome> {
         let outcome = run(&self.doc.cells[index].command.clone(), &self.exec)?;
         self.apply_outcome(index, &outcome)?;
         Ok(outcome)
     }
 
-    /// 別スレッドで実行した結果を Markdown (と必要なら別ファイル) に書き戻す。
+    /// Writes back a result produced on another thread, to the Markdown (and to a
+    /// separate file when needed).
     pub fn apply_outcome(&mut self, index: usize, outcome: &ExecOutcome) -> io::Result<()> {
         self.refresh_before_write()?;
         let cell = self.doc.cells[index].clone();
@@ -102,32 +105,33 @@ impl Session {
         Ok(())
     }
 
-    /// 書き込みの直前にファイルを読み直す。
+    /// Re-reads the file just before writing.
     ///
-    /// コマンドの実行中に外部エディタで編集されていることがある。実行前の内容で
-    /// 上書きするとその編集を黙って捨ててしまうため、読み直したうえで対象のセルが
-    /// 変わっていないことを確かめる。
+    /// An external editor may have modified it while the command was running.
+    /// Overwriting with the pre-run content would silently discard those edits, so
+    /// the file is re-read and the cells are checked to be unchanged.
     fn refresh_before_write(&mut self) -> io::Result<()> {
         let current = std::fs::read_to_string(&self.path)?;
         if current == self.doc.text {
             return Ok(());
         }
         let reparsed = Document::parse(&current);
-        // セルの並びが 1 つでも変わっていたら、結果を別のセルに書き込みかねないので諦める。
-        // 同じ内容のセルが前に挿入された場合、index の一致だけでは取り違えを防げない。
+        // Give up if the sequence of cells changed at all: the result could land on
+        // the wrong cell. Matching on index alone cannot catch an identical cell
+        // being inserted ahead of this one.
         let commands = |doc: &Document| -> Vec<String> {
             doc.cells.iter().map(|cell| cell.command.clone()).collect()
         };
         if commands(&reparsed) != commands(&self.doc) {
             return Err(io::Error::other(
-                "実行中に Markdown が書き換えられたため、結果を書き戻せませんでした。読み直してから再実行してください。",
+                "the Markdown changed while the command was running, so the result could not be written back; reload and run again",
             ));
         }
         self.doc = reparsed;
         Ok(())
     }
 
-    /// ファイルを読み直す。外部エディタでの編集を反映するため。
+    /// Re-reads the file, picking up edits made in an external editor.
     pub fn reload(&mut self) -> io::Result<()> {
         let text = std::fs::read_to_string(&self.path)?;
         self.doc = Document::parse(&text);
@@ -135,16 +139,18 @@ impl Session {
     }
 }
 
-/// 一時ファイルへ書いてから rename する。
+/// Writes to a temporary file and renames it into place.
 ///
-/// 実行中に中断されても、元の Markdown が半端な状態で残らないようにする。
+/// This keeps the original Markdown from being left half-written if the process
+/// is interrupted.
 fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "runandlog".to_string());
-    // 一時ファイルは必ず新規作成する (create_new)。既存のファイルやシンボリックリンクを
-    // 掴んで書き込まないようにするため。名前が衝突した場合は連番をずらして作り直す。
+    // The temporary file is always newly created (create_new) so that writing can
+    // never land on an existing file or symlink. On a name collision, the counter
+    // is bumped and creation is retried.
     let mut temp = PathBuf::new();
     let mut file = None;
     for attempt in 0..64 {
@@ -167,22 +173,23 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
         }
     }
     let Some(mut file) = file else {
-        return Err(io::Error::other("一時ファイルを作成できませんでした"));
+        return Err(io::Error::other("could not create a temporary file"));
     };
     file.write_all(contents.as_bytes())?;
     drop(file);
 
-    // 既存ファイルのパーミッションを引き継ぐ。rename は一時ファイルの属性で置き換えるため。
+    // Carry over the permissions of the existing file, since the rename replaces
+    // them with those of the temporary file.
     if let Ok(metadata) = std::fs::metadata(path) {
         std::fs::set_permissions(&temp, metadata.permissions())?;
     }
     std::fs::rename(&temp, path)
 }
 
-/// `target` が (シンボリックリンクを解決したうえで) `base` の配下に収まっているか。
+/// Whether `target` stays under `base` once symlinks are resolved.
 ///
-/// 途中のディレクトリがリンクだと、`..` を含まないパスでも外へ出られるため、
-/// 実際に存在する一番深い祖先まで解決してから比較する。
+/// A symlinked directory along the way lets even a path without `..` escape, so
+/// the deepest ancestor that actually exists is resolved before comparing.
 fn resolves_inside(base: &Path, target: &Path) -> io::Result<bool> {
     let base = base.canonicalize()?;
     let mut existing = target.to_path_buf();

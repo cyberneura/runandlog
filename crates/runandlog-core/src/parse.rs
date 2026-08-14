@@ -1,64 +1,68 @@
-//! Markdown からコマンドセルと既存の実行結果を取り出す。
+//! Extracts command cells and existing run results from Markdown.
 //!
-//! Markdown の完全なパーサーではなく、フェンスドコードブロックの走査に絞っている。
-//! 書き戻し時に原文をできるだけそのまま保つため、パース結果は文字列のバイトオフセットで
-//! 位置を保持し、編集は該当範囲の置換だけで行う。
+//! This is not a full Markdown parser; it only scans fenced code blocks.
+//! To keep the original text intact when writing results back, the parse result
+//! records positions as byte offsets into the source string, and edits are
+//! applied as plain range replacements.
 
-/// 実行結果ブロックの開始マーカー。
+/// Opening marker of a result block.
 ///
-/// 再実行時に前回の結果を確実に置き換えられるよう、結果は HTML コメントで挟む。
-/// HTML コメントは Markdown として妥当で、レンダリング時には表示されない。
+/// Results are wrapped in HTML comments so that a re-run can reliably locate and
+/// replace the previous result. HTML comments are valid Markdown and are not
+/// displayed when rendered.
 pub const BEGIN_MARKER: &str = "<!-- runandlog:begin -->";
-/// 実行結果ブロックの終了マーカー。
+/// Closing marker of a result block.
 pub const END_MARKER: &str = "<!-- runandlog:end -->";
 
 const BEGIN_MARKER_PREFIX: &str = "<!-- runandlog:begin";
 
-/// 実行対象とみなすコードフェンスの言語。
+/// Code fence languages treated as runnable cells.
 const SHELL_LANGS: [&str; 4] = ["shell", "sh", "bash", "zsh"];
 
-/// Markdown 中の 1 つのコマンドセル。
+/// A single command cell in a Markdown document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
-    /// 0 始まりのセル番号 (ドキュメント内の出現順)。
+    /// Zero-based cell index (order of appearance in the document).
     pub index: usize,
-    /// フェンスの言語 (`shell` 等)。
+    /// Fence language (`shell` and friends).
     pub lang: String,
-    /// フェンスの中身。複数行ある場合はまとめて 1 回のシェル起動で実行する。
+    /// Fence body. Multiple lines are run together in a single shell invocation.
     pub command: String,
-    /// 結果の書き出し先として明示指定されたファイル。Markdown ファイルからの相対パス。
+    /// File explicitly designated as the destination for the result.
+    /// Relative to the Markdown file.
     pub out_file: Option<String>,
-    /// 書き出し先が `Result:` 段落として本文に書かれているか。
+    /// Whether the destination is written in the body as a `Result:` paragraph.
     ///
-    /// 本文に既にリンクがあるなら、結果ブロックで同じリンクを繰り返さない。
+    /// When the body already carries the link, the result block does not repeat it.
     pub out_file_in_text: bool,
-    /// 開きフェンス行の先頭バイトオフセット。
+    /// Byte offset of the start of the opening fence line.
     pub fence_start: usize,
-    /// 閉じフェンス行の直後のバイトオフセット。
+    /// Byte offset just past the closing fence line.
     pub fence_end: usize,
-    /// 既存の結果ブロックの範囲 (開始マーカー行の先頭 .. 終了マーカー行の直後)。
+    /// Range of an existing result block
+    /// (start of the begin-marker line .. just past the end-marker line).
     pub result_span: Option<(usize, usize)>,
-    /// 結果ブロックが無い場合に挿入する位置。
+    /// Position to insert at when there is no result block yet.
     pub insert_at: usize,
 }
 
 impl Cell {
-    /// 1 始まりの表示用セル番号。
+    /// One-based cell number, for display.
     pub fn display_number(&self) -> usize {
         self.index + 1
     }
 }
 
-/// パース済みの Markdown ドキュメント。
+/// A parsed Markdown document.
 #[derive(Debug, Clone)]
 pub struct Document {
-    /// 原文。
+    /// The original text.
     pub text: String,
-    /// 見つかったコマンドセル。
+    /// The command cells that were found.
     pub cells: Vec<Cell>,
 }
 
-/// 文字列の一部を置き換える編集。
+/// An edit that replaces a slice of the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     pub start: usize,
@@ -67,7 +71,7 @@ pub struct Edit {
 }
 
 impl Document {
-    /// Markdown をパースする。
+    /// Parses Markdown.
     pub fn parse(text: &str) -> Document {
         let lines = split_lines(text);
         let mut cells = Vec::new();
@@ -111,7 +115,7 @@ impl Document {
         }
     }
 
-    /// 既存の結果ブロックの中身 (マーカー行を除いた部分) を返す。
+    /// Returns the body of an existing result block (without the marker lines).
     pub fn result_text(&self, cell: &Cell) -> Option<&str> {
         let (start, end) = cell.result_span?;
         let block = &self.text[start..end];
@@ -120,9 +124,10 @@ impl Document {
         Some(block[body_start..body_end.max(body_start)].trim_matches('\n'))
     }
 
-    /// 指定したセルの結果ブロックを `region` で置き換える (無ければ挿入する) 編集を作る。
+    /// Builds an edit that replaces the result block of `cell` with `region`,
+    /// inserting one if it does not exist yet.
     ///
-    /// `region` は終了マーカー行までを含み、末尾は改行で終わっていること。
+    /// `region` must include the end-marker line and must end with a newline.
     pub fn result_edit(&self, cell: &Cell, region: &str) -> Edit {
         match cell.result_span {
             Some((start, end)) => Edit {
@@ -134,12 +139,12 @@ impl Document {
                 let at = cell.insert_at;
                 let rest = &self.text[at..];
                 let mut replacement = String::new();
-                // 直前のブロックとの間に必ず空行を 1 つ入れる。
+                // Always keep exactly one blank line after the preceding block.
                 if !self.text[..at].ends_with("\n\n") {
                     replacement.push('\n');
                 }
                 replacement.push_str(region);
-                // 後続の本文と結果ブロックがくっつかないようにする。
+                // Keep the result block from running into the text that follows.
                 if !rest.is_empty() && !rest.starts_with('\n') {
                     replacement.push('\n');
                 }
@@ -153,7 +158,8 @@ impl Document {
     }
 }
 
-/// 複数の編集をまとめて適用する。範囲が重ならないことは呼び出し側の責任。
+/// Applies several edits at once. The caller is responsible for making sure the
+/// ranges do not overlap.
 pub fn splice(text: &str, mut edits: Vec<Edit>) -> String {
     edits.sort_by_key(|e| e.start);
     let mut out = String::with_capacity(text.len());
@@ -172,9 +178,9 @@ pub fn splice(text: &str, mut edits: Vec<Edit>) -> String {
 
 struct Line<'a> {
     text: &'a str,
-    /// 行頭のバイトオフセット。
+    /// Byte offset of the start of the line.
     start: usize,
-    /// 改行を含む行末のバイトオフセット。
+    /// Byte offset of the end of the line, including the newline.
     end: usize,
 }
 
@@ -220,7 +226,7 @@ fn open_fence(line: &str) -> Option<Fence> {
         return None;
     }
     let info = rest[len..].trim().to_string();
-    // バッククォートのフェンスでは info にバッククォートを含められない。
+    // A backtick fence cannot carry backticks in its info string.
     if ch == '`' && info.contains('`') {
         return None;
     }
@@ -246,9 +252,10 @@ struct FenceAttrs {
     out: Option<String>,
 }
 
-/// フェンスの info 文字列がシェルセルなら (言語, 属性) を返す。
+/// Returns (language, attributes) if the fence info string denotes a shell cell.
 ///
-/// 属性は言語に続けて `out=path` の形で書ける (例: ```` ```shell out=result.txt ````)。
+/// Attributes follow the language as `out=path`
+/// (for example ```` ```shell out=result.txt ````).
 fn shell_fence_info(info: &str) -> Option<(String, FenceAttrs)> {
     let mut tokens = tokenize_info(info);
     if tokens.is_empty() {
@@ -270,7 +277,7 @@ fn shell_fence_info(info: &str) -> Option<(String, FenceAttrs)> {
     Some((lang, attrs))
 }
 
-/// info 文字列を空白区切りで分割する。値はダブルクォートで囲める。
+/// Splits an info string on whitespace. Values may be wrapped in double quotes.
 fn tokenize_info(info: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -302,12 +309,13 @@ struct Trailer {
     insert_at: Option<usize>,
 }
 
-/// 閉じフェンスの後ろを読み、結果の書き出し先指定と既存の結果ブロックを拾う。
+/// Reads what follows the closing fence, picking up a designated output file and
+/// any existing result block.
 fn scan_trailer(text: &str, lines: &[Line<'_>], from: usize) -> Trailer {
     let mut trailer = Trailer::default();
     let mut i = skip_blank(lines, from);
 
-    // "Result:" 段落による書き出し先の事前指定。
+    // Output file designated up front by a "Result:" paragraph.
     if i < lines.len() && is_designation_head(lines[i].text) {
         let end = (i..lines.len())
             .find(|&j| lines[j].text.trim().is_empty())
@@ -318,7 +326,7 @@ fn scan_trailer(text: &str, lines: &[Line<'_>], from: usize) -> Trailer {
         i = skip_blank(lines, end);
     }
 
-    // 既存の結果ブロック。
+    // An existing result block.
     if i < lines.len()
         && lines[i].text.trim_start().starts_with(BEGIN_MARKER_PREFIX)
         && let Some(end) = find_end_marker(lines, i + 1)
@@ -328,10 +336,11 @@ fn scan_trailer(text: &str, lines: &[Line<'_>], from: usize) -> Trailer {
     trailer
 }
 
-/// 結果ブロックの終了マーカー行を探す。
+/// Finds the end-marker line of a result block.
 ///
-/// コマンドの出力自体が終了マーカーと同じ行を含むことがあるため、コードフェンスの中は読み飛ばす。
-/// 出力は必ずフェンスで囲んで書き込むので、これで取り違えを防げる。
+/// Command output can itself contain a line identical to the end marker, so the
+/// scan skips over code fences. Output is always written inside a fence, which
+/// is what makes this reliable.
 fn find_end_marker(lines: &[Line<'_>], from: usize) -> Option<usize> {
     let mut i = from;
     while i < lines.len() {
@@ -358,15 +367,18 @@ fn skip_blank(lines: &[Line<'_>], from: usize) -> usize {
     i
 }
 
+/// `結果:` is accepted alongside `Result:` because these documents are often
+/// written in Japanese; it is an accepted input spelling, not UI text.
 fn is_designation_head(line: &str) -> bool {
     let trimmed = line.trim_start().trim_start_matches(['*', '_', ' ']);
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("result:") || trimmed.starts_with("結果:")
 }
 
-/// 段落から最初のリンク先を取り出す。
+/// Extracts the first link target from a paragraph.
 ///
-/// `[名前](パス)` を基本とし、リンク先が省略された `[パス]` も許容する。
+/// `[label](path)` is the normal form; a bare `[path]` without a target is also
+/// accepted.
 fn extract_link_target(paragraph: &str) -> Option<String> {
     let open = paragraph.find('[')?;
     let close = paragraph[open..].find(']')? + open;
@@ -385,7 +397,7 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
     Some(label.to_string())
 }
 
-/// インデントされたフェンスの中身から、フェンスと同じだけの字下げを取り除く。
+/// Removes as much leading indentation from a fence body as the fence itself has.
 fn dedent(body: &str, indent: usize) -> String {
     if indent == 0 {
         return body.to_string();

@@ -1,26 +1,28 @@
-# 動作確認用のサンプル
+# Sample document
 
-`runandlog examples/exam.md` で開くと、下のコードブロックを選んで実行できる。
+Open this with `runandlog examples/exam.md` and you can pick and run the code
+blocks below.
 
-## 1 行のコマンド
+## A single-line command
 
 ```shell
 date
 ```
 
-## 複数行のコマンド
+## A multi-line command
 
-1 つのブロックにまとめて書いたコマンドは、1 回のシェル起動でまとめて実行される。
+Commands written together in one block are run together, in a single shell
+invocation.
 
 ```shell
 ls /opt
 ls /tmp
 ```
 
-## 結果を別ファイルに書き出す
+## Sending the result to a separate file
 
-出力の行数にかかわらず別ファイルへ書き出したい場合は、ブロックの直後に `Result:` 段落を置き、
-リンクで書き出し先を指定する。
+To write to a separate file regardless of how long the output is, put a
+`Result:` paragraph right after the block and give the destination as a link.
 
 ```shell
 seq 1 5
@@ -29,17 +31,18 @@ seq 1 5
 Result:
 [exam-seq-result.txt](exam-seq-result.txt)
 
-## フェンスの属性で指定する
+## Designating it with a fence attribute
 
-`Result:` 段落の代わりに、フェンスの情報文字列でも指定できる。
+The fence info string works too, instead of a `Result:` paragraph.
 
 ```shell out=exam-uname-result.txt
 uname -a
 ```
 
-## 出力が長い場合
+## When the output is long
 
-`--max-inline-lines` (既定 50) を超えた出力は、指定が無くても自動で別ファイルに書き出される。
+Output beyond `--max-inline-lines` (50 by default) goes to a separate file
+automatically, with no designation needed.
 
 ```shell
 seq 1 60

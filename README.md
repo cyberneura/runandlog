@@ -1,56 +1,58 @@
 # Run and Log
 
-Markdown に書かれたシェルコマンドを選んで実行し、実行結果をその Markdown に書き戻すツール。
+A tool that runs the shell commands written in a Markdown file and writes the
+results back into that same file.
 
-AI エージェントがユーザーにコマンドの実行を依頼し、ユーザーが実行し、エージェントが結果を確認する、
-というやりとりを 1 つのファイルの上で完結させるために作っている。IPython Notebook のように
-「コマンドのセル」と「その結果」が並んだ状態を、ただの Markdown として保つ。
+It exists for a loop that comes up constantly: an AI agent asks a person to run a
+command, the person runs it, and the agent reads the result. Run and Log keeps
+that exchange inside a single file. Like an IPython notebook, command cells and
+their results sit next to each other -- except the document stays plain Markdown.
 
-## インストール
+## Install
 
 ```shell
 cargo install --path crates/runandlog-cli
 ```
 
-`runandlog` バイナリが入る。
+This installs the `runandlog` binary.
 
-## 使い方
+## Usage
 
 ```shell
-runandlog exam.md              # TUI で開く
-runandlog exam.md --list       # セルの一覧を表示する
-runandlog exam.md --run 2      # 2 番目のセルだけ実行する (繰り返し指定可)
-runandlog exam.md --run-all    # 全セルを順に実行する
+runandlog exam.md              # open the TUI
+runandlog exam.md --list       # list the cells
+runandlog exam.md --run 2      # run only cell 2 (may be repeated)
+runandlog exam.md --run-all    # run every cell in order
 ```
 
-### オプション
+### Options
 
-| オプション | 既定値 | 説明 |
+| Option | Default | Description |
 |---|---|---|
-| `--max-inline-lines <N>` | 50 | 出力がこの行数を超えたら別ファイルに書き出す |
-| `--shell <PATH>` | 環境変数 `SHELL` | コマンドを渡すシェル |
-| `--cwd <DIR>` | Markdown のあるディレクトリ | コマンドの作業ディレクトリ |
-| `--timeout <SECONDS>` | 無制限 | 1 セルあたりの実行時間の上限。超えるとプロセスグループごと終了させる |
-| `--gui` | - | デスクトップアプリで開く (未実装) |
+| `--max-inline-lines <N>` | 50 | Write output to a separate file once it exceeds this many lines |
+| `--shell <PATH>` | `SHELL` environment variable | Shell the commands are handed to |
+| `--cwd <DIR>` | Directory of the Markdown file | Working directory for the commands |
+| `--timeout <SECONDS>` | unlimited | Time limit per cell. On expiry the whole process group is killed |
+| `--gui` | - | Open in the desktop app (not implemented yet) |
 
-### TUI のキー操作
+### TUI keys
 
-| キー | 動作 |
+| Key | Action |
 |---|---|
-| `j` / `k` (`↓` / `↑`) | セルの選択を移動する |
-| `Enter` / `r` | 選択中のセルを実行する |
-| `a` | 全セルを順に実行する |
-| `g` / `G` | 先頭 / 末尾のセルへ |
-| `PageUp` / `PageDown` | スクロール |
-| `R` | ファイルを読み直す |
-| `q` / `Esc` / `Ctrl-C` | 終了 (コマンドの実行中は、その完了を待ってから終了する) |
+| `j` / `k` (`↓` / `↑`) | Move the selection between cells |
+| `Enter` / `r` | Run the selected cell |
+| `a` | Run every cell in order |
+| `g` / `G` | Jump to the first / last cell |
+| `PageUp` / `PageDown` | Scroll |
+| `R` | Reload the file |
+| `q` / `Esc` / `Ctrl-C` | Quit (while a command is running, quitting waits for it to finish) |
 
-## Markdown の書き方
+## Writing the Markdown
 
-### 実行されるブロック
+### Blocks that get run
 
-情報文字列が `shell` / `sh` / `bash` / `zsh` のフェンスドコードブロックがセルになる。
-それ以外の言語のブロックは実行対象にならない。
+A fenced code block becomes a cell when its info string is `shell`, `sh`, `bash`,
+or `zsh`. Blocks in any other language are left alone.
 
 ````markdown
 ```shell
@@ -58,7 +60,7 @@ date
 ```
 ````
 
-1 つのブロックに複数行書いた場合は、まとめて 1 回のシェル起動で実行される。
+Several lines in one block are run together in a single shell invocation.
 
 ````markdown
 ```shell
@@ -67,9 +69,9 @@ ls /tmp
 ```
 ````
 
-### 実行結果
+### Results
 
-実行すると、ブロックの直後に結果ブロックが書き込まれる。
+Running a cell writes a result block directly after it.
 
 ````markdown
 ```shell
@@ -85,17 +87,21 @@ Fri Aug 14 09:53:32 JST 2026
 <!-- runandlog:end -->
 ````
 
-結果は HTML コメントのマーカーで挟む。Markdown として妥当で表示もされず、再実行のときに
-前回の結果を確実に置き換えられる。何度実行しても結果ブロックは 1 つだけ残る。
+The result is wrapped in HTML comment markers. They are valid Markdown, they do
+not show up when rendered, and they let a re-run replace the previous result
+reliably -- so no matter how many times a cell runs, exactly one result block
+remains.
 
-### 結果を別ファイルに書き出す
+### Sending the result to a separate file
 
-出力が `--max-inline-lines` (既定 50 行) を超えると、`<Markdown 名>-result-<セル番号>.txt` に
-書き出され、Markdown にはそのリンクだけが載る。
+Output longer than `--max-inline-lines` (50 by default) is written to
+`<markdown name>-result-<cell number>.txt`, and only a link to it goes into the
+Markdown.
 
-行数にかかわらず別ファイルにしたい場合は、書き出し先をあらかじめ指定できる。指定方法は 2 つある。
+To always use a separate file regardless of length, designate the destination up
+front. There are two ways to do it.
 
-ブロックの直後に `Result:` 段落を置き、リンクで書き出し先を書く方法:
+Put a `Result:` paragraph right after the block, with the destination as a link:
 
 ````markdown
 ```shell
@@ -106,7 +112,7 @@ Result:
 [date-command-result.txt](date-command-result.txt)
 ````
 
-フェンスの情報文字列に `out=` を書く方法:
+Or write `out=` in the fence info string:
 
 ````markdown
 ```shell out=date-command-result.txt
@@ -114,28 +120,30 @@ date
 ```
 ````
 
-書き出し先は Markdown のあるディレクトリの配下に限られる。絶対パスや `..` を含む指定は
-無視され、通常どおり (インラインまたは自動採番の別ファイルに) 書き出される。
+The destination must stay under the directory holding the Markdown file. An
+absolute path, or one containing `..`, is ignored and the output goes where it
+normally would (inline, or into an auto-numbered file).
 
-## 構成
+## Layout
 
-| クレート | 役割 |
+| Crate | Role |
 |---|---|
-| `crates/runandlog-core` | Markdown のパース、コマンドの実行、結果の整形。ファイル IO を持たない純粋なコア |
-| `crates/runandlog-cli` | `runandlog` バイナリ。CLI と TUI、ファイルの読み書き |
+| `crates/runandlog-core` | Markdown parsing, command execution, result formatting. A pure core with no file IO |
+| `crates/runandlog-cli` | The `runandlog` binary: CLI, TUI, and file IO |
 
-GUI (デスクトップアプリ) は今後 `runandlog-core` を共有する形で追加する。パース仕様が
-分岐しないよう、コアは必ず共有する。
+A GUI (desktop app) will be added later on top of the same `runandlog-core`. The
+core is always shared, so that the parsing rules cannot drift apart.
 
-## 開発
+## Development
 
 ```shell
-cargo test          # 全テスト
+cargo test          # all tests
 cargo clippy --all-targets
 cargo fmt --all
 ```
 
-`examples/exam.md` が動作確認用のサンプル。**実行すると書き換わる**ので、コピーして試すこと。
+`examples/exam.md` is a sample for trying things out. **Running it rewrites the
+file**, so work on a copy.
 
 ```shell
 cp examples/exam.md /tmp/exam.md

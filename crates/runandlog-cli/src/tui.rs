@@ -1,4 +1,4 @@
-//! ターミナル UI。セルを選んで実行し、結果をその場で確認する。
+//! Terminal UI. Pick a cell, run it, and read the result in place.
 
 use std::io;
 use std::sync::mpsc;
@@ -15,15 +15,15 @@ use runandlog_core::ExecOutcome;
 
 use crate::session::Session;
 
-// 実行と描画の往復は端末が必要で自動テストでは検証できないため、テストは
-// runandlog-core (パース・実行・整形) と session (書き戻し) 側に置いている。
+// The run/draw loop needs a terminal and cannot be covered by automated tests, so
+// the tests live in runandlog-core (parse, exec, render) and in session (write-back).
 
-/// 入力待ちと画面更新の間隔。
+/// Interval between input polls and redraws.
 const TICK: Duration = Duration::from_millis(100);
 const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 const PAGE_LINES: usize = 10;
 
-/// TUI を開く。
+/// Opens the TUI.
 pub fn run(session: Session) -> io::Result<()> {
     let terminal = ratatui::init();
     let result = App::new(session).run(terminal);
@@ -31,10 +31,10 @@ pub fn run(session: Session) -> io::Result<()> {
     result
 }
 
-/// 画面に描く行と、セルごとの行範囲。
+/// The lines to draw, plus the line range occupied by each cell.
 struct Rendered {
     lines: Vec<Line<'static>>,
-    /// セルごとの (開始行, 終端行)。終端は含まない。
+    /// (first line, one past the last line) for each cell.
     spans: Vec<(usize, usize)>,
 }
 
@@ -42,10 +42,10 @@ struct App {
     session: Session,
     selected: usize,
     scroll: usize,
-    /// 本文領域の高さ。スクロール位置の調整に使う。
+    /// Height of the body area. Used to adjust the scroll position.
     viewport: usize,
     status: String,
-    /// 実行中のセル (0 始まり) とスピナーの位相。
+    /// The cell being run (0-based) and the spinner phase.
     running: Option<(usize, usize)>,
     quit: bool,
 }
@@ -53,9 +53,9 @@ struct App {
 impl App {
     fn new(session: Session) -> App {
         let status = if session.is_empty() {
-            "実行できるセルがありません。q で終了します。".to_string()
+            "No runnable cells. Press q to quit.".to_string()
         } else {
-            "Enter/r: 実行  a: 全実行  j/k: 移動  R: 再読込  q: 終了".to_string()
+            "Enter/r: run  a: run all  j/k: move  R: reload  q: quit".to_string()
         };
         App {
             session,
@@ -95,7 +95,7 @@ impl App {
             ]);
             frame.render_widget(Paragraph::new(header), areas[0]);
 
-            // 上下のボーダー 2 行を除いた分が本文の高さ。
+            // The body height is what is left after the top and bottom borders.
             self.viewport = (areas[1].height.saturating_sub(2) as usize).max(1);
             self.adjust_scroll(&rendered);
 
@@ -106,7 +106,7 @@ impl App {
 
             let status = match self.running {
                 Some((index, phase)) => format!(
-                    "{} 実行中: セル {}",
+                    "{} running cell {}",
                     SPINNER[phase % SPINNER.len()],
                     index + 1
                 ),
@@ -123,7 +123,7 @@ impl App {
         Ok(())
     }
 
-    /// 画面に出す行を組み立てる。
+    /// Builds the lines to display.
     fn render_lines(&self) -> Rendered {
         let mut lines = Vec::new();
         let mut spans = Vec::new();
@@ -171,20 +171,20 @@ impl App {
 
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  shell / sh / bash / zsh のコードブロックが見つかりません。",
+                "  No shell / sh / bash / zsh code block found.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
         Rendered { lines, spans }
     }
 
-    /// 選択中のセルが画面外に出ないようにスクロール位置を寄せる。
+    /// Nudges the scroll position so the selected cell stays on screen.
     fn adjust_scroll(&mut self, rendered: &Rendered) {
         if let Some(&(start, end)) = rendered.spans.get(self.selected) {
             if start < self.scroll {
                 self.scroll = start;
             } else if end > self.scroll + self.viewport {
-                // セルが画面より高い場合は末尾ではなく先頭を優先する。
+                // For a cell taller than the viewport, prefer its top over its bottom.
                 self.scroll = end.saturating_sub(self.viewport).min(start);
             }
         }
@@ -250,13 +250,14 @@ impl App {
         match self.session.reload() {
             Ok(()) => {
                 self.selected = self.selected.min(self.session.len().saturating_sub(1));
-                self.status = "読み直しました。".to_string();
+                self.status = "Reloaded.".to_string();
             }
-            Err(error) => self.status = format!("読み直しに失敗しました: {error}"),
+            Err(error) => self.status = format!("Reload failed: {error}"),
         }
     }
 
-    /// 1 セルを実行する。実行はワーカースレッドに投げ、待っている間も画面を更新する。
+    /// Runs one cell. The run goes to a worker thread so the screen keeps
+    /// updating while it is in flight.
     fn execute(&mut self, index: usize, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let command = self.session.command_of(index);
         let options = self.session.exec_options();
@@ -270,20 +271,21 @@ impl App {
         match outcome {
             Ok(Ok(outcome)) => match self.session.apply_outcome(index, &outcome) {
                 Ok(()) => {
-                    self.status = format!("セル {} 完了 ({})", index + 1, outcome.status_text());
+                    self.status = format!("Cell {} done ({})", index + 1, outcome.status_text());
                 }
-                Err(error) => self.status = format!("結果の書き込みに失敗しました: {error}"),
+                Err(error) => self.status = format!("Writing the result failed: {error}"),
             },
-            Ok(Err(error)) => self.status = format!("実行に失敗しました: {error}"),
+            Ok(Err(error)) => self.status = format!("The run failed: {error}"),
             Err(error) => return Err(error),
         }
         Ok(())
     }
 
-    /// 実行中に押されたキーを処理する。
+    /// Handles keys pressed while a command is running.
     ///
-    /// 実行中のコマンドは止められないので、ここで受け付けるのは終了要求だけ。残りは捨てる。
-    /// 捨てないと、実行中に押したキーが完了後にまとめて効いてしまう。
+    /// A running command cannot be stopped, so only a quit request is honoured
+    /// here and everything else is discarded. Without discarding them, keys
+    /// pressed during the run would all fire at once once it finishes.
     fn drain_events_while_running(&mut self) -> io::Result<()> {
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()?
@@ -291,14 +293,14 @@ impl App {
                 && key.code == KeyCode::Char('c')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
-                // コマンドの完了を待ってから終了する (結果は書き戻される)。
+                // Quit after the command finishes; its result still gets written back.
                 self.quit = true;
             }
         }
         Ok(())
     }
 
-    /// 実行の完了を待つ。待っている間はスピナーを回して画面の更新を続ける。
+    /// Waits for the run to finish, spinning the spinner and redrawing meanwhile.
     fn wait_for(
         &mut self,
         index: usize,
@@ -316,7 +318,7 @@ impl App {
                     self.drain_events_while_running()?;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok(Err(io::Error::other("実行スレッドが異常終了しました")));
+                    return Ok(Err(io::Error::other("the worker thread died unexpectedly")));
                 }
             }
         }

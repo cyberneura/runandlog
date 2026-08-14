@@ -1,6 +1,6 @@
 [package]
 name = "runandlog-cli"
-description = "Markdown 内のシェルコマンドを実行して結果を書き戻す CLI / TUI"
+description = "CLI / TUI that runs the shell commands in a Markdown file and writes the results back"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

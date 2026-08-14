@@ -3,6 +3,15 @@
 Markdown 内のシェルコマンドを実行し、結果を同じ Markdown に書き戻すツール。
 仕様と使い方は README.md を参照。ここには開発上の判断と注意点だけを書く。
 
+## 言語の方針
+
+public リポジトリなので、**README・コードコメント・UI 文字列・エラーメッセージはすべて英語**で書く
+(CYBERNEURA-DEV-442 での指示)。**この CLAUDE.md だけは日本語**。エージェント向けの開発メモで、
+他リポジトリでも「ユーザー向け表示は英語、開発者向けドキュメントは日本語」で揃えているため。
+
+例外は `parse::is_designation_head` が受け付ける `結果:`。これは UI 出力ではなく
+**入力として許容する綴り**で、日本語で書かれた Markdown を読めるようにするために残している。
+
 ## 設計の要点
 
 - **コアは IO を持たない**。`runandlog-core` はパース (`parse`)・実行 (`exec`)・整形 (`render`)
@@ -21,6 +30,13 @@ Markdown 内のシェルコマンドを実行し、結果を同じ Markdown に�
   シェルだけを kill すると、シェルが起動したコマンドが走り続けたうえパイプも開いたままになり、
   出力の読み取りが終わらない。タイムアウト無しの場合はこの保護が効かないので、読み取りは
   `DRAIN_GRACE` で打ち切って読めた分を結果とする。
+- **spawn 後に `Command` を drop してパイプの書き込み端を手放す。** `Command` は
+  `stdout` / `stderr` に渡した書き込み端を保持し続けるので、drop しないと親側にコピーが残り、
+  子が終了しても読み取りスレッドに EOF が来ない。結果、**全実行が毎回 `DRAIN_GRACE` (300ms) を
+  待たされ、報告する実行時間もその分水増しされる**。回帰を防ぐテストが
+  `exec::tests::a_fast_command_does_not_wait_for_the_drain_grace`。
+- `ExecOutcome::duration` はプロセス終了時点で確定させる。drain の待ち時間はコマンドの
+  実行時間ではないので含めない。
 - 出力の取り込みには上限がある (`ExecOptions::max_output_bytes`、既定 8 MiB)。上限を超えても
   読み捨てるだけで読み取り自体は続ける。読むのをやめるとパイプが詰まってコマンドが止まる。
 - **`out=` や `Result:` で指定された書き出し先は信用しない。** Markdown の中身は AI エージェントが
@@ -43,7 +59,7 @@ Markdown 内のシェルコマンドを実行し、結果を同じ Markdown に�
 ## 検証
 
 ```shell
-cargo test                  # 46 件
+cargo test                  # 49 件
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
 ```

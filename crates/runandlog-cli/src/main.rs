@@ -1,4 +1,4 @@
-//! Run and Log の CLI / TUI エントリーポイント。
+//! Entry point of the Run and Log CLI / TUI.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,42 +9,43 @@ use runandlog_cli::session::Session;
 use runandlog_cli::tui;
 use runandlog_core::ExecOptions;
 
-/// Markdown に書かれたシェルコマンドを実行し、結果を同じ Markdown に書き戻す。
+/// Runs the shell commands written in a Markdown file and writes the results
+/// back into the same file.
 #[derive(Parser, Debug)]
 #[command(name = "runandlog", version, about, long_about = None)]
 struct Args {
-    /// 対象の Markdown ファイル。
+    /// The Markdown file to work on.
     file: PathBuf,
 
-    /// デスクトップアプリ (GUI) で開く。
+    /// Open in the desktop app (GUI).
     #[arg(short, long)]
     gui: bool,
 
-    /// セルの一覧を表示して終了する。
+    /// Print the list of cells and exit.
     #[arg(short, long)]
     list: bool,
 
-    /// 指定した番号のセルだけを実行する (1 始まり)。繰り返し指定できる。
+    /// Run only the cell with this number (1-based). May be repeated.
     #[arg(short, long, value_name = "N")]
     run: Vec<usize>,
 
-    /// すべてのセルを順に実行する。
+    /// Run every cell in order.
     #[arg(short = 'a', long)]
     run_all: bool,
 
-    /// 出力がこの行数を超えたら別ファイルに書き出す。
+    /// Write output to a separate file once it exceeds this many lines.
     #[arg(long, value_name = "N", default_value_t = 50)]
     max_inline_lines: usize,
 
-    /// コマンドを渡すシェル。既定は環境変数 SHELL。
+    /// Shell the commands are handed to. Defaults to the SHELL environment variable.
     #[arg(long, value_name = "PATH")]
     shell: Option<PathBuf>,
 
-    /// コマンドの作業ディレクトリ。既定は Markdown ファイルのあるディレクトリ。
+    /// Working directory for the commands. Defaults to the directory of the Markdown file.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// 1 セルあたりの実行時間の上限 (秒)。既定は無制限。
+    /// Time limit per cell, in seconds. Unlimited by default.
     #[arg(long, value_name = "SECONDS")]
     timeout: Option<u64>,
 }
@@ -62,9 +63,7 @@ fn main() -> ExitCode {
 
 fn dispatch(args: Args) -> std::io::Result<ExitCode> {
     if args.gui {
-        eprintln!(
-            "runandlog: GUI はまだ実装されていません。TUI で開くには --gui を外してください。"
-        );
+        eprintln!("runandlog: the GUI is not implemented yet. Drop --gui to open the TUI.");
         return Ok(ExitCode::from(2));
     }
 
@@ -113,7 +112,7 @@ fn exec_options(args: &Args) -> ExecOptions {
     options
 }
 
-/// 実行対象のセル番号 (0 始まり) を決める。空なら TUI を開く。
+/// Decides which cells to run, as 0-based indices. An empty result opens the TUI.
 fn targets(args: &Args, session: &Session) -> std::io::Result<Vec<usize>> {
     if args.run_all {
         return Ok((0..session.len()).collect());
@@ -122,7 +121,7 @@ fn targets(args: &Args, session: &Session) -> std::io::Result<Vec<usize>> {
     for number in &args.run {
         if *number == 0 || *number > session.len() {
             return Err(std::io::Error::other(format!(
-                "セル {number} は存在しません (セル数: {})",
+                "no such cell: {number} (the file has {} cells)",
                 session.len()
             )));
         }
@@ -133,7 +132,7 @@ fn targets(args: &Args, session: &Session) -> std::io::Result<Vec<usize>> {
 
 fn print_list(session: &Session) {
     if session.is_empty() {
-        println!("実行できるセルがありません: {}", session.path().display());
+        println!("no runnable cells in {}", session.path().display());
         return;
     }
     for cell in &session.doc().cells {

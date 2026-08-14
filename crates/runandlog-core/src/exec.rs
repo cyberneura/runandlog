@@ -1,7 +1,8 @@
-//! コマンドの実行。
+//! Command execution.
 //!
-//! stdout と stderr は 1 本のパイプにまとめて受け取る。順序を保ったまま 1 つのログとして
-//! Markdown に書き戻したいため、別々に読んで連結する方式は採らない。
+//! stdout and stderr are received through a single pipe. The goal is to write
+//! them back to Markdown as one log with the original interleaving preserved,
+//! so reading the two streams separately and concatenating them is not an option.
 
 use std::io::{Read, pipe};
 use std::path::PathBuf;
@@ -14,31 +15,35 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 
-/// 実行の待ち合わせ間隔。
+/// How often the child process is polled for completion.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// プロセス終了後、出力の読み取りスレッドを待つ猶予。
+/// Grace period to wait for the reader thread after the process exits.
 ///
-/// タイムアウト無しで起動されたバックグラウンドの孫プロセスがパイプを掴んだままだと
-/// EOF が来ないため、ここで打ち切って読めた分だけを結果とする。
+/// When a background grandchild process still holds the pipe -- which can happen
+/// with no timeout set -- EOF never arrives, so the read is cut off here and
+/// whatever was read becomes the result.
 const DRAIN_GRACE: Duration = Duration::from_millis(300);
-/// 取り込む出力の既定の上限。無限に出力し続けるコマンドでメモリを使い切らないための保険。
+/// Default cap on captured output. A safeguard against a command that keeps
+/// printing forever exhausting memory.
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-/// 実行時の設定。
+/// Execution settings.
 #[derive(Debug, Clone)]
 pub struct ExecOptions {
-    /// コマンドを渡すシェル。
+    /// Shell the command is handed to.
     pub shell: PathBuf,
-    /// 作業ディレクトリ。
+    /// Working directory.
     pub cwd: PathBuf,
-    /// 実行の打ち切り時間。`None` なら無制限。
+    /// Deadline for the run. `None` means no limit.
     pub timeout: Option<Duration>,
-    /// 取り込む出力の上限バイト数。超えた分は捨てて `truncated` を立てる。
+    /// Cap on captured output in bytes. Anything beyond it is discarded and
+    /// `truncated` is set.
     pub max_output_bytes: usize,
 }
 
 impl ExecOptions {
-    /// `cwd` を指定し、シェルは環境変数 `SHELL` (無ければ `/bin/sh`) を使う。
+    /// Takes `cwd` and uses the `SHELL` environment variable (falling back to
+    /// `/bin/sh`) as the shell.
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         let shell = std::env::var_os("SHELL")
             .map(PathBuf::from)
@@ -52,30 +57,30 @@ impl ExecOptions {
     }
 }
 
-/// 1 回の実行結果。
+/// The outcome of a single run.
 #[derive(Debug, Clone)]
 pub struct ExecOutcome {
-    /// 実行開始時刻 (ローカルタイム)。
+    /// When the run started (local time).
     pub started_at: DateTime<Local>,
-    /// 実行にかかった時間。
+    /// How long the run took.
     pub duration: Duration,
-    /// 終了コード。シグナルで終了した場合は `None`。
+    /// Exit code. `None` when the process was terminated by a signal.
     pub exit_code: Option<i32>,
-    /// stdout と stderr をまとめた出力。
+    /// stdout and stderr combined.
     pub output: String,
-    /// タイムアウトで打ち切ったか。
+    /// Whether the run was cut off by the timeout.
     pub timed_out: bool,
-    /// 出力が上限を超えて打ち切られたか。
+    /// Whether the output was truncated at the cap.
     pub truncated: bool,
 }
 
 impl ExecOutcome {
-    /// 成功したとみなせるか。
+    /// Whether the run counts as successful.
     pub fn is_success(&self) -> bool {
         !self.timed_out && self.exit_code == Some(0)
     }
 
-    /// 終了状態の短い説明。
+    /// A short description of how the run ended.
     pub fn status_text(&self) -> String {
         if self.timed_out {
             return "timeout".to_string();
@@ -87,15 +92,16 @@ impl ExecOutcome {
     }
 }
 
-/// `command` をシェル経由で実行する。
+/// Runs `command` through a shell.
 ///
-/// シェルの起動に失敗した場合だけ `Err` を返す。コマンド自体が失敗した場合は
-/// 終了コードを持つ `ExecOutcome` として返す。
+/// `Err` is returned only when the shell itself fails to start. A command that
+/// merely fails comes back as an `ExecOutcome` carrying its exit code.
 pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome> {
-    // 存在しないディレクトリのまま起動すると、シェルの起動失敗としか分からなくなる。
+    // Spawning in a directory that does not exist surfaces only as "the shell
+    // failed to start", which says nothing about the real cause.
     if !options.cwd.is_dir() {
         return Err(std::io::Error::other(format!(
-            "作業ディレクトリがありません: {}",
+            "working directory does not exist: {}",
             options.cwd.display()
         )));
     }
@@ -113,13 +119,19 @@ pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome>
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(writer_for_stderr);
-    // タイムアウト時にシェルの子孫までまとめて終了させるため、専用のプロセスグループに入れる。
+    // Put the shell in its own process group so a timeout can take down its
+    // descendants along with it.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut builder, 0);
     let child = builder.spawn()?;
+    // Drop the builder so the parent releases its copies of the pipe's write end.
+    // The child inherits its own; while the parent still holds one, the reader
+    // thread never reaches EOF and every run pays the full DRAIN_GRACE.
+    drop(builder);
 
-    // 読み取りスレッドは EOF まで読み続ける。孫プロセスがパイプを保持していると
-    // 終わらないため、結果はロック越しに共有し、本体は待たずに進めるようにする。
+    // The reader thread reads until EOF. It will not finish while a grandchild
+    // process holds the pipe, so the buffer is shared behind a lock and the main
+    // thread moves on without joining it.
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let truncated = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
@@ -137,7 +149,8 @@ pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome>
             let mut buffer = reader_buffer.lock().unwrap();
             let room = limit.saturating_sub(buffer.len());
             if room == 0 {
-                // 読み捨てる。読むのをやめるとパイプが詰まり、コマンドが止まってしまう。
+                // Discard it. Stopping the read would fill the pipe and stall
+                // the command.
                 reader_truncated.store(true, Ordering::Relaxed);
                 continue;
             }
@@ -166,17 +179,20 @@ pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome>
         }
         thread::sleep(POLL_INTERVAL);
     };
+    // Take the elapsed time here: waiting for the reader to drain is bookkeeping,
+    // not part of how long the command took.
+    let duration = start.elapsed();
 
     if drained_rx.recv_timeout(DRAIN_GRACE).is_err() {
-        // 孫プロセスがパイプを掴んだまま出力を続けている。読み取りスレッドが延々と
-        // 動き続けないよう、次に読めた時点で止まるように伝える。
+        // A grandchild is still holding the pipe and producing output. Tell the
+        // reader thread to stop at its next read so it does not run forever.
         stop.store(true, Ordering::Relaxed);
     }
     let output = String::from_utf8_lossy(&buffer.lock().unwrap()).to_string();
 
     Ok(ExecOutcome {
         started_at,
-        duration: start.elapsed(),
+        duration,
         exit_code,
         output,
         timed_out,
@@ -184,14 +200,15 @@ pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome>
     })
 }
 
-/// シェルとその子孫をまとめて終了させる。
+/// Terminates the shell together with all of its descendants.
 ///
-/// シェルだけを kill すると、シェルが起動したコマンドが実行を続け、パイプも開いたまま残る。
+/// Killing only the shell leaves the commands it started running, with the pipe
+/// still open.
 #[cfg(unix)]
 fn kill_process_group(child: &mut Child) {
-    // process_group(0) で起動しているので、プロセスグループ ID は子プロセスの PID と同じ。
+    // Spawned with process_group(0), so the process group id equals the child's pid.
     let pid = child.id() as i32;
-    // SAFETY: 自分が起動したプロセスグループにシグナルを送るだけ。
+    // SAFETY: this only signals a process group that we spawned ourselves.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
@@ -259,7 +276,38 @@ mod tests {
         let mut opts = options();
         opts.cwd = std::env::temp_dir().join("runandlog-no-such-dir");
         let error = run("pwd", &opts).unwrap_err();
-        assert!(error.to_string().contains("作業ディレクトリ"));
+        assert!(error.to_string().contains("working directory"));
+    }
+
+    #[test]
+    fn a_fast_command_does_not_wait_for_the_drain_grace() {
+        // The parent must release its copies of the pipe's write end after spawning.
+        // If it holds one, the reader never sees EOF and every run costs DRAIN_GRACE.
+        //
+        // This has to measure the wall clock around `run`, not `ExecOutcome::duration`:
+        // the latter is taken before the drain wait, so it stays small even when the
+        // bug is present.
+        //
+        // The threshold cannot be raised above DRAIN_GRACE without going blind --
+        // DRAIN_GRACE *is* the cost of the regression. What keeps this stable is the
+        // margin below it: with the write end released, a run takes single-digit
+        // milliseconds, so there are two orders of magnitude of headroom. The
+        // regression costs DRAIN_GRACE on *every* run, so taking the fastest of
+        // several attempts detects it just as well while letting a loaded machine
+        // lose individual runs to scheduling.
+        const ATTEMPTS: usize = 5;
+        let fastest = (0..ATTEMPTS)
+            .map(|_| {
+                let start = Instant::now();
+                run("echo quick", &options()).unwrap();
+                start.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            fastest < DRAIN_GRACE,
+            "the fastest of {ATTEMPTS} runs took {fastest:?}, at least the drain grace of {DRAIN_GRACE:?}"
+        );
     }
 
     #[test]
@@ -277,7 +325,7 @@ mod tests {
         let mut opts = options();
         opts.timeout = Some(Duration::from_millis(200));
         let start = Instant::now();
-        // 孫プロセスがパイプを掴んだままだと、シェルだけを kill しても EOF が来ない。
+        // While a grandchild holds the pipe, killing just the shell never yields EOF.
         let outcome = run("sleep 30 & wait", &opts).unwrap();
         assert!(outcome.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));

@@ -1,46 +1,48 @@
-//! 実行結果を Markdown へ書き戻す形に整形する。
+//! Formats a run result into the shape that gets written back to Markdown.
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::exec::ExecOutcome;
 use crate::parse::{BEGIN_MARKER, Cell, END_MARKER};
 
-/// 結果の整形に必要な文脈。
+/// The context needed to format a result.
 #[derive(Debug, Clone)]
 pub struct RenderContext {
-    /// Markdown ファイルのあるディレクトリ。別ファイルの書き出し先の基準になる。
+    /// Directory holding the Markdown file. Sidecar files are resolved against it.
     pub md_dir: PathBuf,
-    /// Markdown ファイル名から拡張子を除いたもの。自動採番のファイル名に使う。
+    /// Markdown file name without its extension. Used for auto-numbered file names.
     pub md_stem: String,
-    /// この行数を超えたら別ファイルに書き出す。
+    /// Output longer than this many lines goes to a separate file.
     pub max_inline_lines: usize,
 }
 
-/// 別ファイルへ書き出す内容。
+/// Content to be written to a separate file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sidecar {
-    /// 書き出し先の絶対パス (または `md_dir` からの相対パスを解決したもの)。
+    /// Absolute destination path (a path relative to `md_dir`, resolved).
     pub path: PathBuf,
-    /// Markdown に載せるリンク先 (`md_dir` からの相対パス)。
+    /// Link target placed in the Markdown (relative to `md_dir`).
     pub link: String,
-    /// ファイルの中身。
+    /// File content.
     pub contents: String,
 }
 
-/// 整形結果。
+/// The formatted result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultRender {
-    /// 結果ブロックの Markdown。開始マーカーから終了マーカーまでを含み、改行で終わる。
+    /// Markdown of the result block. Spans the begin marker through the end
+    /// marker and ends with a newline.
     pub markdown: String,
-    /// 別ファイルに書き出す場合の内容。
+    /// Content to write out when a separate file is used.
     pub sidecar: Option<Sidecar>,
 }
 
-/// 実行結果から結果ブロックを組み立てる。
+/// Builds a result block from a run outcome.
 ///
-/// `out_file_allowed` には、書き出し先を実際に解決した結果 (シンボリックリンクを含めて
-/// Markdown のディレクトリ配下に収まっているか) を呼び出し側から渡す。ここでの字句的な
-/// 検査と合わせて二重に確認する。
+/// The caller passes `out_file_allowed` after actually resolving the destination
+/// (checking that it stays under the Markdown directory, symlinks included).
+/// Together with the lexical check performed here, that gives two layers of
+/// validation.
 pub fn render_result(
     cell: &Cell,
     outcome: &ExecOutcome,
@@ -50,8 +52,8 @@ pub fn render_result(
     let output = normalize(&outcome.output);
     let line_count = count_lines(&output);
 
-    // Markdown の中身は信用できない入力なので、書き出し先が Markdown のディレクトリの外を
-    // 指している場合は指定ごと捨てる。任意のファイルを上書きさせないため。
+    // Markdown content is untrusted input, so a destination pointing outside the
+    // Markdown directory is dropped entirely. Otherwise it could overwrite any file.
     let designated = cell
         .out_file
         .as_deref()
@@ -61,10 +63,10 @@ pub fn render_result(
 
     let sidecar = sidecar_for(designated, ctx, cell, line_count, &output);
     let body = match &sidecar {
-        // 本文に既に書き出し先のリンクがある場合は、同じリンクを繰り返さない。
+        // When the body already carries the link, do not repeat it.
         Some(_) if cell.out_file_in_text && !rejected => None,
         Some(sidecar) => Some(format!("[{}]({})", sidecar.link, sidecar.link)),
-        None if output.is_empty() => Some("(出力なし)".to_string()),
+        None if output.is_empty() => Some("(no output)".to_string()),
         None => Some(fenced(&output)),
     };
 
@@ -82,7 +84,7 @@ fn sidecar_for(
     line_count: usize,
     output: &str,
 ) -> Option<Sidecar> {
-    // 書き出し先が明示されていれば、行数にかかわらずそちらへ書く。
+    // An explicitly designated destination wins regardless of line count.
     let link = match designated {
         Some(path) => path.to_string(),
         None if line_count > ctx.max_inline_lines => {
@@ -101,7 +103,7 @@ fn sidecar_for(
     })
 }
 
-/// 書き出し先が Markdown のあるディレクトリの配下に収まっているか。
+/// Whether the destination stays under the directory holding the Markdown file.
 fn is_inside_dir(link: &str) -> bool {
     let path = Path::new(link);
     path.is_relative()
@@ -118,23 +120,24 @@ fn summary_line(outcome: &ExecOutcome, line_count: usize, rejected_out_file: boo
         outcome.status_text()
     );
     if outcome.truncated {
-        summary.push_str(" 出力が上限を超えたため打ち切りました。");
+        summary.push_str(" Output exceeded the limit and was truncated.");
     }
     if rejected_out_file {
         summary.push_str(
-            " 書き出し先の指定は Markdown のあるディレクトリの外を指しているため無視しました。",
+            " The designated output file points outside the Markdown directory and was ignored.",
         );
     }
     summary
 }
 
-/// 出力を囲むフェンスを作る。
+/// Wraps the output in a code fence.
 ///
-/// 出力自体がバッククォートの並びを含む場合に閉じてしまわないよう、フェンスを長くする。
+/// The fence is lengthened so that a run of backticks inside the output cannot
+/// close it early.
 fn fenced(output: &str) -> String {
     let longest = output
         .lines()
-        // 行頭に空白があってもフェンスを閉じられるので、空白を除いてから数える。
+        // A fence can be closed even when indented, so strip leading spaces first.
         .map(|line| {
             line.trim_start_matches(' ')
                 .chars()
@@ -147,7 +150,7 @@ fn fenced(output: &str) -> String {
     format!("{fence}text\n{output}\n{fence}")
 }
 
-/// 末尾の余分な改行を落とす。行末の空白は出力の一部なので触らない。
+/// Drops trailing newlines. Trailing spaces are part of the output and are left alone.
 fn normalize(output: &str) -> String {
     output.trim_end_matches('\n').to_string()
 }
@@ -216,7 +219,7 @@ mod tests {
             &context(50),
             true,
         );
-        assert!(rendered.markdown.contains("(出力なし)"));
+        assert!(rendered.markdown.contains("(no output)"));
         assert!(rendered.sidecar.is_none());
     }
 
@@ -282,7 +285,7 @@ mod tests {
         let sidecar = rendered.sidecar.expect("sidecar");
         assert_eq!(sidecar.link, "date-command-result.txt");
         assert_eq!(sidecar.contents, "short\n");
-        // 本文の Result: 段落に既にリンクがあるので、結果ブロックには繰り返さない。
+        // The Result: paragraph already carries the link, so the result block omits it.
         assert!(!rendered.markdown.contains("date-command-result.txt"));
     }
 
@@ -298,7 +301,7 @@ mod tests {
         let md = "```shell out=../../etc/passwd\nid\n```\n";
         let rendered = render_result(&cell(md), &outcome("uid=0\n"), &context(50), true);
         assert!(rendered.sidecar.is_none());
-        assert!(rendered.markdown.contains("無視しました"));
+        assert!(rendered.markdown.contains("was ignored"));
         assert!(rendered.markdown.contains("```text\nuid=0\n```"));
     }
 
@@ -314,7 +317,7 @@ mod tests {
         let md = "```shell out=logs/id.txt\nid\n```\n";
         let rendered = render_result(&cell(md), &outcome("uid=0\n"), &context(50), false);
         assert!(rendered.sidecar.is_none());
-        assert!(rendered.markdown.contains("無視しました"));
+        assert!(rendered.markdown.contains("was ignored"));
     }
 
     #[test]
@@ -346,7 +349,7 @@ mod tests {
             &context(50),
             true,
         );
-        assert!(rendered.markdown.contains("打ち切りました"));
+        assert!(rendered.markdown.contains("was truncated"));
     }
 
     #[test]

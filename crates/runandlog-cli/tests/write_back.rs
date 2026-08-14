@@ -1,11 +1,11 @@
-//! Markdown への書き戻しを実ファイルで確認する。
+//! Verifies the write-back to Markdown against real files.
 
 use std::path::{Path, PathBuf};
 
 use runandlog_cli::session::Session;
 use runandlog_core::ExecOptions;
 
-/// テスト用の一時ディレクトリ。後始末までを持つ。
+/// A temporary directory for tests, including its own cleanup.
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -72,7 +72,7 @@ fn rerunning_replaces_the_previous_result_instead_of_appending() {
     assert_eq!(
         text.matches("hello").count(),
         2,
-        "コマンドと結果で 1 回ずつ"
+        "once in the command and once in the result"
     );
 }
 
@@ -136,15 +136,15 @@ fn an_external_edit_that_keeps_the_cell_is_preserved() {
     let path = dir.write("note.md", "```shell\necho hello\n```\n");
     let mut session = session(&path, 50);
 
-    // 実行中に人が本文を足した状況を作る。
+    // Simulate someone adding to the body while the command runs.
     dir.write(
         "note.md",
-        "# 追記された見出し\n\n```shell\necho hello\n```\n",
+        "# An appended heading\n\n```shell\necho hello\n```\n",
     );
     session.run_cell(0).unwrap();
 
     let text = dir.read("note.md");
-    assert!(text.contains("# 追記された見出し"));
+    assert!(text.contains("# An appended heading"));
     assert!(text.contains("```text\nhello\n```"));
 }
 
@@ -157,7 +157,11 @@ fn an_external_edit_that_changes_the_cell_is_reported_instead_of_overwritten() {
     dir.write("note.md", "```shell\necho something-else\n```\n");
     let error = session.run_cell(0).unwrap_err();
 
-    assert!(error.to_string().contains("書き換えられた"));
+    assert!(
+        error
+            .to_string()
+            .contains("changed while the command was running")
+    );
     assert_eq!(dir.read("note.md"), "```shell\necho something-else\n```\n");
 }
 

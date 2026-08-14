@@ -1,10 +1,11 @@
-//! Run and Log のコア機能。
+//! Core of Run and Log.
 //!
-//! Markdown からシェルコマンドのセルを取り出し (`parse`)、実行し (`exec`)、
-//! 実行結果を Markdown へ書き戻す形に整形する (`render`)。
+//! Extracts shell command cells from Markdown (`parse`), runs them (`exec`), and
+//! formats the outcome for writing back into the Markdown (`render`).
 //!
-//! ファイルの読み書きは意図的にこのクレートに持たせていない。TUI / GUI / 非対話実行の
-//! いずれも同じ純粋関数を使えるようにするため、IO は呼び出し側 (runandlog-cli 等) が行う。
+//! File IO is deliberately kept out of this crate. Callers such as runandlog-cli
+//! perform it, so that the TUI, a future GUI, and non-interactive runs can all
+//! share the same pure functions.
 
 pub mod exec;
 pub mod parse;
