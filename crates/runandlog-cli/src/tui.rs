@@ -350,7 +350,14 @@ impl App {
         let mut phase = 0;
         loop {
             match rx.recv_timeout(TICK) {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    // Drain here too. A cell that finishes inside one TICK would
+                    // otherwise return without ever looking at the terminal, so during
+                    // "run all" over fast cells a queued q / Esc / Ctrl-C would not be
+                    // seen until the whole batch had run.
+                    self.drain_events_while_running()?;
+                    return Ok(result);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     phase += 1;
                     self.running = Some((index, phase));

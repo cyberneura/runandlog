@@ -95,7 +95,23 @@ impl Session {
             }
             None => true,
         };
-        let rendered = render_result(&cell, outcome, &self.render, out_file_allowed);
+        let mut rendered = render_result(&cell, outcome, &self.render, out_file_allowed);
+
+        // The auto-numbered destination is generated rather than designated, so the
+        // check above never saw it. If something already occupies that name as a
+        // directory, write_atomically would fail on the rename and the result would
+        // be lost even though the command already ran. Fall back to inline output.
+        if rendered
+            .sidecar
+            .as_ref()
+            .is_some_and(|sidecar| sidecar.path.is_dir())
+        {
+            let inline = RenderContext {
+                max_inline_lines: usize::MAX,
+                ..self.render.clone()
+            };
+            rendered = render_result(&cell, outcome, &inline, false);
+        }
 
         if let Some(sidecar) = &rendered.sidecar {
             if let Some(parent) = sidecar.path.parent() {

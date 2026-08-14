@@ -385,7 +385,7 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
     let label = paragraph[open + 1..close].trim();
     let rest = paragraph[close + 1..].trim_start();
     if let Some(stripped) = rest.strip_prefix('(') {
-        let end = stripped.find(')')?;
+        let end = closing_paren(stripped)?;
         let target = stripped[..end].trim();
         if !target.is_empty() {
             return Some(undelimit(target));
@@ -395,6 +395,30 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
         return None;
     }
     Some(undelimit(label))
+}
+
+/// Finds the byte offset of the `)` that closes an inline link destination.
+///
+/// Parentheses inside a destination are allowed as long as they balance, so a file
+/// called `run(1).txt` must not be cut at its first `)` -- doing so would write the
+/// output to `run(1` while the rendered link still pointed at `run(1).txt`.
+fn closing_paren(rest: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (offset, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(offset),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Unwraps the `<...>` form of a link destination.
@@ -550,6 +574,20 @@ mod tests {
         let md = "```shell\ndate\n```\n\nResult:\n[x](a<b.txt)\n";
         let doc = Document::parse(md);
         assert_eq!(doc.cells[0].out_file.as_deref(), Some("a<b.txt"));
+    }
+
+    #[test]
+    fn reads_an_out_file_containing_balanced_parentheses() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](reports/run(1).txt)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("reports/run(1).txt"));
+    }
+
+    #[test]
+    fn stops_at_the_closing_paren_of_the_link() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](out.txt) and (more text)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("out.txt"));
     }
 
     #[test]

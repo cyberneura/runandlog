@@ -59,7 +59,7 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 ## 検証
 
 ```shell
-cargo test                  # 64 件
+cargo test                  # 68 件
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
 ```

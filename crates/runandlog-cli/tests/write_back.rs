@@ -289,6 +289,39 @@ fn a_result_link_written_in_the_angle_bracket_form_round_trips() {
 }
 
 #[test]
+fn a_generated_sidecar_name_taken_by_a_directory_falls_back_to_inline() {
+    let dir = TempDir::new("sidecar-dir");
+    let path = dir.write("note.md", "```shell\nseq 1 12\n```\n");
+    // Occupy the name the auto-numbered sidecar would take.
+    std::fs::create_dir(dir.0.join("note-result-1.txt")).unwrap();
+    let mut session = session(&path, 5);
+
+    // The command has already run at this point, so losing its output to a failed
+    // rename would be the worst outcome. It goes inline instead.
+    session.run_cell(0).unwrap();
+
+    assert!(dir.0.join("note-result-1.txt").is_dir());
+    let text = dir.read("note.md");
+    assert!(text.contains("```text\n1\n2\n"), "output landed inline");
+    assert!(!text.contains("[note-result-1.txt]"));
+}
+
+#[test]
+fn an_out_file_with_balanced_parentheses_round_trips() {
+    let dir = TempDir::new("parens");
+    let path = dir.write(
+        "note.md",
+        "```shell\necho parens\n```\n\nResult:\n[result](run(1).txt)\n",
+    );
+    let mut session = session(&path, 50);
+
+    session.run_cell(0).unwrap();
+
+    assert_eq!(dir.read("run(1).txt"), "parens\n");
+    assert!(!dir.0.join("run(1").exists());
+}
+
+#[test]
 fn a_failing_command_is_recorded_with_its_exit_code() {
     let dir = TempDir::new("failure");
     let path = dir.write("note.md", "```shell\necho boom 1>&2\nexit 7\n```\n");
