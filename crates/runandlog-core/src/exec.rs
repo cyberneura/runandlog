@@ -239,6 +239,11 @@ fn make_reads_interruptible(reader: &std::io::PipeReader) {
     }
 }
 
+/// Not implemented off unix, where this module is already only half-working: see
+/// the note on [`kill_process_group`]. A silent descendant therefore still parks the
+/// reader, leaking the thread and its pipe handle for as long as that descendant
+/// lives. Fixing it needs an overlapped/`WaitForMultipleObjects` read on Windows,
+/// which cannot be written blind -- there is no way to build or test it here.
 #[cfg(not(unix))]
 fn make_reads_interruptible(_reader: &std::io::PipeReader) {}
 
@@ -289,6 +294,15 @@ fn kill_process_group(child: &mut Child) {
     }
 }
 
+/// Off unix there is no process group to kill, so this can only reach the shell
+/// itself.
+///
+/// **Timeouts are therefore unreliable off unix**: the commands the shell started
+/// keep running, and because they inherit the pipe, its write end stays open. That
+/// is the same condition [`make_reads_interruptible`] cannot currently escape there.
+/// Unix is the only supported target today; Windows needs job objects here and an
+/// interruptible read there, and neither can be verified from this project's
+/// development environment.
 #[cfg(not(unix))]
 fn kill_process_group(child: &mut Child) {
     let _ = child.kill();

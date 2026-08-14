@@ -202,18 +202,37 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    let Some(mut file) = file else {
+    let Some(file) = file else {
         return Err(io::Error::other("could not create a temporary file"));
     };
+
+    // Once the temporary file exists, every path out of here has to remove it.
+    // Leaking it is not merely untidy: the callers now fall back rather than
+    // failing, so a repeatedly failing write would leave a temporary behind each
+    // time until all 64 candidate names are taken -- at which point writing a
+    // sidecar stops working even after whatever caused the failure is cleared.
+    let result = finish_atomic_write(file, &temp, path, contents);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn finish_atomic_write(
+    mut file: std::fs::File,
+    temp: &Path,
+    path: &Path,
+    contents: &str,
+) -> io::Result<()> {
     file.write_all(contents.as_bytes())?;
     drop(file);
 
     // Carry over the permissions of the existing file, since the rename replaces
     // them with those of the temporary file.
     if let Ok(metadata) = std::fs::metadata(path) {
-        std::fs::set_permissions(&temp, metadata.permissions())?;
+        std::fs::set_permissions(temp, metadata.permissions())?;
     }
-    std::fs::rename(&temp, path)
+    std::fs::rename(temp, path)
 }
 
 /// Resolves `target` as far as the filesystem allows.

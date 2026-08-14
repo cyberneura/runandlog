@@ -340,6 +340,32 @@ fn an_out_file_under_a_regular_file_falls_back_to_inline() {
 }
 
 #[test]
+fn a_repeatedly_failing_sidecar_write_leaves_no_temporary_files() {
+    let dir = TempDir::new("temp-cleanup");
+    let path = dir.write("note.md", "```shell\nseq 1 12\n```\n");
+    // Occupy the sidecar name with a directory so the rename fails every time.
+    std::fs::create_dir(dir.0.join("note-result-1.txt")).unwrap();
+    let mut session = session(&path, 5);
+
+    // Well past the 64 candidate names, to prove they are not being consumed.
+    for _ in 0..70 {
+        session.run_cell(0).unwrap();
+    }
+
+    let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files left behind: {leftovers:?}"
+    );
+    assert!(dir.read("note.md").contains("```text\n1\n2\n"));
+}
+
+#[test]
 fn a_failing_command_is_recorded_with_its_exit_code() {
     let dir = TempDir::new("failure");
     let path = dir.write("note.md", "```shell\necho boom 1>&2\nexit 7\n```\n");

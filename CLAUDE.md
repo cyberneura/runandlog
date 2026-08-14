@@ -49,6 +49,19 @@ public リポジトリなので、**README・コードコメント・UI 文字�
   `refresh_before_write` でファイルを読み直し、実行中の外部編集を握り潰さないようにしている。
 - TUI の実行はワーカースレッドに投げる。同期実行にすると長いコマンドで画面が固まる。
 
+## 既知の制約: unix 以外は未対応
+
+`exec` のプロセス管理は **unix でしか成立していない**。Windows では
+`kill_process_group` がプロセスグループを持てずシェルしか kill できないため
+**タイムアウトが効かず**、生き残った子孫がパイプを掴んだままになる。さらに
+`make_reads_interruptible` も no-op なので、その状態になると読み取りスレッドと
+パイプハンドルが子孫の寿命ぶんリークする (CYBERNEURA-DEV-442 の Codex レビューで
+指摘された)。
+
+直すには Windows 側で job object と overlapped read が要るが、**この開発環境では
+ビルドも検証もできない**ため手を付けていない。Windows を対象にするなら、まず
+その環境で検証できる CI を用意すること。
+
 ## 未実装 / 今後
 
 - **GUI (Tauri デスクトップアプリ)**。`--gui` は現在エラーを返すだけ。
@@ -59,7 +72,7 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 ## 検証
 
 ```shell
-cargo test                  # 75 件
+cargo test                  # 77 件
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
 ```

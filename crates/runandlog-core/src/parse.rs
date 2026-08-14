@@ -385,8 +385,8 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
     let label = paragraph[open + 1..close].trim();
     let rest = paragraph[close + 1..].trim_start();
     if let Some(stripped) = rest.strip_prefix('(') {
-        let end = closing_paren(stripped)?;
-        let target = split_destination(stripped[..end].trim());
+        let inner = stripped.trim_start();
+        let target = &inner[..destination_end(inner)?];
         if !target.is_empty() {
             return Some(undelimit(target));
         }
@@ -397,21 +397,21 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
     Some(undelimit(label))
 }
 
-/// Finds the byte offset of the `)` that closes an inline link destination.
+/// Finds the byte offset at which a link destination ends.
 ///
-/// Parentheses inside a destination are allowed as long as they balance, so a file
-/// called `run(1).txt` must not be cut at its first `)` -- doing so would write the
-/// output to `run(1` while the rendered link still pointed at `run(1).txt`.
-fn closing_paren(rest: &str) -> Option<usize> {
-    // Inside `<...>` a parenthesis is literal, so counting it would make the scan
-    // treat the link's own `)` as balancing input and miss the terminator entirely.
-    // The angle bracket form only counts when it opens the destination.
-    if rest.starts_with('<')
-        && let Some(end) = closing_angle(rest)
-    {
-        return rest[end..].find(')').map(|offset| end + offset);
+/// Only the destination is needed, so this deliberately does not try to locate the
+/// link's closing `)`. That matters because a destination can be followed by an
+/// optional title, and a title may contain anything at all -- `[result](out.txt
+/// "draft (")` would defeat any attempt to balance parentheses across the whole
+/// link.
+///
+/// An angle-bracketed destination ends at its `>`. A bare one ends at the first
+/// unescaped whitespace, or at the `)` that closes the link -- its own parentheses
+/// may nest, so `reports/run(1).txt` survives intact.
+fn destination_end(rest: &str) -> Option<usize> {
+    if rest.starts_with('<') {
+        return closing_angle(rest);
     }
-
     let mut depth = 0usize;
     let mut escaped = false;
     for (offset, ch) in rest.char_indices() {
@@ -424,37 +424,11 @@ fn closing_paren(rest: &str) -> Option<usize> {
             '(' => depth += 1,
             ')' if depth == 0 => return Some(offset),
             ')' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => return Some(offset),
             _ => {}
         }
     }
     None
-}
-
-/// Takes just the destination from the inside of a link, dropping any title.
-///
-/// `[result](out.txt "captured output")` designates the file `out.txt`; treating the
-/// whole slice as the name would write to `out.txt "captured output"` while the
-/// rendered link still pointed at `out.txt`. A bare destination therefore ends at
-/// the first unescaped whitespace, and an angle-bracketed one at its `>`.
-fn split_destination(inner: &str) -> &str {
-    if inner.starts_with('<')
-        && let Some(end) = closing_angle(inner)
-    {
-        return &inner[..end];
-    }
-    let mut escaped = false;
-    for (offset, ch) in inner.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            c if c.is_whitespace() => return &inner[..offset],
-            _ => {}
-        }
-    }
-    inner
 }
 
 /// Finds the byte offset just past the `>` that closes an angle bracket destination.
@@ -685,6 +659,13 @@ mod tests {
         let md = "```shell\ndate\n```\n\nResult:\n[result](<a b.txt> \"title\")\n";
         let doc = Document::parse(md);
         assert_eq!(doc.cells[0].out_file.as_deref(), Some("a b.txt"));
+    }
+
+    #[test]
+    fn ignores_a_title_containing_an_unmatched_parenthesis() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](out.txt \"draft (\")\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("out.txt"));
     }
 
     #[test]
