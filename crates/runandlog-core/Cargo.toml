@@ -1,0 +1,14 @@
+[package]
+name = "runandlog-core"
+description = "Markdown 内のシェルコマンドを解析・実行し、結果を Markdown へ書き戻すコア機能"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# タイムアウト時にプロセスグループごと終了させるためだけに使う。
+libc = "0.2"
