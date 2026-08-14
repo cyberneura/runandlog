@@ -1,0 +1,14 @@
+[package]
+name = "runandlog-core"
+description = "Core of Run and Log: parses shell commands out of Markdown, runs them, and writes results back"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Used solely to kill the whole process group on timeout.
+libc = "0.2"

@@ -1,0 +1,16 @@
+[package]
+name = "runandlog-cli"
+description = "CLI / TUI that runs the shell commands in a Markdown file and writes the results back"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "runandlog"
+path = "src/main.rs"
+
+[dependencies]
+runandlog-core.workspace = true
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
