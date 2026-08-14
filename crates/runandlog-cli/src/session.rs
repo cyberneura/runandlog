@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use runandlog_core::{
-    Document, ExecOptions, ExecOutcome, RenderContext, render_result, run, splice,
+    Document, ExecOptions, ExecOutcome, RenderContext, Sidecar, render_result, run, splice,
 };
 
 /// State for a single Markdown file.
@@ -97,28 +97,27 @@ impl Session {
         };
         let mut rendered = render_result(&cell, outcome, &self.render, out_file_allowed);
 
-        // The auto-numbered destination is generated rather than designated, so the
-        // check above never saw it. If something already occupies that name as a
-        // directory, write_atomically would fail on the rename and the result would
-        // be lost even though the command already ran. Fall back to inline output.
-        if rendered
-            .sidecar
-            .as_ref()
-            .is_some_and(|sidecar| sidecar.path.is_dir())
-        {
+        // The command has already run by this point, so a sidecar that cannot be
+        // written must never cost us its output. Rather than enumerating the ways a
+        // path can be unusable -- the name taken by a directory, an ancestor that is
+        // a regular file, permissions -- just try it and fall back to inline on any
+        // failure. This also covers the auto-numbered destination, which is
+        // generated rather than designated and so never passed the check above.
+        let sidecar_failed = match rendered.sidecar.as_ref() {
+            Some(sidecar) => write_sidecar(sidecar).is_err(),
+            None => false,
+        };
+        if sidecar_failed {
             let inline = RenderContext {
                 max_inline_lines: usize::MAX,
                 ..self.render.clone()
             };
             rendered = render_result(&cell, outcome, &inline, false);
+            // Falling back cannot itself need a sidecar, but if it somehow did, the
+            // output would be dropped silently. Assert the invariant instead.
+            debug_assert!(rendered.sidecar.is_none());
         }
 
-        if let Some(sidecar) = &rendered.sidecar {
-            if let Some(parent) = sidecar.path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            write_atomically(&sidecar.path, &sidecar.contents)?;
-        }
         let updated = splice(
             &self.doc.text,
             vec![self.doc.result_edit(&cell, &rendered.markdown)],
@@ -160,6 +159,14 @@ impl Session {
         self.doc = Document::parse(&text);
         Ok(())
     }
+}
+
+/// Writes a sidecar file, creating the directories leading to it.
+fn write_sidecar(sidecar: &Sidecar) -> io::Result<()> {
+    if let Some(parent) = sidecar.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_atomically(&sidecar.path, &sidecar.contents)
 }
 
 /// Writes to a temporary file and renames it into place.

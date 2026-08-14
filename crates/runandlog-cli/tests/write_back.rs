@@ -322,6 +322,24 @@ fn an_out_file_with_balanced_parentheses_round_trips() {
 }
 
 #[test]
+fn an_out_file_under_a_regular_file_falls_back_to_inline() {
+    let dir = TempDir::new("file-ancestor");
+    // `logs` is a regular file, so create_dir_all for `logs/result.txt` must fail.
+    dir.write("logs", "not a directory\n");
+    let path = dir.write("note.md", "```shell out=logs/result.txt\necho nope\n```\n");
+    let mut session = session(&path, 50);
+
+    session.run_cell(0).unwrap();
+
+    assert_eq!(
+        dir.read("logs"),
+        "not a directory\n",
+        "the file was not clobbered"
+    );
+    assert!(dir.read("note.md").contains("```text\nnope\n```"));
+}
+
+#[test]
 fn a_failing_command_is_recorded_with_its_exit_code() {
     let dir = TempDir::new("failure");
     let path = dir.write("note.md", "```shell\necho boom 1>&2\nexit 7\n```\n");

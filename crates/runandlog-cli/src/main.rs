@@ -102,8 +102,14 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
 
 fn exec_options(args: &Args) -> ExecOptions {
     let cwd = args.cwd.clone().unwrap_or_else(|| {
-        args.file
-            .parent()
+        // Resolve first: Session::load canonicalizes the document, so with a symlink
+        // argument the directory "containing the Markdown file" is the one holding
+        // the real file, not the one holding the link.
+        let file = args
+            .file
+            .canonicalize()
+            .unwrap_or_else(|_| args.file.clone());
+        file.parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))

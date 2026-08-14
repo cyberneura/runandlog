@@ -386,7 +386,7 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
     let rest = paragraph[close + 1..].trim_start();
     if let Some(stripped) = rest.strip_prefix('(') {
         let end = closing_paren(stripped)?;
-        let target = stripped[..end].trim();
+        let target = split_destination(stripped[..end].trim());
         if !target.is_empty() {
             return Some(undelimit(target));
         }
@@ -428,6 +428,33 @@ fn closing_paren(rest: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Takes just the destination from the inside of a link, dropping any title.
+///
+/// `[result](out.txt "captured output")` designates the file `out.txt`; treating the
+/// whole slice as the name would write to `out.txt "captured output"` while the
+/// rendered link still pointed at `out.txt`. A bare destination therefore ends at
+/// the first unescaped whitespace, and an angle-bracketed one at its `>`.
+fn split_destination(inner: &str) -> &str {
+    if inner.starts_with('<')
+        && let Some(end) = closing_angle(inner)
+    {
+        return &inner[..end];
+    }
+    let mut escaped = false;
+    for (offset, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            c if c.is_whitespace() => return &inner[..offset],
+            _ => {}
+        }
+    }
+    inner
 }
 
 /// Finds the byte offset just past the `>` that closes an angle bracket destination.
@@ -644,6 +671,20 @@ mod tests {
         let md = "```shell\ndate\n```\n\nResult:\n[result](a\\b.txt)\n";
         let doc = Document::parse(md);
         assert_eq!(doc.cells[0].out_file.as_deref(), Some("a\\b.txt"));
+    }
+
+    #[test]
+    fn ignores_a_link_title_after_the_destination() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](out.txt \"captured output\")\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("out.txt"));
+    }
+
+    #[test]
+    fn ignores_a_link_title_after_an_angle_bracketed_destination() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](<a b.txt> \"title\")\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("a b.txt"));
     }
 
     #[test]
