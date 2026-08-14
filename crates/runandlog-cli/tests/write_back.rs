@@ -194,6 +194,53 @@ fn an_out_file_reached_through_a_symlinked_directory_is_ignored() {
 }
 
 #[test]
+fn an_out_file_that_is_an_existing_directory_is_ignored() {
+    let dir = TempDir::new("dir-target");
+    std::fs::create_dir(dir.0.join("logs")).unwrap();
+    let path = dir.write("note.md", "```shell out=logs\necho nope\n```\n");
+    let mut session = session(&path, 50);
+
+    // Writing into a directory cannot work: the rename would fail and the result
+    // would be lost. The designation is ignored and the output stays inline.
+    session.run_cell(0).unwrap();
+
+    assert!(dir.0.join("logs").is_dir());
+    let text = dir.read("note.md");
+    assert!(text.contains("```text\nnope\n```"));
+    assert!(text.contains("was ignored"));
+}
+
+#[test]
+fn an_out_file_naming_the_markdown_directory_itself_is_ignored() {
+    let dir = TempDir::new("dot-target");
+    let path = dir.write("note.md", "```shell out=.\necho nope\n```\n");
+    let mut session = session(&path, 50);
+
+    session.run_cell(0).unwrap();
+
+    assert!(dir.read("note.md").contains("```text\nnope\n```"));
+}
+
+#[test]
+fn a_designated_out_file_with_spaces_gets_a_usable_link() {
+    let dir = TempDir::new("spaced");
+    let path = dir.write(
+        "note.md",
+        "```shell out=\"date result.txt\"\necho spaced\n```\n",
+    );
+    let mut session = session(&path, 50);
+
+    session.run_cell(0).unwrap();
+
+    assert_eq!(dir.read("date result.txt"), "spaced\n");
+    // A bare destination cannot contain spaces, so the angle bracket form is used.
+    assert!(
+        dir.read("note.md")
+            .contains("[date result.txt](<date result.txt>)")
+    );
+}
+
+#[test]
 fn a_failing_command_is_recorded_with_its_exit_code() {
     let dir = TempDir::new("failure");
     let path = dir.write("note.md", "```shell\necho boom 1>&2\nexit 7\n```\n");

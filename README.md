@@ -41,7 +41,7 @@ runandlog exam.md --run-all    # run every cell in order
 |---|---|
 | `j` / `k` (`↓` / `↑`) | Move the selection between cells |
 | `Enter` / `r` | Run the selected cell |
-| `a` | Run every cell in order |
+| `a` | Run every cell in order (stops if a result cannot be written back) |
 | `g` / `G` | Jump to the first / last cell |
 | `PageUp` / `PageDown` | Scroll |
 | `R` | Reload the file |
@@ -121,8 +121,12 @@ date
 ````
 
 The destination must stay under the directory holding the Markdown file. An
-absolute path, or one containing `..`, is ignored and the output goes where it
-normally would (inline, or into an auto-numbered file).
+absolute path, one containing `..`, and one naming a directory that already
+exists are all ignored, and the output goes where it normally would (inline, or
+into an auto-numbered file).
+
+A destination containing spaces is written as `[a b.txt](<a b.txt>)`, since a
+bare Markdown link target cannot contain them.
 
 ## Layout
 

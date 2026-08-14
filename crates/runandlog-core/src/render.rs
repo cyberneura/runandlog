@@ -65,7 +65,11 @@ pub fn render_result(
     let body = match &sidecar {
         // When the body already carries the link, do not repeat it.
         Some(_) if cell.out_file_in_text && !rejected => None,
-        Some(sidecar) => Some(format!("[{}]({})", sidecar.link, sidecar.link)),
+        Some(sidecar) => Some(format!(
+            "[{}]({})",
+            escape_link_label(&sidecar.link),
+            link_destination(&sidecar.link)
+        )),
         None if output.is_empty() => Some("(no output)".to_string()),
         None => Some(fenced(&output)),
     };
@@ -101,6 +105,49 @@ fn sidecar_for(
             format!("{output}\n")
         },
     })
+}
+
+/// Renders a file name as an inline-link destination.
+///
+/// A bare destination cannot contain spaces or control characters, and its
+/// parentheses have to balance -- a file called `date result.txt` would produce a
+/// link that no Markdown renderer resolves. Anything awkward goes in the angle
+/// bracket form instead, where only `<`, `>` and `\` need escaping.
+fn link_destination(link: &str) -> String {
+    let bare_is_fine = !link
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '(' | ')' | '<' | '>' | '\\'));
+    if bare_is_fine {
+        return link.to_string();
+    }
+    let mut escaped = String::with_capacity(link.len() + 2);
+    escaped.push('<');
+    for ch in link.chars() {
+        // A newline cannot appear inside an angle bracket destination at all, so it
+        // is replaced rather than escaped. File names containing one are pathological.
+        match ch {
+            '<' | '>' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            '\n' | '\r' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('>');
+    escaped
+}
+
+/// Escapes the characters that would end a link label early.
+fn escape_link_label(link: &str) -> String {
+    let mut escaped = String::with_capacity(link.len());
+    for ch in link.chars() {
+        if matches!(ch, '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// Whether the destination stays under the directory holding the Markdown file.
@@ -294,6 +341,57 @@ mod tests {
         let md = "```shell out=uname.txt\nuname -a\n```\n";
         let rendered = render_result(&cell(md), &outcome("Linux\n"), &context(50), true);
         assert!(rendered.markdown.contains("[uname.txt](uname.txt)"));
+    }
+
+    #[test]
+    fn wraps_a_link_destination_that_contains_spaces() {
+        let md = "```shell out=\"date result.txt\"\ndate\n```\n";
+        let rendered = render_result(&cell(md), &outcome("Fri\n"), &context(50), true);
+        // A bare destination cannot contain spaces, so the angle bracket form is used.
+        assert!(
+            rendered
+                .markdown
+                .contains("[date result.txt](<date result.txt>)")
+        );
+    }
+
+    #[test]
+    fn escapes_brackets_and_parentheses_in_a_link() {
+        let md = "```shell out=\"a[1](x).txt\"\ndate\n```\n";
+        let rendered = render_result(&cell(md), &outcome("Fri\n"), &context(50), true);
+        assert!(
+            rendered
+                .markdown
+                .contains("[a\\[1\\](x).txt](<a[1](x).txt>)")
+        );
+    }
+
+    #[test]
+    fn leaves_an_ordinary_link_destination_bare() {
+        let md = "```shell out=uname.txt\nuname -a\n```\n";
+        let rendered = render_result(&cell(md), &outcome("Linux\n"), &context(50), true);
+        assert!(rendered.markdown.contains("[uname.txt](uname.txt)"));
+    }
+
+    #[test]
+    fn wraps_an_auto_numbered_sidecar_link_when_the_stem_has_spaces() {
+        let long = (1..=51)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut ctx = context(50);
+        ctx.md_stem = "my note".to_string();
+        let rendered = render_result(
+            &cell("```shell\nseq 51\n```\n"),
+            &outcome(&long),
+            &ctx,
+            true,
+        );
+        assert!(
+            rendered
+                .markdown
+                .contains("[my note-result-1.txt](<my note-result-1.txt>)")
+        );
     }
 
     #[test]

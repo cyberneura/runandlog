@@ -31,6 +31,22 @@ pub fn run(session: Session) -> io::Result<()> {
     result
 }
 
+/// Whether a "run all" batch may go on to the next cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    Continue,
+    Stop,
+}
+
+/// Whether a key press means "quit".
+fn is_quit_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
 /// The lines to draw, plus the line range occupied by each cell.
 struct Rendered {
     lines: Vec<Line<'static>>,
@@ -204,9 +220,11 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        if is_quit_key(key) {
+            self.quit = true;
+            return Ok(());
+        }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.select(1),
             KeyCode::Char('k') | KeyCode::Up => self.select(-1),
             KeyCode::Char('g') | KeyCode::Home => {
@@ -230,7 +248,9 @@ impl App {
                         break;
                     }
                     self.selected = index;
-                    self.execute(index, terminal)?;
+                    if self.execute(index, terminal)? == Batch::Stop {
+                        break;
+                    }
                 }
             }
             _ => {}
@@ -258,7 +278,9 @@ impl App {
 
     /// Runs one cell. The run goes to a worker thread so the screen keeps
     /// updating while it is in flight.
-    fn execute(&mut self, index: usize, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    ///
+    /// The return value tells a "run all" batch whether it may continue.
+    fn execute(&mut self, index: usize, terminal: &mut DefaultTerminal) -> io::Result<Batch> {
         let command = self.session.command_of(index);
         let options = self.session.exec_options();
         let (tx, rx) = mpsc::channel();
@@ -273,12 +295,28 @@ impl App {
                 Ok(()) => {
                     self.status = format!("Cell {} done ({})", index + 1, outcome.status_text());
                 }
-                Err(error) => self.status = format!("Writing the result failed: {error}"),
+                Err(error) => {
+                    // The write was refused, which usually means the file changed
+                    // underneath us. Carrying on would run the *old* commands held in
+                    // memory -- including ones the file no longer contains -- so stop
+                    // the batch and pick the file back up from disk.
+                    self.status = format!("Writing the result failed: {error}");
+                    self.reload_after_conflict();
+                    return Ok(Batch::Stop);
+                }
             },
             Ok(Err(error)) => self.status = format!("The run failed: {error}"),
             Err(error) => return Err(error),
         }
-        Ok(())
+        Ok(Batch::Continue)
+    }
+
+    /// Re-reads the file after a refused write, keeping the status text that
+    /// explains why the write was refused.
+    fn reload_after_conflict(&mut self) {
+        if self.session.reload().is_ok() {
+            self.selected = self.selected.min(self.session.len().saturating_sub(1));
+        }
     }
 
     /// Handles keys pressed while a command is running.
@@ -286,12 +324,14 @@ impl App {
     /// A running command cannot be stopped, so only a quit request is honoured
     /// here and everything else is discarded. Without discarding them, keys
     /// pressed during the run would all fire at once once it finishes.
+    ///
+    /// The quit keys are the same ones the normal event loop takes, so that the
+    /// documented "q quits after the command finishes" holds while one is running.
     fn drain_events_while_running(&mut self) -> io::Result<()> {
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
-                && key.code == KeyCode::Char('c')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && is_quit_key(key)
             {
                 // Quit after the command finishes; its result still gets written back.
                 self.quit = true;
@@ -322,5 +362,28 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn recognises_the_documented_quit_keys() {
+        assert!(is_quit_key(key(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(is_quit_key(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(is_quit_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn a_plain_c_is_not_a_quit_key() {
+        assert!(!is_quit_key(key(KeyCode::Char('c'), KeyModifiers::NONE)));
+        assert!(!is_quit_key(key(KeyCode::Char('r'), KeyModifiers::NONE)));
+        assert!(!is_quit_key(key(KeyCode::Char('a'), KeyModifiers::NONE)));
     }
 }

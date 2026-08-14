@@ -85,7 +85,14 @@ impl Session {
         self.refresh_before_write()?;
         let cell = self.doc.cells[index].clone();
         let out_file_allowed = match &cell.out_file {
-            Some(link) => resolves_inside(&self.render.md_dir, &self.render.md_dir.join(link))?,
+            Some(link) => {
+                let target = self.render.md_dir.join(link);
+                // A destination that is already a directory (`out=logs`, `out=.`)
+                // cannot hold the output: the rename in write_atomically would fail
+                // and the result would be lost. Treat it like any other rejected
+                // designation so the output still lands inline.
+                !target.is_dir() && resolves_inside(&self.render.md_dir, &target)?
+            }
             None => true,
         };
         let rendered = render_result(&cell, outcome, &self.render, out_file_allowed);
