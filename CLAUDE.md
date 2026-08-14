@@ -62,17 +62,48 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 ビルドも検証もできない**ため手を付けていない。Windows を対象にするなら、まず
 その環境で検証できる CI を用意すること。
 
+## GUI (Tauri)
+
+`--gui` で Tauri のウインドウを開く (CYBERNEURA-DEV-445 で実装)。
+
+- **`runandlog-core` と `session` をそのまま使う。** パース・実行・書き戻しの経路は
+  TUI・非対話実行と完全に同じで、GUI 側には Markdown の仕様が一切無い。
+  ここを分岐させると仕様の追従が破綻するので、GUI 専用のパースを足さないこと。
+- **`gui` は cargo feature** (既定 ON)。Tauri はビルドに webkit2gtk / gtk3 を要求するため、
+  CLI / TUI だけが欲しい配布者は `--no-default-features` で外せる。外したビルドでも
+  `--gui` は受け付けて「この build に GUI は無い」と答える (clap の未知フラグにしない)。
+- **実行はブロッキングワーカーに投げる** (`tauri::async_runtime::spawn_blocking`)。
+  `runandlog_core::run` は完了までブロックするので、コマンドスレッドで直接呼ぶと
+  ウインドウがコマンドの実行時間ぶん固まる。TUI がワーカースレッドを使うのと同じ理由。
+- **`Session` のロックを `await` をまたいで持たない。** またぐと `MutexGuard` が Send でなく
+  コンパイルが通らないうえ、通ったとしても実行中ずっと画面の読み取りを止めてしまう。
+- **同時実行は 1 本に制限する** (`busy` フラグ)。同じファイルを 2 本が書き戻すと、
+  互いの書き込みを「外部編集」と見なして `refresh_before_write` が両方失敗する。
+- **reload も同じ `busy` フラグを取る** (Codex レビューで Critical として指摘)。
+  `apply_outcome` は「実行前に持っていた文書」と実際のファイルを比べて外部編集を検出するが、
+  実行中に reload するとその基準がディスクの現在値に差し替わり、**比較が通ってしまう**。
+  ガードが守ろうとしている当のものでガードが無効化され、古いコマンドの結果が
+  別のセルに書き戻されうる。回帰テストは `reloading_is_refused_while_a_command_is_running`。
+- **フロントは innerHTML を使わない。** コマンドとその出力は任意のテキストで、
+  HTML として流し込むとドキュメントがウインドウ内でスクリプトを実行できてしまう。
+  `textContent` と DOM 生成だけで組む。
+- ウインドウは `tauri.conf.json`、フロントの実体は `crates/runandlog-cli/ui/`
+  (素の HTML / CSS / JS。node のビルド工程を持たないので `withGlobalTauri` を有効にしている)。
+
+**ヘッドレスなのでウインドウの目視確認はできない。** ビルドと `cargo test` は通るので、
+検証はそこまで。実機で開く確認は動作確認できる環境で行うこと。
+
 ## 未実装 / 今後
 
-- **GUI (Tauri デスクトップアプリ)**。`--gui` は現在エラーを返すだけ。
-  作る場合も `runandlog-core` を必ず共有すること (パース仕様の分岐を避けるため)。
-  なお Bot (Amedeo) の実行環境には webkit2gtk / gtk3 が無く Tauri をビルドできないため、
-  GUI の実装は動作確認ができる環境で行う必要がある。
+- GUI からの実行キャンセル (Stop ボタン)。`exec` の `stop` フラグと `kill_process_group` は
+  private なので、コア側に API を足す必要がある。
+- 実行中の出力のライブ表示。現在の `exec::run` は終了時にまとめて `String` を返すだけで、
+  途中経過を渡すフックが無い。
 
 ## 検証
 
 ```shell
-cargo test                  # 77 件
+cargo test                  # 89 件
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
 ```

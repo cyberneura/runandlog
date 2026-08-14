@@ -10,7 +10,20 @@ repository.workspace = true
 name = "runandlog"
 path = "src/main.rs"
 
+[features]
+# The GUI pulls in Tauri, which needs webkit2gtk / gtk3 at build time. It is on by
+# default so that `runandlog --gui` works out of the box; packagers who only want
+# the CLI and TUI can build with --no-default-features to drop that requirement.
+default = ["gui"]
+gui = ["dep:tauri", "dep:tauri-build", "dep:serde", "dep:serde_json"]
+
 [dependencies]
 runandlog-core.workspace = true
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tauri = { version = "2", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [], optional = true }

@@ -23,6 +23,7 @@ runandlog exam.md              # open the TUI
 runandlog exam.md --list       # list the cells
 runandlog exam.md --run 2      # run only cell 2 (may be repeated)
 runandlog exam.md --run-all    # run every cell in order
+runandlog exam.md --gui        # open the desktop app
 ```
 
 ### Options
@@ -33,7 +34,7 @@ runandlog exam.md --run-all    # run every cell in order
 | `--shell <PATH>` | `SHELL` environment variable | Shell the commands are handed to |
 | `--cwd <DIR>` | Directory of the Markdown file | Working directory for the commands |
 | `--timeout <SECONDS>` | unlimited | Time limit per cell. On expiry the whole process group is killed |
-| `--gui` | - | Open in the desktop app (not implemented yet) |
+| `--gui` | - | Open in the desktop app (GUI) |
 
 ### TUI keys
 
@@ -46,6 +47,30 @@ runandlog exam.md --run-all    # run every cell in order
 | `PageUp` / `PageDown` | Scroll |
 | `R` | Reload the file |
 | `q` / `Esc` / `Ctrl-C` | Quit (while a command is running, quitting waits for it to finish) |
+
+### The desktop app
+
+`--gui` opens a window showing the same document the TUI shows: the file path,
+then every cell with its command, a `▶ Run` button, and the result of the last
+run. **Run all** runs every cell in order, **Reload** picks up edits made in an
+external editor.
+
+Results are written back to the Markdown exactly as they are from the CLI and the
+TUI: the same markers, the same separate-file handling, the same refusal to write
+when the file changed while a command was running. Parsing, running and writing
+all go through `runandlog-core` and the same `session` module, so the two front
+ends cannot drift apart.
+
+The GUI is a [Tauri](https://tauri.app/) app and needs the system webview
+(`webkit2gtk-4.1` and `gtk3` on Linux) at build time. It is on by default; to
+build the CLI and TUI alone, drop it:
+
+```shell
+cargo build --no-default-features
+```
+
+Such a build still accepts `--gui`, but reports that this build has no GUI rather
+than opening a window.
 
 ## Writing the Markdown
 
@@ -133,10 +158,10 @@ bare Markdown link target cannot contain them.
 | Crate | Role |
 |---|---|
 | `crates/runandlog-core` | Markdown parsing, command execution, result formatting. A pure core with no file IO |
-| `crates/runandlog-cli` | The `runandlog` binary: CLI, TUI, and file IO |
+| `crates/runandlog-cli` | The `runandlog` binary: CLI, TUI, GUI, and file IO |
 
-A GUI (desktop app) will be added later on top of the same `runandlog-core`. The
-core is always shared, so that the parsing rules cannot drift apart.
+All three front ends sit on the same `runandlog-core` and the same `session`
+module, so that the parsing rules and the write-back rules cannot drift apart.
 
 ## Development
 

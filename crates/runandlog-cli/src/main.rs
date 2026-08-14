@@ -62,12 +62,14 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(args: Args) -> std::io::Result<ExitCode> {
-    if args.gui {
-        eprintln!("runandlog: the GUI is not implemented yet. Drop --gui to open the TUI.");
-        return Ok(ExitCode::from(2));
-    }
-
     let mut session = Session::load(&args.file, exec_options(&args), args.max_inline_lines)?;
+
+    if args.gui {
+        // The GUI is checked before the other flags on purpose: --gui is a request
+        // for a window, and quietly doing something else instead would be worse
+        // than refusing.
+        return open_gui(session).map(|()| ExitCode::SUCCESS);
+    }
 
     if args.list {
         print_list(&session);
@@ -98,6 +100,23 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Opens the desktop app.
+///
+/// Built only when the `gui` feature is on. Without it the binary still accepts
+/// `--gui` so that the message explains what happened, rather than clap reporting
+/// an unknown flag.
+#[cfg(feature = "gui")]
+fn open_gui(session: Session) -> std::io::Result<()> {
+    runandlog_cli::gui::run(session)
+}
+
+#[cfg(not(feature = "gui"))]
+fn open_gui(_session: Session) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "this build has no GUI; rebuild with the \"gui\" feature to use --gui",
+    ))
 }
 
 fn exec_options(args: &Args) -> ExecOptions {
