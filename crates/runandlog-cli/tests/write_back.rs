@@ -241,6 +241,54 @@ fn a_designated_out_file_with_spaces_gets_a_usable_link() {
 }
 
 #[test]
+fn an_out_file_naming_the_markdown_itself_is_ignored() {
+    let dir = TempDir::new("self-target");
+    let path = dir.write("note.md", "```shell out=note.md\necho nope\n```\n");
+    let mut session = session(&path, 50);
+
+    // Writing the output over the document would destroy it: the sidecar is written
+    // first and the document second, so a failure in between leaves note.md as raw
+    // command output.
+    session.run_cell(0).unwrap();
+
+    let text = dir.read("note.md");
+    assert!(text.contains("```shell out=note.md"), "the cell survived");
+    assert!(text.contains("```text\nnope\n```"));
+    assert!(text.contains("was ignored"));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_out_file_symlinked_to_the_markdown_itself_is_ignored() {
+    let dir = TempDir::new("self-symlink");
+    let path = dir.write("note.md", "```shell out=alias.md\necho nope\n```\n");
+    std::os::unix::fs::symlink(&path, dir.0.join("alias.md")).unwrap();
+    let mut session = session(&path, 50);
+
+    session.run_cell(0).unwrap();
+
+    let text = dir.read("note.md");
+    assert!(text.contains("```shell out=alias.md"), "the cell survived");
+    assert!(text.contains("```text\nnope\n```"));
+}
+
+#[test]
+fn a_result_link_written_in_the_angle_bracket_form_round_trips() {
+    let dir = TempDir::new("angle-round-trip");
+    let path = dir.write(
+        "note.md",
+        "```shell\necho spaced\n```\n\nResult:\n[date result.txt](<date result.txt>)\n",
+    );
+    let mut session = session(&path, 50);
+
+    session.run_cell(0).unwrap();
+
+    // The angle brackets are delimiters, so the file must not be named with them.
+    assert_eq!(dir.read("date result.txt"), "spaced\n");
+    assert!(!dir.0.join("<date result.txt>").exists());
+}
+
+#[test]
 fn a_failing_command_is_recorded_with_its_exit_code() {
     let dir = TempDir::new("failure");
     let path = dir.write("note.md", "```shell\necho boom 1>&2\nexit 7\n```\n");

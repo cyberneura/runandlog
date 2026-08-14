@@ -74,11 +74,15 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let targets = targets(&args, &session)?;
-    if targets.is_empty() {
+    // Whether to run non-interactively is decided by the flags, not by how many
+    // targets they happen to select. `--run-all` on a file with no cells is a
+    // request to run nothing, not a request for the TUI -- opening it would hang a
+    // script that has no terminal.
+    if !args.run_all && args.run.is_empty() {
         tui::run(session)?;
         return Ok(ExitCode::SUCCESS);
     }
+    let targets = targets(&args, &session)?;
 
     let mut failed = false;
     for index in targets {
@@ -112,7 +116,10 @@ fn exec_options(args: &Args) -> ExecOptions {
     options
 }
 
-/// Decides which cells to run, as 0-based indices. An empty result opens the TUI.
+/// Decides which cells to run, as 0-based indices.
+///
+/// Only called once the flags have established that this is a non-interactive
+/// run, so an empty result means "run nothing", not "open the TUI".
 fn targets(args: &Args, session: &Session) -> std::io::Result<Vec<usize>> {
     if args.run_all {
         return Ok((0..session.len()).collect());

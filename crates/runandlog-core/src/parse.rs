@@ -388,13 +388,43 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
         let end = stripped.find(')')?;
         let target = stripped[..end].trim();
         if !target.is_empty() {
-            return Some(target.to_string());
+            return Some(undelimit(target));
         }
     }
     if label.is_empty() {
         return None;
     }
-    Some(label.to_string())
+    Some(undelimit(label))
+}
+
+/// Unwraps the `<...>` form of a link destination.
+///
+/// A destination containing spaces has to be written that way -- `render` emits
+/// exactly this form -- so the brackets are delimiters, not part of the file name.
+/// Reading them literally would create a file actually called `<a b.txt>` while
+/// the rendered link pointed at `a b.txt`, i.e. output that looks lost.
+fn undelimit(target: &str) -> String {
+    let Some(inner) = target.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
+        return target.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                // Only the characters render escapes are unescaped; anything else
+                // keeps its backslash, since a file name may legitimately contain one.
+                Some(escaped @ ('<' | '>' | '\\')) => out.push(escaped),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Removes as much leading indentation from a fence body as the fence itself has.
@@ -497,6 +527,29 @@ mod tests {
         assert!(out.contains(
             "[date-command-result.txt](date-command-result.txt)\n\n<!-- runandlog:begin -->"
         ));
+    }
+
+    #[test]
+    fn reads_an_angle_bracketed_out_file() {
+        // render emits this form for destinations containing spaces, so parse has to
+        // read it back or the file name would gain literal angle brackets.
+        let md = "```shell\ndate\n```\n\nResult:\n[date result.txt](<date result.txt>)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("date result.txt"));
+    }
+
+    #[test]
+    fn unescapes_an_angle_bracketed_out_file() {
+        let md = "```shell\ndate\n```\n\nResult:\n[x](<a \\<b\\> c.txt>)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("a <b> c.txt"));
+    }
+
+    #[test]
+    fn keeps_angle_brackets_that_are_not_delimiters() {
+        let md = "```shell\ndate\n```\n\nResult:\n[x](a<b.txt)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("a<b.txt"));
     }
 
     #[test]

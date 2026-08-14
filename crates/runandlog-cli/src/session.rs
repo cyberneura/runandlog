@@ -91,7 +91,7 @@ impl Session {
                 // cannot hold the output: the rename in write_atomically would fail
                 // and the result would be lost. Treat it like any other rejected
                 // designation so the output still lands inline.
-                !target.is_dir() && resolves_inside(&self.render.md_dir, &target)?
+                !target.is_dir() && is_safe_out_file(&self.render.md_dir, &self.path, &target)?
             }
             None => true,
         };
@@ -193,20 +193,21 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     std::fs::rename(&temp, path)
 }
 
-/// Whether `target` stays under `base` once symlinks are resolved.
+/// Resolves `target` as far as the filesystem allows.
 ///
-/// A symlinked directory along the way lets even a path without `..` escape, so
-/// the deepest ancestor that actually exists is resolved before comparing.
-fn resolves_inside(base: &Path, target: &Path) -> io::Result<bool> {
-    let base = base.canonicalize()?;
+/// The path need not exist yet, so the deepest ancestor that does exist is
+/// canonicalized and the remaining components are appended to it. Resolving
+/// matters because a symlinked directory along the way lets even a path without
+/// `..` land somewhere else entirely.
+fn resolve_as_far_as_possible(target: &Path) -> io::Result<Option<PathBuf>> {
     let mut existing = target.to_path_buf();
     let mut rest = Vec::new();
     while !existing.exists() {
         let Some(name) = existing.file_name().map(|name| name.to_owned()) else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(parent) = existing.parent().map(Path::to_path_buf) else {
-            return Ok(false);
+            return Ok(None);
         };
         rest.push(name);
         existing = parent;
@@ -215,5 +216,23 @@ fn resolves_inside(base: &Path, target: &Path) -> io::Result<bool> {
     for name in rest.iter().rev() {
         resolved.push(name);
     }
-    Ok(resolved.starts_with(&base))
+    Ok(Some(resolved))
+}
+
+/// Whether writing the output to `target` is safe.
+///
+/// Two things disqualify a destination:
+///
+/// - it resolves outside `base`, the directory holding the Markdown file
+/// - it resolves to `markdown` itself. `apply_outcome` writes the sidecar first
+///   and the document second, so this would replace the document with the command
+///   output and then overwrite it again -- losing the sidecar in the good case,
+///   and leaving the document *as raw command output* if anything fails in
+///   between.
+fn is_safe_out_file(base: &Path, markdown: &Path, target: &Path) -> io::Result<bool> {
+    let base = base.canonicalize()?;
+    let Some(resolved) = resolve_as_far_as_possible(target)? else {
+        return Ok(false);
+    };
+    Ok(resolved.starts_with(&base) && resolved != markdown)
 }
