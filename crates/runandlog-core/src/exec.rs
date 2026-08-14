@@ -23,6 +23,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// with no timeout set -- EOF never arrives, so the read is cut off here and
 /// whatever was read becomes the result.
 const DRAIN_GRACE: Duration = Duration::from_millis(300);
+/// How long the reader may wait for data before re-checking its stop flag.
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// Default cap on captured output. A safeguard against a command that keeps
 /// printing forever exhausting memory.
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -140,12 +142,28 @@ pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome>
     let reader_truncated = Arc::clone(&truncated);
     let reader_stop = Arc::clone(&stop);
     let limit = options.max_output_bytes;
+    // Without this the `stop` flag below is toothless: a silent grandchild
+    // (`sleep 86400 &`) holds the pipe open and produces nothing, so the reader
+    // stays parked inside `read` forever and never looks at the flag again. The
+    // thread, its pipe descriptor and the captured buffer would then live until
+    // that descendant exits, and repeated runs would pile them up.
+    make_reads_interruptible(&reader);
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
-        while let Ok(read) = reader.read(&mut chunk) {
-            if read == 0 || reader_stop.load(Ordering::Relaxed) {
+        loop {
+            if reader_stop.load(Ordering::Relaxed) {
                 break;
             }
+            if !wait_readable(&reader) {
+                // Nothing arrived in time. Loop back so the stop flag gets another look.
+                continue;
+            }
+            let read = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if is_retryable(&error) => continue,
+                Err(_) => break,
+            };
             let mut buffer = reader_buffer.lock().unwrap();
             let room = limit.saturating_sub(buffer.len());
             if room == 0 {
@@ -198,6 +216,63 @@ pub fn run(command: &str, options: &ExecOptions) -> std::io::Result<ExecOutcome>
         timed_out,
         truncated: truncated.load(Ordering::Relaxed),
     })
+}
+
+/// Puts the pipe in non-blocking mode so a read can never park indefinitely.
+///
+/// Paired with [`wait_readable`]: the wait is what avoids a busy loop, and
+/// non-blocking mode is what guarantees the read itself always returns, even if the
+/// readiness reported by `poll` turns out to be spurious.
+///
+/// A read *timeout* would be the tidier mechanism, but `SO_RCVTIMEO` is a socket
+/// option and silently does nothing on a pipe.
+#[cfg(unix)]
+fn make_reads_interruptible(reader: &std::io::PipeReader) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `reader` owns the descriptor and outlives both calls.
+    unsafe {
+        let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+        if flags != -1 {
+            libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_reads_interruptible(_reader: &std::io::PipeReader) {}
+
+/// Waits for the pipe to have data, giving up after [`READ_TIMEOUT`].
+///
+/// Returns false if nothing arrived in time, which is the reader's cue to look at
+/// its stop flag again. Blocking here rather than spinning keeps an ordinary run
+/// from burning CPU, and waking on readiness keeps it from adding latency.
+#[cfg(unix)]
+fn wait_readable(reader: &std::io::PipeReader) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut poll_fd = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: a single valid pollfd is passed, and `reader` outlives the call.
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, READ_TIMEOUT.as_millis() as libc::c_int) };
+    // On error, report readiness and let the non-blocking read settle it.
+    ready != 0
+}
+
+#[cfg(not(unix))]
+fn wait_readable(_reader: &std::io::PipeReader) -> bool {
+    true
+}
+
+/// Whether a read failed only because no data was available yet.
+fn is_retryable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    )
 }
 
 /// Terminates the shell together with all of its descendants.
@@ -329,6 +404,32 @@ mod tests {
         let outcome = run("sleep 30 & wait", &opts).unwrap();
         assert!(outcome.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_reader_thread_stops_when_a_silent_grandchild_holds_the_pipe() {
+        // `sleep` keeps the pipe open and writes nothing, so the reader is parked in
+        // `read` with no data ever coming. Unless reads are interruptible, the stop
+        // flag never gets looked at again and the thread, its descriptor and the
+        // captured buffer leak -- once per run.
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task").unwrap().count()
+        }
+
+        let mut opts = options();
+        opts.timeout = None;
+        let before = threads();
+        for _ in 0..5 {
+            let outcome = run("sleep 20 &", &opts).unwrap();
+            assert!(outcome.is_success());
+        }
+        // The stop flag is set after DRAIN_GRACE and acted on within READ_TIMEOUT.
+        thread::sleep(DRAIN_GRACE + READ_TIMEOUT * 4);
+        let after = threads();
+        assert!(
+            after <= before + 1,
+            "reader threads leaked: {before} -> {after}"
+        );
     }
 
     #[test]

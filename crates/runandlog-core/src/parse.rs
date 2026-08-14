@@ -403,6 +403,15 @@ fn extract_link_target(paragraph: &str) -> Option<String> {
 /// called `run(1).txt` must not be cut at its first `)` -- doing so would write the
 /// output to `run(1` while the rendered link still pointed at `run(1).txt`.
 fn closing_paren(rest: &str) -> Option<usize> {
+    // Inside `<...>` a parenthesis is literal, so counting it would make the scan
+    // treat the link's own `)` as balancing input and miss the terminator entirely.
+    // The angle bracket form only counts when it opens the destination.
+    if rest.starts_with('<')
+        && let Some(end) = closing_angle(rest)
+    {
+        return rest[end..].find(')').map(|offset| end + offset);
+    }
+
     let mut depth = 0usize;
     let mut escaped = false;
     for (offset, ch) in rest.char_indices() {
@@ -421,6 +430,23 @@ fn closing_paren(rest: &str) -> Option<usize> {
     None
 }
 
+/// Finds the byte offset just past the `>` that closes an angle bracket destination.
+fn closing_angle(rest: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '>' => return Some(offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Unwraps the `<...>` form of a link destination.
 ///
 /// A destination containing spaces has to be written that way -- `render` emits
@@ -428,17 +454,26 @@ fn closing_paren(rest: &str) -> Option<usize> {
 /// Reading them literally would create a file actually called `<a b.txt>` while
 /// the rendered link pointed at `a b.txt`, i.e. output that looks lost.
 fn undelimit(target: &str) -> String {
-    let Some(inner) = target.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
-        return target.to_string();
-    };
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
+    match target.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+        // Inside `<...>` only `<`, `>` and `\` can be escaped; everything else is
+        // literal, so a lone backslash keeps its meaning as part of the file name.
+        Some(inner) => unescape(inner, |ch| matches!(ch, '<' | '>' | '\\')),
+        // A bare destination uses ordinary Markdown escaping, so `run\(1\).txt`
+        // names the file `run(1).txt`. Keeping the backslashes would write the output
+        // to a path that does not match where the rendered link points.
+        None => unescape(target, |ch| ch.is_ascii_punctuation()),
+    }
+}
+
+/// Drops the backslash from `\x` where `escapable(x)`, leaving other backslashes
+/// alone -- a file name may legitimately contain one.
+fn unescape(target: &str, escapable: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(target.len());
+    let mut chars = target.chars();
     while let Some(ch) = chars.next() {
         match ch {
             '\\' => match chars.next() {
-                // Only the characters render escapes are unescaped; anything else
-                // keeps its backslash, since a file name may legitimately contain one.
-                Some(escaped @ ('<' | '>' | '\\')) => out.push(escaped),
+                Some(escaped) if escapable(escaped) => out.push(escaped),
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
@@ -588,6 +623,27 @@ mod tests {
         let md = "```shell\ndate\n```\n\nResult:\n[result](out.txt) and (more text)\n";
         let doc = Document::parse(md);
         assert_eq!(doc.cells[0].out_file.as_deref(), Some("out.txt"));
+    }
+
+    #[test]
+    fn keeps_parentheses_literal_inside_an_angle_bracketed_out_file() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](<run(1.txt>)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("run(1.txt"));
+    }
+
+    #[test]
+    fn unescapes_a_bare_out_file() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](run\\(1\\).txt)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("run(1).txt"));
+    }
+
+    #[test]
+    fn keeps_a_backslash_that_is_not_an_escape() {
+        let md = "```shell\ndate\n```\n\nResult:\n[result](a\\b.txt)\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("a\\b.txt"));
     }
 
     #[test]
