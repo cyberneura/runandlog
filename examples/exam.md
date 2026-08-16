@@ -48,3 +48,13 @@ automatically, with no designation needed.
 ```shell
 seq 1 60
 ```
+
+## Stopping a command
+
+This one counts to ten, a second at a time. Interrupt it partway -- Ctrl-C in the
+TUI or from a `--run-all`, **Stop** in the desktop app -- and the numbers it had
+reached are written back with the result marked `cancelled`.
+
+```shell
+for i in $(seq 1 10); do echo "$i"; sleep 1; done
+```
