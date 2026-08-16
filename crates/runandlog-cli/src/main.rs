@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
-use runandlog_cli::session::Session;
-use runandlog_cli::tui;
+use runandlog::session::Session;
+use runandlog::tui;
 use runandlog_core::{Canceller, ExecOptions};
 
 /// Exit code for a run stopped by a signal, following the shell convention of
@@ -234,7 +234,7 @@ fn catch_interrupts(_canceller: &Canceller) {}
 /// an unknown flag.
 #[cfg(feature = "gui")]
 fn open_gui(session: Session) -> std::io::Result<()> {
-    runandlog_cli::gui::run(session)
+    runandlog::gui::run(session)
 }
 
 #[cfg(not(feature = "gui"))]

@@ -1,0 +1,488 @@
+name: Release
+
+# Started by hand, never by a push: one dispatch is one version.
+# Locally that is `scripts/release.sh [patch|minor|major]`, which bumps the
+# version first.
+on:
+  workflow_dispatch:
+    inputs:
+      publish_crates:
+        description: "Publish both crates to crates.io as well"
+        type: boolean
+        default: false
+      dispatch_id:
+        description: "Word echoed in the run name, so that whoever started this run can find it"
+        type: string
+        default: ""
+      expected_sha:
+        description: "Commit to release; the run stops unless main is still on it"
+        type: string
+        required: true
+
+# The name carries the word back, since a caller cannot otherwise tell its own run
+# from another dispatch of the same commit.
+run-name: Release ${{ inputs.dispatch_id && format('({0})', inputs.dispatch_id) || '' }}
+
+# Only the job that creates the release needs to write. The job that handles the
+# signing certificate is left with read.
+permissions:
+  contents: read
+
+# Serialised, because a cancelled run leaves its version bumped on main and never
+# released. Both keys are needed:
+#   cancel-in-progress: false — a later dispatch must not kill a running one.
+#   queue: max — hold up to 100 pending. The default `queue: single` keeps only
+#     one pending run and replaces it, so three dispatches in a row lose the
+#     middle version.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  # The version is settled once and handed to every job. Reading Cargo.toml in
+  # each of them would let a tag and its artifacts disagree if main moved.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # `--ref main` resolves when the dispatch lands, not when it was sent, so a
+      # commit that arrives in between would be the one built and published. The
+      # caller says which commit it meant; anything else stops here.
+      - name: Check the commit is the one that was asked for
+        env:
+          EXPECTED: ${{ inputs.expected_sha }}
+          ACTUAL: ${{ github.sha }}
+        run: |
+          # Empty is refused rather than waved through: a check that any caller can
+          # skip by leaving a field blank is not a check. Dispatching by hand means
+          # pasting the commit, which is the point -- saying which one is meant.
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::expected_sha is empty. Pass the commit to release (scripts/release.sh does)."
+            exit 1
+          fi
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::this run is on $ACTUAL, but $EXPECTED was the commit meant for release"
+            exit 1
+          fi
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "runandlog") | .version')
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read the version out of Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$VERSION"
+
+      - name: Refuse a version that is already published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Caught before the build, so that a mistake does not cost a signing and
+          # notarisation round.
+          #
+          # This endpoint answers for published releases only -- a draft has no tag
+          # for it to find -- which is exactly the question here. Drafts are dealt
+          # with by the release job, which has the write access to see them.
+          #
+          # Only a 404 counts as "no such release". Treating every failed lookup
+          # that way would let a rate limit or an outage read as absence.
+          status=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" \
+            --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+          case "$status" in
+            404)
+              ;;
+            200)
+              echo "::error::v${VERSION} is already published. Bump the version first (scripts/release.sh does it)."
+              exit 1
+              ;;
+            *)
+              echo "::error::could not tell whether v${VERSION} exists (HTTP ${status:-none}). Not guessing."
+              exit 1
+              ;;
+          esac
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon only. Built with the default features, so the GUI is in,
+          # then signed with a Developer ID and notarised: Homebrew casks put the
+          # download in quarantine, and without both the first run is refused.
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            features: ""
+          # Linux gets the CLI and TUI alone. The default features pull in Tauri,
+          # and a binary linked against webkit2gtk will not start where that
+          # library is absent. Asking for no webview is worth more here than the
+          # window -- though the binary is still linked against glibc, so it is not
+          # portable to every distribution either.
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: "--no-default-features"
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+
+    steps:
+      # persist-credentials: false keeps the token out of .git/config. Everything
+      # is pinned to a commit SHA because this job holds the signing certificate:
+      # a moved tag would be enough to take it.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Pin a SHA from master, not from a generated branch like `stable`: those
+      # commits are collected once the branch moves on, and the run then fails
+      # before Rust is even installed.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # A missing secret does not merely skip codesign, it goes unnoticed: an
+      # unsigned archive would ship as though it had been signed.
+      - name: Check macOS signing secrets
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}. Run deploy-github-secret-apple-building.sh to set them."
+            exit 1
+          fi
+          echo "All signing and notarisation secrets are present."
+
+      - name: Import Apple Developer certificate
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          # codesign looks identities up in the search list rather than in the
+          # default keychain, so the new keychain has to be added to it.
+          security list-keychains -d user -s build.keychain
+          # find-identity exits 0 even with nothing to show, so the check has to
+          # look at what it printed.
+          security find-identity -v -p codesigning | grep -q "Developer ID Application" || {
+            echo "::error::no 'Developer ID Application' identity in the keychain search list"
+            exit 1
+          }
+          rm "$RUNNER_TEMP/certificate.p12"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }} -p runandlog
+
+      # Notarisation needs the hardened runtime (--options runtime). A bare binary
+      # cannot be stapled -- stapling takes a .app, .dmg or .pkg -- so the ticket
+      # stays with Apple and Gatekeeper fetches it. That covers a download, and
+      # leaves only a first run with no network refused.
+      - name: Sign and notarise
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/${TARGET}/release/runandlog"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          # notarytool takes a zip, pkg or dmg, so the binary is wrapped only to be
+          # submitted. What ships is the tar.gz below; the ticket is bound to the
+          # signature, which is the same in either container.
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/notarize.zip"
+          # The verdict is read rather than left to the exit code: a submission
+          # that comes back Invalid is still a submission that completed.
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notarize.json"
+          cat "$RUNNER_TEMP/notarize.json"
+          status=$(jq -r .status "$RUNNER_TEMP/notarize.json")
+          if [ "$status" != "Accepted" ]; then
+            id=$(jq -r .id "$RUNNER_TEMP/notarize.json")
+            xcrun notarytool log "$id" --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::notarisation came back $status"
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          NAME="runandlog-v${VERSION}-${TARGET}"
+          mkdir -p "dist/$NAME"
+          cp "target/${TARGET}/release/runandlog" "dist/$NAME/"
+          cp README.md "dist/$NAME/"
+          # The archive carries its own directory rather than unpacking into the
+          # current one. The Homebrew cask names that directory in its `binary`
+          # path, since a cask does not descend into it on its own.
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # Every target has to be in hand first. The release is assembled as a draft and
+  # published only once its assets are all there: `gh release create` uploads
+  # after creating, so a failure partway would otherwise leave a published release
+  # missing a platform.
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          EXPECTED_ASSETS: "2"
+        run: |
+          # Drafts left by a run that failed partway are cleared, so that the same
+          # version can be built again instead of being blocked by its own remains.
+          # A published release is never touched: it is the thing this workflow
+          # exists to produce.
+          #
+          # The releases are listed rather than looked up by tag. A draft has no tag
+          # for that endpoint to find, so a lookup would report nothing and the
+          # create below would add a *second* draft under the same name -- from
+          # there, which one gets its assets counted, or published, is a coin toss.
+          # `--paginate` hands back one array per page, so the pages are flattened
+          # into a single one before anything asks a question of them.
+          set -o pipefail
+          releases=$(gh api "repos/${GH_REPO}/releases" --paginate --jq '.[]' | jq -s '.') || {
+            echo "::error::could not list the releases. Not guessing."
+            exit 1
+          }
+          if jq -e --arg tag "v${VERSION}" \
+            'any(.[]; .tag_name == $tag and .draft == false)' <<< "$releases" >/dev/null; then
+            echo "::error::v${VERSION} is published already; refusing to touch it."
+            exit 1
+          fi
+          # Every same-named draft, not just one: an earlier failure may have left
+          # more than one behind.
+          for id in $(jq -r --arg tag "v${VERSION}" \
+            '.[] | select(.tag_name == $tag and .draft) | .id' <<< "$releases"); do
+            # Deleted by id, and without --cleanup-tag: a draft has no tag to clean
+            # up, and asking for one fails the step after the draft is already gone.
+            echo "removing leftover draft $id"
+            gh api -X DELETE "repos/${GH_REPO}/releases/${id}"
+          done
+
+          # The checksums go into the notes so that the Homebrew cask can be
+          # updated without fetching the assets again.
+          {
+            echo "## Checksums"
+            echo
+            echo '```'
+            (cd dist && sha256sum *.tar.gz)
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+
+          gh release create "v${VERSION}" \
+            --draft \
+            --target "$COMMIT" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/*.tar.gz
+
+          count=$(gh release view "v${VERSION}" --json assets --jq '.assets | length')
+          if [ "$count" -ne "$EXPECTED_ASSETS" ]; then
+            echo "::error::the draft carries $count assets, expected $EXPECTED_ASSETS; leaving it unpublished"
+            exit 1
+          fi
+          gh release edit "v${VERSION}" --draft=false --latest
+
+  # Only when asked for. A version on crates.io cannot be taken back, so this is
+  # never the default.
+  crates:
+    needs: [plan, release]
+    if: inputs.publish_crates
+    # On macOS, because `cargo publish` builds what it is about to publish and the
+    # default features need a webview. It is there already, where on Linux it
+    # would have to be installed and kept up with.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Create a token on crates.io and add it with 'gh secret set CARGO_REGISTRY_TOKEN'."
+            exit 1
+          fi
+
+          # What cargo resolves against is the sparse index, not the web API, and
+          # the two do not update together. Asking the index is therefore the only
+          # answer that means "the next crate can depend on this one".
+          # The index nests by name length, and the short cases are not the same
+          # shape as the common one. Getting it wrong yields a 404, which reads as
+          # "not published" and would publish a version a second time.
+          index_url() {
+            case ${#1} in
+              1) path="1/$1" ;;
+              2) path="2/$1" ;;
+              3) path="3/${1:0:1}/$1" ;;
+              *) path="${1:0:2}/${1:2:2}/$1" ;;
+            esac
+            printf 'https://index.crates.io/%s' "$path"
+          }
+
+          # Only 200 and 404 are answers. Anything else -- a rate limit, an outage,
+          # a broken connection -- is not evidence of absence, and treating it as
+          # such would publish a version twice or declare a good one missing.
+          indexed() {
+            name=$1
+            body=$(mktemp)
+            status=$(curl -s -o "$body" -w '%{http_code}' "$(index_url "$name")" || echo 000)
+            answer="unknown:$status"
+            case "$status" in
+              404) answer="no" ;;
+              200)
+                # A 200 whose body will not parse is a broken answer, not a "no".
+                # Both are checked separately so that a truncated response cannot
+                # read as an absent version.
+                if ! jq -e . < "$body" >/dev/null 2>&1; then
+                  answer="unknown:unparsable"
+                elif jq -e --arg v "$VERSION" 'select(.vers == $v)' < "$body" >/dev/null; then
+                  answer="yes"
+                else
+                  answer="no"
+                fi
+                ;;
+            esac
+            rm -f "$body"
+            echo "$answer"
+          }
+
+          # Publishing takes two steps and neither can be undone, so each crate is
+          # looked up first: a rerun after one of them failed has to finish the half
+          # that is left rather than stop on the half that is done.
+          publish() {
+            name=$1
+            case "$(indexed "$name")" in
+              yes) echo "${name} ${VERSION} is already on crates.io"; return ;;
+              no) ;;
+              *)
+                echo "::error::could not tell whether ${name} ${VERSION} is published. Not guessing."
+                exit 1
+                ;;
+            esac
+
+            # A failure here is not proof that nothing was published: the registry
+            # can take the crate and the response still be lost. The index is the
+            # only thing that settles it.
+            if ! cargo publish -p "$name"; then
+              for _ in $(seq 12); do
+                sleep 10
+                case "$(indexed "$name")" in
+                  yes)
+                    echo "publishing ${name} ${VERSION} reported a failure, but it is in the index"
+                    return
+                    ;;
+                  no) ;;
+                  *)
+                    echo "::error::publishing ${name} ${VERSION} failed and the index cannot be read. Check crates.io before rerunning."
+                    exit 1
+                    ;;
+                esac
+              done
+              echo "::error::publishing ${name} ${VERSION} failed and it is not in the index"
+              exit 1
+            fi
+
+            # The crate that depends on this one cannot resolve it until the index
+            # has caught up.
+            for _ in $(seq 30); do
+              sleep 10
+              case "$(indexed "$name")" in
+                yes) return ;;
+                no) ;;
+                *)
+                  # Publishing already succeeded, so this is not "it did not
+                  # publish" -- it is "the index cannot be read". Saying which is
+                  # what tells the next person whether to rerun or to wait.
+                  echo "::error::${name} ${VERSION} was published, but the index could not be read. Check crates.io before rerunning."
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "::error::${name} ${VERSION} never reached the index"
+            exit 1
+          }
+
+          publish runandlog-core
+          publish runandlog

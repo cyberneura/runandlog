@@ -22,4 +22,4 @@ if [[ -n ${RUNANDLOG:-} ]]; then
 fi
 # --quiet so that cargo's progress does not mix into the TUI's first frame.
 exec cargo run --quiet --manifest-path "$examples_dir/../Cargo.toml" \
-    -p runandlog-cli -- "$document" "$@"
+    -p runandlog -- "$document" "$@"

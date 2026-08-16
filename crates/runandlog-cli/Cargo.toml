@@ -1,5 +1,5 @@
 [package]
-name = "runandlog-cli"
+name = "runandlog"
 description = "CLI / TUI that runs the shell commands in a Markdown file and writes the results back"
 version.workspace = true
 edition.workspace = true

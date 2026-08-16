@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use runandlog_cli::session::Session;
+use runandlog::session::Session;
 use runandlog_core::{Canceller, ExecOptions};
 
 /// A temporary directory for tests, including its own cleanup.
