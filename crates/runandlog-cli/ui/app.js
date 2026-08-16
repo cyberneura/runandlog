@@ -15,6 +15,7 @@ const pathEl = document.getElementById('path')
 const cellsEl = document.getElementById('cells')
 const statusEl = document.getElementById('status')
 const runAllButton = document.getElementById('run-all')
+const stopButton = document.getElementById('stop')
 const reloadButton = document.getElementById('reload')
 
 /** Index of the cell being run, or null when idle. */
@@ -31,6 +32,13 @@ function setBusy(value) {
   busy = value
   runAllButton.disabled = value
   reloadButton.disabled = value
+  // Stop is the one button that only makes sense while a command is running, and
+  // it stays off until the backend says one has started: a press that beats the
+  // `run_cell` / `run_all` call there finds nothing to stop and is dropped. It is
+  // left on between the cells of a batch, where the backend remembers the request.
+  if (!value) {
+    stopButton.disabled = true
+  }
   for (const button of cellsEl.querySelectorAll('button.run')) {
     button.disabled = value
   }
@@ -140,12 +148,14 @@ async function runAll() {
   }
   setBusy(true)
   try {
-    const reports = await invoke('run_all')
+    const { reports, stopped } = await invoke('run_all')
     const failed = reports.filter((report) => !report.success).length
     setStatus(
-      failed === 0
-        ? `Ran ${reports.length} cells.`
-        : `Ran ${reports.length} cells, ${failed} failed.`,
+      stopped
+        ? `Stopped after ${reports.length} cells.`
+        : failed === 0
+          ? `Ran ${reports.length} cells.`
+          : `Ran ${reports.length} cells, ${failed} failed.`,
       failed === 0 ? 'ok' : 'error',
     )
   } catch (error) {
@@ -155,6 +165,17 @@ async function runAll() {
     running = null
     setBusy(false)
     await refresh()
+  }
+}
+
+async function stop() {
+  try {
+    // The backend remembers the request for the rest of the operation, so a press
+    // that lands between two cells of a batch still stops it.
+    const stopped = await invoke('cancel')
+    setStatus(stopped ? 'Stopping…' : 'Nothing is running.', 'info')
+  } catch (error) {
+    setStatus(String(error), 'error')
   }
 }
 
@@ -170,21 +191,34 @@ async function reload(quiet) {
 }
 
 runAllButton.addEventListener('click', runAll)
+stopButton.addEventListener('click', stop)
 reloadButton.addEventListener('click', () => reload(false))
 
-listen('runandlog://document', (event) => {
-  render(event.payload)
-})
+// Nothing can be started until the events are subscribed. `listen` registers with
+// the backend asynchronously, and Stop is only offered once a run has said it
+// started -- so a run begun before the subscription exists would miss that event
+// and leave Stop unavailable for as long as the command takes.
+async function start() {
+  setBusy(true)
+  setStatus('Starting…', 'info')
+  await Promise.all([
+    listen('runandlog://document', (event) => {
+      render(event.payload)
+    }),
+    listen('runandlog://started', (event) => {
+      running = event.payload
+      stopButton.disabled = false
+      setStatus(`Running cell ${event.payload + 1}…`, 'info')
+      // Redraw so the cell being run shows its spinner label.
+      refresh()
+    }),
+    listen('runandlog://finished', () => {
+      running = null
+    }),
+  ])
+  setBusy(false)
+  setStatus('Ready.', 'info')
+  await refresh()
+}
 
-listen('runandlog://started', (event) => {
-  running = event.payload
-  setStatus(`Running cell ${event.payload + 1}…`, 'info')
-  // Redraw so the cell being run shows its spinner label.
-  refresh()
-})
-
-listen('runandlog://finished', () => {
-  running = null
-})
-
-refresh()
+start()

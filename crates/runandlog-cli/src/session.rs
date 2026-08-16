@@ -6,7 +6,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use runandlog_core::{
-    Document, ExecOptions, ExecOutcome, RenderContext, Sidecar, render_result, run, splice,
+    Canceller, Document, ExecOptions, ExecOutcome, RenderContext, Sidecar, render_result,
+    run_cancellable, splice,
 };
 
 /// State for a single Markdown file.
@@ -73,8 +74,26 @@ impl Session {
 
     /// Runs a cell and writes the result back to the Markdown (and to a separate
     /// file when needed).
+    ///
+    /// Nothing but its timeout can stop the command. Use [`Session::run_cell_cancellable`]
+    /// where the user needs a way out.
     pub fn run_cell(&mut self, index: usize) -> io::Result<ExecOutcome> {
-        let outcome = run(&self.doc.cells[index].command.clone(), &self.exec)?;
+        self.run_cell_cancellable(index, &Canceller::new())
+    }
+
+    /// Runs a cell, watching `canceller` for a request to stop.
+    ///
+    /// A cancelled run still has the output it managed to produce written back.
+    pub fn run_cell_cancellable(
+        &mut self,
+        index: usize,
+        canceller: &Canceller,
+    ) -> io::Result<ExecOutcome> {
+        let outcome = run_cancellable(
+            &self.doc.cells[index].command.clone(),
+            &self.exec,
+            canceller,
+        )?;
         self.apply_outcome(index, &outcome)?;
         Ok(outcome)
     }

@@ -227,6 +227,7 @@ mod tests {
             exit_code: Some(0),
             output: output.to_string(),
             timed_out: false,
+            cancelled: false,
             truncated: false,
         }
     }

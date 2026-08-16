@@ -26,6 +26,14 @@ runandlog exam.md --run-all    # run every cell in order
 runandlog exam.md --gui        # open the desktop app
 ```
 
+During a non-interactive run (`--run` or `--run-all`), Ctrl-C stops the command
+that is running -- along with the descendants still in its process group -- and
+writes the output it produced up to that point back into the Markdown before
+exiting with status 130.
+Press it again to leave immediately without waiting for that write. SIGTERM does
+the same and exits with 143, so a job runner can tell the two apart. In the TUI,
+Ctrl-C stops the command the same way; see the key table below.
+
 ### Options
 
 | Option | Default | Description |
@@ -46,14 +54,16 @@ runandlog exam.md --gui        # open the desktop app
 | `g` / `G` | Jump to the first / last cell |
 | `PageUp` / `PageDown` | Scroll |
 | `R` | Reload the file |
-| `q` / `Esc` / `Ctrl-C` | Quit (while a command is running, quitting waits for it to finish) |
+| `q` / `Esc` | Quit (while a command is running, quitting waits for it to finish) |
+| `Ctrl-C` | Quit at once, stopping the running command and keeping the output it produced |
 
 ### The desktop app
 
 `--gui` opens a window showing the same document the TUI shows: the file path,
 then every cell with its command, a `▶ Run` button, and the result of the last
-run. **Run all** runs every cell in order, **Reload** picks up edits made in an
-external editor.
+run. **Run all** runs every cell in order, **Stop** ends the command that is
+running and keeps what it printed, **Reload** picks up edits made in an external
+editor.
 
 Results are written back to the Markdown exactly as they are from the CLI and the
 TUI: the same markers, the same separate-file handling, the same refusal to write

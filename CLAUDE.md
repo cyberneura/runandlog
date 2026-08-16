@@ -48,6 +48,39 @@ public リポジトリなので、**README・コードコメント・UI 文字�
   実行中に中断されても元ファイルが半端な状態にならないようにする。書き込み直前に
   `refresh_before_write` でファイルを読み直し、実行中の外部編集を握り潰さないようにしている。
 - TUI の実行はワーカースレッドに投げる。同期実行にすると長いコマンドで画面が固まる。
+- **Ctrl-C はアプリが拾って明示的にプロセスグループを kill する** (`Canceller`)。コマンドを
+  専用のプロセスグループで起動している以上、端末が前面プロセスグループに送る SIGINT は
+  runandlog にしか届かない。ハンドラを入れないと、runandlog だけが死んでコマンドは生き残り、
+  ユーザーが待っていた出力ごと消える。
+  - 非対話実行 (`main::catch_interrupts`) は SIGINT / SIGTERM をハンドラで受けて**受信した
+    シグナル番号**を記録し、監視スレッドが `Canceller::cancel` を呼ぶ。**ハンドラの中では kill しない**。
+    `cancel` はロックを取るのでハンドラから呼べず、そもそもハンドラはシグナル番号しか受け取れないので
+    `Canceller` に辿り着くには static に置き直す必要がある。
+    終了コードは `128 + signo` (SIGINT なら 130、SIGTERM なら 143)。2 回目のシグナルは
+    書き戻しを待たずに `_exit`。
+  - **セルの前後で見るのはハンドラが直接書く `INTERRUPTED_BY` で、`Canceller` ではない。**
+    監視スレッドは 50ms ごとにしか起きないので、シグナル受信直後は canceller がまだ何も知らない。
+    canceller を見ると、シグナル受信済みなのに次のセルを開始してしまい、下に書いた上書きが起きる。
+    最後のセルの直後にシグナルが来た場合に終了コードが 130 / 143 にならない問題も同じ原因。
+  - **キャンセルのフラグはセルを実行する前にも見る。** 前のセルの書き戻し中に Ctrl-C が届くと、
+    次のセルを開始した直後にキャンセルされ、**出力ゼロの結果がそのセルの前回結果を潰す**。
+    誰も頼んでいない実行で結果を失うことになる。GUI の `run_all` も同じ理由で
+    `stop_requested` をセルの前に見る。
+  - TUI は raw mode で SIGINT 自体が来ないので、Ctrl-C をキーイベントとして受けて cancel する。
+    `q` / `Esc` は従来どおり「終わってから終了」。
+  - `Canceller::cancel` はフラグ→pid の順、`run` は pid→フラグの順に触る。spawn の最中に
+    cancel が来ても、どちらかが必ず相手を見るので取りこぼさない。
+  - **pid は atomic ではなく `Mutex<i32>`。** kill する側は「id を読む→kill する」の間、
+    reap する側は「reap する→id を捨てる」の間、互いを排他する必要がある。
+    読んでから kill するまでスレッドは任意の長さ止まりうるので、その間に子が reap されて
+    pid が再利用されると、**無関係なプロセスグループを kill する**。ロックを取るのは
+    20ms ごとのポーリング 1 回ぶんで、キャンセル要求のポーリング自体は AtomicBool のまま。
+    この代償として `cancel` はシグナルハンドラから呼べない (呼んでいない)。
+  - **シェルが終了してから drain (最大 300ms) が終わるまでの Stop は何も kill しない。**
+    リーダーを reap した後もプロセスグループは子孫が残っていれば存続するが、その時点では
+    「グループが消えて番号が再利用された」のか「元の子孫がまだ属している」のかを区別できない。
+    パイプを掴んだ子孫は生き残る。
+  - **キャンセルされた実行も結果を書き戻す。** 途中まで出た出力を残すのがキャンセルの目的。
 
 ## 既知の制約: unix 以外は未対応
 
@@ -84,6 +117,24 @@ public リポジトリなので、**README・コードコメント・UI 文字�
   実行中に reload するとその基準がディスクの現在値に差し替わり、**比較が通ってしまう**。
   ガードが守ろうとしている当のものでガードが無効化され、古いコマンドの結果が
   別のセルに書き戻されうる。回帰テストは `reloading_is_refused_while_a_command_is_running`。
+- **Stop は実行ごとに新しい `Canceller` を持たせる** (`GuiState::arm` / `stop`)。使い回すと
+  一度 Stop したフラグが立ちっぱなしになり、次のコマンドが即キャンセルされる。実行が
+  終わったら `arm(None)` で外す。遅れて届いた Stop が次のコマンドに当たらないようにするため。
+  `run_all` はキャンセルされたセルで打ち切る (`RunReport::cancelled`)。
+- **GUI の操作状態 (`busy` / `stop_requested` / `Canceller`) は 1 つの `Mutex<Operation>` で扱う。**
+  別々の atomic にすると「走っているか」「Stop を覚える」「コマンドを kill する」の間に
+  操作の終了と次の操作の開始が割り込め、**前の操作の Stop が次の操作の 1 セル目に当たる**。
+- **`Canceller` を外している間の Stop は `stop_requested` フラグで拾う。** `Canceller` は
+  コマンドが走っている間しか存在しないが、フロントは `runandlog://started` で Stop を有効にした後、
+  操作が終わるまで有効なままにする (セル間でも押せる)。`run_all` のセル間 (書き戻しの実 IO を挟む
+  ms オーダーの窓) に押された Stop は、フラグが無いとどこにも残らず、**「止めた」と表示しながら
+  バッチが走り続ける**。
+  フラグは `acquire` (操作の開始) でクリアする。
+  Stop でバッチが終わったことは `BatchReport::stopped` で返す。キャンセルされた実行が 1 つも
+  無いまま終わる場合があるため、`RunReport` からは読み取れない。
+- **フロントは `listen` の購読が終わるまでボタンを有効にしない。** Stop は
+  `runandlog://started` を受けて初めて有効になるので、購読前に実行を始められると
+  **コマンドが走っている間ずっと Stop が押せない**。
 - **フロントは innerHTML を使わない。** コマンドとその出力は任意のテキストで、
   HTML として流し込むとドキュメントがウインドウ内でスクリプトを実行できてしまう。
   `textContent` と DOM 生成だけで組む。
@@ -95,15 +146,14 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 
 ## 未実装 / 今後
 
-- GUI からの実行キャンセル (Stop ボタン)。`exec` の `stop` フラグと `kill_process_group` は
-  private なので、コア側に API を足す必要がある。
 - 実行中の出力のライブ表示。現在の `exec::run` は終了時にまとめて `String` を返すだけで、
   途中経過を渡すフックが無い。
 
 ## 検証
 
 ```shell
-cargo test                  # 89 件
+cargo test                  # 98 件 (linux では 102 件。/proc を見るテストが 1 件、
+                            #         DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
 ```
@@ -111,5 +161,11 @@ cargo fmt --all --check
 TUI は端末が必要なので自動テストの対象外。手で確認する場合は pty を割り当てて起動する。
 
 ```shell
+# GNU (linux)
 (sleep 1; printf 'q'; sleep 1) | script -qec "stty rows 30 cols 100; ./target/debug/runandlog /tmp/exam.md" /dev/null
+# BSD (macOS)。-c は無い
+(sleep 1; printf 'q'; sleep 1) | script -q /dev/null ./target/debug/runandlog /tmp/exam.md
 ```
+
+Ctrl-C を送るなら `printf '\003'`。ただし **サンドボックス下では pty を割り当てられず
+(`script: openpty: Operation not permitted`) TUI を起動できない**ので、その場合は手で確認する。

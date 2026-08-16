@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use runandlog_cli::session::Session;
-use runandlog_core::ExecOptions;
+use runandlog_core::{Canceller, ExecOptions};
 
 /// A temporary directory for tests, including its own cleanup.
 struct TempDir(PathBuf);
@@ -54,6 +54,29 @@ fn writes_the_result_back_into_the_markdown() {
     assert!(text.contains("<!-- runandlog:begin -->"));
     assert!(text.contains("```text\nhello\n```"));
     assert!(text.ends_with("tail\n"));
+}
+
+#[test]
+fn a_cancelled_run_still_writes_back_what_the_command_printed() {
+    // The point of Ctrl-C on a command that hangs is to keep its output, so the
+    // write-back has to happen for a cancelled run exactly as for a finished one.
+    let dir = TempDir::new("cancelled");
+    let path = dir.write("note.md", "```shell\necho partial\nsleep 30\n```\n");
+    let mut session = session(&path, 50);
+
+    let canceller = Canceller::new();
+    let from_another_thread = canceller.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        from_another_thread.cancel();
+    });
+    let outcome = session.run_cell_cancellable(0, &canceller).unwrap();
+    assert!(outcome.cancelled);
+    assert!(!outcome.is_success());
+
+    let text = dir.read("note.md");
+    assert!(text.contains("(cancelled,"), "{text}");
+    assert!(text.contains("partial"), "{text}");
 }
 
 #[test]

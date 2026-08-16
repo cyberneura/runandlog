@@ -23,11 +23,12 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use runandlog_core::Canceller;
 
 use crate::session::Session;
 
@@ -67,36 +68,118 @@ struct RunReport {
     /// `exit 0`, `timeout`, and so on.
     status: String,
     success: bool,
+    /// Whether the run was stopped from the window. A batch stops here.
+    cancelled: bool,
+}
+
+/// How a "run all" ended.
+///
+/// `stopped` is carried separately because a batch can end on a Stop that landed
+/// between two cells, where there is no cancelled run to read it from.
+#[derive(Debug, Clone, Serialize)]
+struct BatchReport {
+    reports: Vec<RunReport>,
+    stopped: bool,
+}
+
+/// The operation in flight, if any, and what has been asked of it.
+///
+/// All three live under one lock rather than as separate atomics: they describe a
+/// single thing, and a Stop has to be decided against the operation it was pressed
+/// during. Read apart, "is anything running", "remember the stop" and "cancel the
+/// command" can interleave with an operation ending and the next one starting, and
+/// the stop then lands on a command the user never asked to stop.
+#[derive(Default)]
+struct Operation {
+    /// Whether a run or a reload is in flight.
+    busy: bool,
+    /// Whether Stop was pressed during it.
+    ///
+    /// A canceller exists only while a command is actually running, and a batch
+    /// spends real time between cells writing the previous result back. Without this
+    /// a Stop landing in that gap would reach nothing and be forgotten, leaving the
+    /// batch running after the window said it had stopped.
+    stop_requested: bool,
+    /// Handle for the command running right now.
+    canceller: Option<Canceller>,
 }
 
 /// Shared state behind the Tauri commands.
 struct GuiState {
     session: Mutex<Session>,
-    /// Whether a run is in flight. Keeps concurrent runs off the same file.
-    busy: AtomicBool,
+    operation: Mutex<Operation>,
 }
 
 impl GuiState {
-    /// Takes the busy flag, or reports that a run is already in flight.
+    fn operation(&self) -> std::sync::MutexGuard<'_, Operation> {
+        // Nothing under this lock can panic while it is held, so poisoning would
+        // only be a leftover from an unrelated crash.
+        self.operation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Publishes the handle for the command about to run, so Stop can reach it.
     ///
-    /// The guard clears the flag on drop, so an early return or a panic in a
-    /// command cannot leave the app permanently refusing to run anything.
+    /// Reports whether a stop was already asked for, which the caller must honour:
+    /// the window keeps Stop available for the whole operation, including the moment
+    /// before the first command has a handle to cancel.
+    fn arm(&self, canceller: Option<Canceller>) -> bool {
+        let mut operation = self.operation();
+        operation.canceller = canceller;
+        operation.stop_requested
+    }
+
+    /// Stops the operation in flight. Reports whether there was one.
+    ///
+    /// The request is remembered for as long as the operation lasts, so that a batch
+    /// stops even when the press lands between two cells.
+    fn stop(&self) -> bool {
+        let mut operation = self.operation();
+        if !operation.busy {
+            return false;
+        }
+        operation.stop_requested = true;
+        if let Some(canceller) = &operation.canceller {
+            canceller.cancel();
+        }
+        true
+    }
+
+    /// Whether Stop has been pressed during the operation in flight.
+    fn stop_requested(&self) -> bool {
+        self.operation().stop_requested
+    }
+
+    /// Marks an operation as started, or reports that one is already in flight.
+    ///
+    /// The guard clears the mark on drop, so an early return or a panic in a command
+    /// cannot leave the app permanently refusing to run anything.
     fn acquire(&self) -> Result<BusyGuard<'_>, String> {
-        if self.busy.swap(true, Ordering::SeqCst) {
+        let mut operation = self.operation();
+        if operation.busy {
             return Err("A command is already running.".to_string());
         }
+        // A stop belongs to the operation it was pressed during, so this one starts
+        // with a clean slate.
+        *operation = Operation {
+            busy: true,
+            ..Operation::default()
+        };
         Ok(BusyGuard { state: self })
     }
 }
 
-/// Clears the busy flag when it goes out of scope.
+/// Ends the operation when it goes out of scope.
 struct BusyGuard<'a> {
     state: &'a GuiState,
 }
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.state.busy.store(false, Ordering::SeqCst);
+        let mut operation = self.state.operation();
+        operation.busy = false;
+        operation.canceller = None;
     }
 }
 
@@ -171,7 +254,7 @@ async fn run_cell(
 /// changed underneath us, so the commands held in memory may no longer be the
 /// ones in the file.
 #[tauri::command]
-async fn run_all(app: AppHandle, state: State<'_, GuiState>) -> Result<Vec<RunReport>, String> {
+async fn run_all(app: AppHandle, state: State<'_, GuiState>) -> Result<BatchReport, String> {
     let _busy = state.acquire()?;
     let count = {
         let session = state.session.lock().map_err(lock_error)?;
@@ -179,13 +262,45 @@ async fn run_all(app: AppHandle, state: State<'_, GuiState>) -> Result<Vec<RunRe
     };
 
     let mut reports = Vec::new();
+    let mut stopped = false;
     for index in 0..count {
+        // Asked before the cell starts as well as after it ends. Writing the previous
+        // result back takes real time, and a Stop landing in that gap has no command
+        // to cancel -- starting this cell only to kill it at once would replace the
+        // result it already had with an empty one.
+        if state.stop_requested() {
+            stopped = true;
+            break;
+        }
         match execute(&app, &state, index).await {
-            Ok(report) => reports.push(report),
+            Ok(report) => {
+                stopped = report.cancelled;
+                reports.push(report);
+                if stopped {
+                    // Stop was pressed. Its result has been written back; carrying on
+                    // to the next cell is not what was asked for.
+                    break;
+                }
+            }
             Err(error) => return Err(error),
         }
     }
-    Ok(reports)
+    // Asked once more rather than left to the loop: a Stop landing while the last
+    // cell's result is written back never reaches a check above, and the window
+    // would report the batch as having run to the end after saying it was stopping.
+    Ok(BatchReport {
+        reports,
+        stopped: stopped || state.stop_requested(),
+    })
+}
+
+/// Stops the command in flight, keeping the output it has produced so far.
+///
+/// Reports whether there was anything to stop, so the window can tell "stopped"
+/// from "nothing was running" without guessing.
+#[tauri::command]
+fn cancel(state: State<'_, GuiState>) -> bool {
+    state.stop()
 }
 
 /// The body shared by [`run_cell`] and [`run_all`].
@@ -205,14 +320,32 @@ async fn execute(
         (session.command_of(index), session.exec_options())
     };
 
+    // One handle per run: a stopped cell must not leave the next one unable to start.
+    let canceller = Canceller::new();
+    if state.arm(Some(canceller.clone())) {
+        // Stop was pressed before this command had a handle. Honour it here rather
+        // than let the press vanish.
+        canceller.cancel();
+    }
+
     let _ = app.emit(EVENT_STARTED, index);
     // The lock is deliberately not held here: the run can take minutes, and the
     // window keeps reading the document while it does.
-    let outcome =
-        tauri::async_runtime::spawn_blocking(move || runandlog_core::run(&command, &options))
-            .await
-            .map_err(|error| format!("The worker thread died unexpectedly: {error}"))?
-            .map_err(|error| format!("The run failed: {error}"))?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        runandlog_core::run_cancellable(&command, &options, &canceller)
+    })
+    .await
+    .map_err(|error| format!("The worker thread died unexpectedly: {error}"))
+    .inspect_err(|_| {
+        state.arm(None);
+    })?
+    .map_err(|error| format!("The run failed: {error}"))
+    .inspect_err(|_| {
+        state.arm(None);
+    })?;
+    // Disarmed as soon as the command is over: from here on there is nothing to
+    // stop, and a Stop that arrived late must not reach the *next* run.
+    state.arm(None);
 
     let view = {
         let mut session = state.session.lock().map_err(lock_error)?;
@@ -226,6 +359,7 @@ async fn execute(
         index,
         status: outcome.status_text(),
         success: outcome.is_success(),
+        cancelled: outcome.cancelled,
     };
     let _ = app.emit(EVENT_FINISHED, &report);
     Ok(report)
@@ -252,7 +386,7 @@ pub fn run(session: Session) -> io::Result<()> {
     tauri::Builder::default()
         .manage(GuiState {
             session: Mutex::new(session),
-            busy: AtomicBool::new(false),
+            operation: Mutex::new(Operation::default()),
         })
         .setup(move |app| {
             // Say which file is open. tauri.conf.json cannot express this because
@@ -263,7 +397,7 @@ pub fn run(session: Session) -> io::Result<()> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            document, reload, run_cell, run_all
+            document, reload, run_cell, run_all, cancel
         ])
         .run(tauri::generate_context!())
         .map_err(io::Error::other)
@@ -326,7 +460,7 @@ fn window_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use runandlog_core::ExecOptions;
 
@@ -379,7 +513,7 @@ mod tests {
         GuiState {
             // The session is irrelevant to the busy flag, so any file will do.
             session: Mutex::new(session(&dir.write("doc.md", "# no cells\n"))),
-            busy: AtomicBool::new(false),
+            operation: Mutex::new(Operation::default()),
         }
     }
 
@@ -415,6 +549,77 @@ mod tests {
         // Without the Drop impl an early return would leave the app refusing to run
         // anything for the rest of the session.
         assert!(state.acquire().is_ok());
+    }
+
+    #[test]
+    fn stopping_while_idle_says_there_was_nothing_to_stop() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        // The window uses this to tell "stopped" from "there was nothing to stop"
+        // rather than reporting a stop that never happened.
+        assert!(!state.stop());
+        assert!(!state.stop_requested());
+    }
+
+    #[test]
+    fn stopping_reaches_the_run_in_flight() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        let _busy = state.acquire().unwrap();
+        let canceller = Canceller::new();
+        state.arm(Some(canceller.clone()));
+
+        assert!(state.stop());
+        assert!(canceller.is_cancelled());
+    }
+
+    #[test]
+    fn a_stop_between_two_cells_still_stops_the_batch() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        let _busy = state.acquire().unwrap();
+        // Where `run_all` is between cells: the previous run is disarmed and the
+        // next one has not started. There is no handle to cancel, so the press has
+        // to be remembered instead of dropped.
+        state.arm(None);
+
+        assert!(state.stop());
+        assert!(state.stop_requested());
+    }
+
+    #[test]
+    fn a_stop_that_beats_the_command_to_the_start_is_honoured() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        let _busy = state.acquire().unwrap();
+        // The window enables Stop as soon as the operation begins, which is before
+        // the first command exists.
+        state.stop();
+
+        let canceller = Canceller::new();
+        // `execute` cancels when arming reports a pending stop.
+        assert!(state.arm(Some(canceller.clone())));
+    }
+
+    #[test]
+    fn a_stop_does_not_carry_over_to_the_next_run() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        let busy = state.acquire().unwrap();
+        let stopped = Canceller::new();
+        state.arm(Some(stopped.clone()));
+        state.stop();
+        // Disarmed when the run ends, exactly as `execute` does it.
+        state.arm(None);
+        drop(busy);
+
+        let _busy = state.acquire().unwrap();
+        let next = Canceller::new();
+        // Without a fresh handle per run, and without clearing the request when the
+        // next operation starts, the next command would refuse to start.
+        assert!(!state.arm(Some(next.clone())));
+        assert!(!next.is_cancelled());
+        assert!(stopped.is_cancelled());
     }
 
     #[test]
