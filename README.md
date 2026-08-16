@@ -10,11 +10,28 @@ their results sit next to each other -- except the document stays plain Markdown
 
 ## Install
 
+From a checkout:
+
 ```shell
-cargo install --path crates/runandlog-cli
+cargo install --path crates/runandlog-cli                       # with the GUI
+cargo install --path crates/runandlog-cli --no-default-features # without it
 ```
 
-This installs the `runandlog` binary.
+Once a release has been published, from crates.io, and on macOS through Homebrew:
+
+```shell
+cargo install runandlog
+brew install --cask cyberneura/tap/runandlog
+```
+
+Each installs the `runandlog` binary. Building the GUI needs the system webview,
+which macOS has and Linux does not until `webkit2gtk-4.1` and `gtk3` are
+installed -- `--no-default-features` drops it and leaves the CLI and TUI.
+
+The releases page carries built binaries too: Apple Silicon with the GUI, signed
+and notarized, and x86_64 Linux without it, so that one asks for no webview. It is
+still a glibc build, so a distribution older than the one it was built on may
+refuse it; build from source there.
 
 ## Usage
 

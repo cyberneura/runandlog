@@ -15,7 +15,7 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 ## 設計の要点
 
 - **コアは IO を持たない**。`runandlog-core` はパース (`parse`)・実行 (`exec`)・整形 (`render`)
-  だけを担当し、ファイルの読み書きは `runandlog-cli` の `session` が行う。TUI・非対話実行・
+  だけを担当し、ファイルの読み書きは `runandlog` クレート (`crates/runandlog-cli/`) の `session` が行う。TUI・非対話実行・
   将来の GUI が同じコアを共有できるようにするため。
 - **書き戻しは範囲置換だけで行う**。`parse` は結果をバイトオフセットで保持し、`splice` が
   該当範囲を置き換える。Markdown を再構築しないので、原文の書式がそのまま残る。
@@ -155,6 +155,47 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 
 **ヘッドレスなのでウインドウの目視確認はできない。** ビルドと `cargo test` は通るので、
 検証はそこまで。実機で開く確認は動作確認できる環境で行うこと。
+
+## リリース
+
+`scripts/release.sh` (既定 minor) が version を上げて push し、GitHub Actions の Release
+ワークフローを起動して watch する。ワークフローは **workflow_dispatch のみ**で、push では走らない。
+
+- **version は毎回上げる。** 公開済みの version で起動すると plan ジョブが即失敗する
+  (mac の署名と公証を無駄に回さないよう、ビルド前に見ている)。
+- **push した後に失敗すると、リリースされない version が main に残る。** 次に普通に実行すると
+  さらに上の version を振ってしまうので、スクリプトはその状態を検出して止まる。
+  `scripts/release.sh --retry` が同じ version でやり直す。
+- **watch する run は、dispatch ごとの合言葉 (`dispatch_id` → `run-name`) と push した SHA の
+  両方で特定する。** 「最新の run」を見ると、今回の run がまだ登録されていない時に**前回の結果**を
+  今回のものとして報告する。合言葉が `displayTitle` に出ない場合に備えて、SHA と run id の
+  大小によるフォールバックも持たせてある。
+- **未リリースの version が残っているかは、自分が書いた bump コミット (`Release v<version>`) で
+  判定する。** リリース履歴では区別が付かない — 0 件なら「初回」と「初回が失敗して残った」が
+  同じに見え、1 件でもあれば別 version の draft が「過去に出した証拠」に見える。
+- **mac は arm64 のみ、既定 feature (GUI 込み) でビルドして Developer ID で署名 + 公証する。**
+  Homebrew の cask は quarantine を付けるので、署名も公証も無いと受け取った側の初回起動が
+  止まる。素のバイナリは staple できないので、チケットは Apple 側にしか残らない
+  (Gatekeeper はオンラインで引く)。**公証の結果は `--output-format json` の `status` で見る。**
+  提出が完了しさえすれば `notarytool` は成功終了しうるので、終了コードだけでは Invalid を拾えない。
+- **Linux は `--no-default-features`。** 既定 feature には Tauri が入り、webkit2gtk に
+  動的リンクしたバイナリは同じ webkit を持たない環境で起動しない。ただし glibc には
+  動的リンクしたままなので、**「どの Linux でも動く」わけではない** (ビルドした runner より
+  古い glibc では起動しない)。
+- **Release は draft で作ってからアセットを数えて公開する。** `gh release create` は先に
+  Release を作ってからアップロードするので、途中で失敗すると**公開済みで中身の欠けた Release**
+  が残る。draft で残っている間は誰にも見えず、同じ version の再実行が**それを消して作り直す**
+  (公開済みの Release には触らない)。
+- Homebrew の cask は別リポジトリ (`cyberneura/homebrew-tap`) なので、CI ではなく
+  `scripts/update-cask.sh` が手元の認証情報で更新する。tap への書き込み権を持つ token を
+  この repo の secret に置かずに済む。**cask の `binary` はアーカイブ内のディレクトリを含めた
+  パスで書く** (cask はトップレベルのディレクトリに降りてくれない)。
+- crates.io は `--crates` を指定した時だけ。公開は取り消せないので既定は off。
+  `CARGO_REGISTRY_TOKEN` の secret が要る。**publish ジョブは macOS で走らせる**:
+  `cargo publish` は公開するものをビルドして検証し、既定 feature には webview が要るため。
+  publish 済みの version は飛ばすので、片方だけ通った後の再実行が続きから進められる。
+  `Cargo.toml` の `runandlog-core = { path = ..., version = ... }` は workspace version と
+  揃っている必要がある (揃っていないと publish が拒否される)。release.sh が両方書き換える。
 
 ## 未実装 / 今後
 

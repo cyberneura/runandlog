@@ -3,8 +3,8 @@
 //! Extracts shell command cells from Markdown (`parse`), runs them (`exec`), and
 //! formats the outcome for writing back into the Markdown (`render`).
 //!
-//! File IO is deliberately kept out of this crate. Callers such as runandlog-cli
-//! perform it, so that the TUI, a future GUI, and non-interactive runs can all
+//! File IO is deliberately kept out of this crate. Callers such as the runandlog
+//! binary perform it, so that the TUI, the GUI and non-interactive runs can all
 //! share the same pure functions.
 
 pub mod exec;
