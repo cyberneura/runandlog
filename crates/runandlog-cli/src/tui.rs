@@ -56,6 +56,14 @@ fn is_cancel_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// What the marker of a cell says, telling apart a first run from a repeat.
+///
+/// Both are the same width so that the highlighted markers line up down the
+/// column, whichever cells happen to carry a result.
+fn run_label(has_result: bool) -> &'static str {
+    if has_result { "Re-run" } else { "Run   " }
+}
+
 /// The lines to draw, plus the line range occupied by each cell.
 struct Rendered {
     lines: Vec<Line<'static>>,
@@ -166,7 +174,14 @@ impl App {
                 Style::default().fg(Color::Green)
             };
             lines.push(Line::from(vec![
-                Span::styled(format!(" [{}] > Run ", cell.display_number()), marker_style),
+                Span::styled(
+                    format!(
+                        " [{}] > {} ",
+                        cell.display_number(),
+                        run_label(doc.result_text(cell).is_some())
+                    ),
+                    marker_style,
+                ),
                 Span::styled(
                     match &cell.out_file {
                         Some(path) => format!("  -> {path}"),
@@ -409,6 +424,14 @@ mod tests {
         assert!(is_quit_key(key(KeyCode::Char('q'), KeyModifiers::NONE)));
         assert!(is_quit_key(key(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(is_quit_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn a_cell_that_already_ran_says_so() {
+        assert_eq!(run_label(true).trim(), "Re-run");
+        assert_eq!(run_label(false).trim(), "Run");
+        // Equal widths keep the markers aligned down the column.
+        assert_eq!(run_label(true).len(), run_label(false).len());
     }
 
     #[test]

@@ -60,7 +60,8 @@ Ctrl-C stops the command the same way; see the key table below.
 ### The desktop app
 
 `--gui` opens a window showing the same document the TUI shows: the file path,
-then every cell with its command, a `▶ Run` button, and the result of the last
+then every cell with its command, a `▶ Run` button -- `↻ Re-run` once the cell
+holds a result, since pressing it replaces that result -- and the result of the last
 run. **Run all** runs every cell in order, **Stop** ends the command that is
 running and keeps what it printed, **Reload** picks up edits made in an external
 editor.
@@ -181,10 +182,16 @@ cargo clippy --all-targets
 cargo fmt --all
 ```
 
-`examples/exam.md` is a sample for trying things out. **Running it rewrites the
-file**, so work on a copy.
+`examples/exam.md` is a sample for trying things out. **Running a document
+rewrites it** and leaves result files beside it, so the sample is never run where
+it sits. This script copies it into a directory git ignores and runs the copy, so no
+number of trials shows up in `git status`.
 
 ```shell
-cp examples/exam.md /tmp/exam.md
-cargo run -p runandlog-cli -- /tmp/exam.md
+examples/run-example.sh              # open the TUI
+examples/run-example.sh --run-all    # run every cell
+examples/run-example.sh --gui        # open the desktop app
 ```
+
+Arguments are passed straight through. The binary is built from the current tree,
+or set `RUNANDLOG` to try one that already exists.

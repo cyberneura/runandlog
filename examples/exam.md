@@ -1,7 +1,8 @@
 # Sample document
 
-Open this with `runandlog examples/exam.md` and you can pick and run the code
-blocks below.
+Open a throwaway copy of this with `examples/run-example.sh` and you can pick and
+run the code blocks below. Running this file where it sits rewrites it and drops
+result files beside it, which is what the script is there to avoid.
 
 ## A single-line command
 

@@ -134,10 +134,22 @@ public リポジトリなので、**README・コードコメント・UI 文字�
   無いまま終わる場合があるため、`RunReport` からは読み取れない。
 - **フロントは `listen` の購読が終わるまでボタンを有効にしない。** Stop は
   `runandlog://started` を受けて初めて有効になるので、購読前に実行を始められると
-  **コマンドが走っている間ずっと Stop が押せない**。
+  **コマンドが走っている間ずっと Stop が押せない**。購読は all-or-nothing で扱う
+  (`Promise.allSettled` → 一部でも失敗したら成功したぶんを unlisten する)。半分だけ
+  購読された状態を作らないため。
+- **購読に失敗しても縮退して開く。** capability 不足などで `listen` が拒否されたら、
+  ドキュメントを読んでボタンを有効にし、理由をステータスに出す。ここで固まらせると
+  ウインドウが何もできない箱になる。この状態では `started` が来ないので、**Stop は
+  busy に合わせて有効にする** (既定はタイムアウト無しなので、押せないと長いコマンドを
+  ウインドウから止められない)。早すぎる Stop はバックエンドが「何も走っていない」と
+  返すだけで無害。
 - **フロントは innerHTML を使わない。** コマンドとその出力は任意のテキストで、
   HTML として流し込むとドキュメントがウインドウ内でスクリプトを実行できてしまう。
   `textContent` と DOM 生成だけで組む。
+- **capability を置かないとコアプラグインのコマンドが拒否される** (`capabilities/default.json`)。
+  `invoke_handler` に登録した自前コマンドは capability 無しでも通るので、**`event.listen` だけが
+  静かに失敗する**。実機で開くまで気付かなかった。与えるのは `core:event:default` だけで、
+  window / webview / menu / path は使っていない。
 - ウインドウは `tauri.conf.json`、フロントの実体は `crates/runandlog-cli/ui/`
   (素の HTML / CSS / JS。node のビルド工程を持たないので `withGlobalTauri` を有効にしている)。
 
@@ -152,19 +164,33 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 ## 検証
 
 ```shell
-cargo test                  # 98 件 (linux では 102 件。/proc を見るテストが 1 件、
+cargo test                  # 99 件 (linux では 103 件。/proc を見るテストが 1 件、
                             #         DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
 ```
 
+手で動かす時は `examples/run-example.sh` を使う。`examples/exam.md` の使い捨てコピーを
+gitignore 下 (`examples/scratch/`) に作ってからそれを実行するので、**何回動かしても
+ワーキングツリーが汚れない**。実行は結果ファイルもドキュメントの隣に書くので、サンプルを
+直接動かしてはいけない。引数はそのまま渡る。
+
+```shell
+examples/run-example.sh --run-all
+RUNANDLOG=./target/release/runandlog examples/run-example.sh --list  # 既存のバイナリで
+```
+
+コピーを作るだけなら `examples/create-test-copy.sh` (パスを stdout に出す)。下の pty 起動の
+ように、実行を自分で組み立てたい時に使う。
+
 TUI は端末が必要なので自動テストの対象外。手で確認する場合は pty を割り当てて起動する。
 
 ```shell
-# GNU (linux)
-(sleep 1; printf 'q'; sleep 1) | script -qec "stty rows 30 cols 100; ./target/debug/runandlog /tmp/exam.md" /dev/null
+DOC=$(examples/create-test-copy.sh)
+# GNU (linux)。パスは環境変数で渡して内側で quote する (パスに空白が入ると壊れるため)
+(sleep 1; printf 'q'; sleep 1) | DOC="$DOC" script -qec 'stty rows 30 cols 100; ./target/debug/runandlog "$DOC"' /dev/null
 # BSD (macOS)。-c は無い
-(sleep 1; printf 'q'; sleep 1) | script -q /dev/null ./target/debug/runandlog /tmp/exam.md
+(sleep 1; printf 'q'; sleep 1) | script -q /dev/null ./target/debug/runandlog "$DOC"
 ```
 
 Ctrl-C を送るなら `printf '\003'`。ただし **サンドボックス下では pty を割り当てられず
