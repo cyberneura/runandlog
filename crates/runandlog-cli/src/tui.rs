@@ -11,7 +11,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use runandlog_core::ExecOutcome;
+use runandlog_core::{Canceller, ExecOutcome};
 
 use crate::session::Session;
 
@@ -45,6 +45,15 @@ fn is_quit_key(key: KeyEvent) -> bool {
         KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
+}
+
+/// Whether a key press means "stop the running command".
+///
+/// Only Ctrl-C. `q` and `Esc` keep their documented meaning of quitting once the
+/// command has finished, which is what you want for a command that is merely slow;
+/// Ctrl-C is the way out of one that will never finish.
+fn is_cancel_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// The lines to draw, plus the line range occupied by each cell.
@@ -283,12 +292,19 @@ impl App {
     fn execute(&mut self, index: usize, terminal: &mut DefaultTerminal) -> io::Result<Batch> {
         let command = self.session.command_of(index);
         let options = self.session.exec_options();
+        // One per run: a cancelled cell must not leave the next one unable to start.
+        let canceller = Canceller::new();
+        let worker_canceller = canceller.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(runandlog_core::run(&command, &options));
+            let _ = tx.send(runandlog_core::run_cancellable(
+                &command,
+                &options,
+                &worker_canceller,
+            ));
         });
 
-        let outcome = self.wait_for(index, rx, terminal);
+        let outcome = self.wait_for(index, rx, terminal, &canceller);
         self.running = None;
         match outcome {
             Ok(Ok(outcome)) => match self.session.apply_outcome(index, &outcome) {
@@ -321,20 +337,27 @@ impl App {
 
     /// Handles keys pressed while a command is running.
     ///
-    /// A running command cannot be stopped, so only a quit request is honoured
-    /// here and everything else is discarded. Without discarding them, keys
-    /// pressed during the run would all fire at once once it finishes.
+    /// Only quitting and cancelling are honoured here; everything else is
+    /// discarded, since keys pressed during the run would otherwise all fire at
+    /// once when it finishes.
     ///
     /// The quit keys are the same ones the normal event loop takes, so that the
     /// documented "q quits after the command finishes" holds while one is running.
-    fn drain_events_while_running(&mut self) -> io::Result<()> {
+    /// Ctrl-C does not wait: raw mode means the terminal never turns it into a
+    /// signal, and the command sits in a process group of its own anyway, so this
+    /// is the only thing that can reach a command that hangs.
+    fn drain_events_while_running(&mut self, canceller: &Canceller) -> io::Result<()> {
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
-                && is_quit_key(key)
             {
-                // Quit after the command finishes; its result still gets written back.
-                self.quit = true;
+                if is_cancel_key(key) {
+                    canceller.cancel();
+                    self.quit = true;
+                } else if is_quit_key(key) {
+                    // Quit after the command finishes; its result still gets written back.
+                    self.quit = true;
+                }
             }
         }
         Ok(())
@@ -346,6 +369,7 @@ impl App {
         index: usize,
         rx: mpsc::Receiver<io::Result<ExecOutcome>>,
         terminal: &mut DefaultTerminal,
+        canceller: &Canceller,
     ) -> io::Result<io::Result<ExecOutcome>> {
         let mut phase = 0;
         loop {
@@ -355,14 +379,14 @@ impl App {
                     // otherwise return without ever looking at the terminal, so during
                     // "run all" over fast cells a queued q / Esc / Ctrl-C would not be
                     // seen until the whole batch had run.
-                    self.drain_events_while_running()?;
+                    self.drain_events_while_running(canceller)?;
                     return Ok(result);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     phase += 1;
                     self.running = Some((index, phase));
                     self.redraw(terminal)?;
-                    self.drain_events_while_running()?;
+                    self.drain_events_while_running(canceller)?;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Ok(Err(io::Error::other("the worker thread died unexpectedly")));

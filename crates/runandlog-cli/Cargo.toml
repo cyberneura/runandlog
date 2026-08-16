@@ -25,5 +25,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tauri = { version = "2", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Used solely to catch Ctrl-C during a non-interactive run.
+libc = "0.2"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
