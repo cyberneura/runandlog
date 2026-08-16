@@ -1,7 +1,11 @@
 /* Window styling. Deliberately plain: this is a tool window, not a web page. */
 
 :root {
-  --bg: #ffffff;
+  /* The page sits a shade behind the cards rather than level with them: with both
+     white, a card was told from the page by its border alone and the document read
+     as one flat sheet. */
+  --bg: #e5e7eb;
+  --card: #ffffff;
   --fg: #1f2328;
   --muted: #656d76;
   --border: #d0d7de;
@@ -13,7 +17,9 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0d1117;
+    /* Same relationship the other way round: the page is the darker of the two. */
+    --bg: #010409;
+    --card: #0d1117;
     --fg: #e6edf3;
     --muted: #8b949e;
     --border: #30363d;
@@ -71,7 +77,7 @@ button {
   padding: 4px 12px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--bg);
+  background: var(--card);
   color: var(--fg);
   font: inherit;
   cursor: pointer;
@@ -96,6 +102,7 @@ button:disabled {
 .cell {
   border: 1px solid var(--border);
   border-radius: 8px;
+  background: var(--card);
   margin-bottom: 14px;
   overflow: hidden;
 }
@@ -115,7 +122,13 @@ button:disabled {
 
 .number {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 18px;
+  font-weight: 700;
   color: var(--muted);
+  /* Fixed width so the buttons beside it line up whether the number is one digit
+     or two, since the numbers carry no brackets to hold a shape of their own. */
+  min-width: 1.6em;
+  text-align: center;
 }
 
 .out {

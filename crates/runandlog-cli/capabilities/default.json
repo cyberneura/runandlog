@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the window is allowed to call. The commands this app registers itself are permitted without being listed; this is here for the core plugins, whose commands are denied unless granted. Without it `listen` is refused and the window never hears that a run started or finished. Only the event plugin is granted, since subscribing is the whole of what the window needs from the core -- `core:default` would hand it the window, webview, menu and path plugins it never calls.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

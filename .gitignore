@@ -3,3 +3,7 @@
 # Written by tauri-build on every GUI build (permission schemas for the editor).
 # Regenerated from tauri.conf.json, so there is nothing to keep.
 /crates/runandlog-cli/gen
+
+# Throwaway copies of the sample made by examples/create-test-copy.sh, together
+# with whatever running them writes.
+/examples/scratch

@@ -22,6 +22,13 @@ const reloadButton = document.getElementById('reload')
 let running = null
 /** Buttons are disabled while a run is in flight. */
 let busy = false
+/**
+ * Whether the backend's events are being listened to. See `start`.
+ *
+ * Taken for granted until `start` learns otherwise, so that the moment before the
+ * subscriptions settle -- where nothing is running yet -- does not offer Stop.
+ */
+let subscribed = true
 
 function setStatus(text, kind) {
   statusEl.textContent = text
@@ -32,13 +39,15 @@ function setBusy(value) {
   busy = value
   runAllButton.disabled = value
   reloadButton.disabled = value
-  // Stop is the one button that only makes sense while a command is running, and
-  // it stays off until the backend says one has started: a press that beats the
-  // `run_cell` / `run_all` call there finds nothing to stop and is dropped. It is
-  // left on between the cells of a batch, where the backend remembers the request.
-  if (!value) {
-    stopButton.disabled = true
-  }
+  // Stop is the one button that only makes sense while a command is running. With
+  // the events subscribed it waits for the backend to say one has started, since a
+  // press that beats the `run_cell` / `run_all` call there finds nothing to stop
+  // and is dropped; it then stays on between the cells of a batch, where the
+  // backend remembers the request. Without them that signal never comes, so being
+  // busy has to be enough -- otherwise a command with no timeout could not be
+  // stopped from the window at all. A press too early is harmless: the backend
+  // reports there was nothing running and clears the request when one starts.
+  stopButton.disabled = value ? subscribed : true
   for (const button of cellsEl.querySelectorAll('button.run')) {
     button.disabled = value
   }
@@ -76,15 +85,18 @@ function renderCell(cell) {
 
   const number = document.createElement('span')
   number.className = 'number'
-  number.textContent = `[${cell.number}]`
+  number.textContent = String(cell.number)
   head.append(number)
 
   const button = document.createElement('button')
   button.className = 'run'
   button.type = 'button'
-  // The label is a play triangle plus a word, so the button reads the same way
-  // whether or not the glyph renders.
-  button.textContent = running === cell.index ? '▶ Running…' : '▶ Run'
+  // The label is a glyph plus a word, so the button reads the same way whether or
+  // not the glyph renders. A cell holding a result says Re-run, since pressing it
+  // replaces that result rather than adding one.
+  const hasResult = cell.result !== null && cell.result !== undefined
+  button.textContent =
+    running === cell.index ? '▶ Running…' : hasResult ? '↻ Re-run' : '▶ Run'
   button.disabled = busy
   button.addEventListener('click', () => runCell(cell.index))
   head.append(button)
@@ -102,7 +114,7 @@ function renderCell(cell) {
 
   section.append(head, command)
 
-  if (cell.result !== null && cell.result !== undefined) {
+  if (hasResult) {
     const result = document.createElement('pre')
     result.className = 'result'
     result.textContent = cell.result
@@ -111,11 +123,14 @@ function renderCell(cell) {
   return section
 }
 
+/** Redraws from the backend's copy of the document. Reports whether it worked. */
 async function refresh() {
   try {
     render(await invoke('document'))
+    return true
   } catch (error) {
     setStatus(String(error), 'error')
+    return false
   }
 }
 
@@ -201,7 +216,10 @@ reloadButton.addEventListener('click', () => reload(false))
 async function start() {
   setBusy(true)
   setStatus('Starting…', 'info')
-  await Promise.all([
+  // Settled rather than raced: a rejection from `Promise.all` would leave whatever
+  // subscriptions did succeed in place, half-listening. Either all three are on or
+  // none are, so the rest of the window has one state to reason about.
+  const attempts = await Promise.allSettled([
     listen('runandlog://document', (event) => {
       render(event.payload)
     }),
@@ -216,9 +234,34 @@ async function start() {
       running = null
     }),
   ])
+  const failure = attempts.find((attempt) => attempt.status === 'rejected')
+  subscribed = failure === undefined
+  if (!subscribed) {
+    // Subscribing can be refused -- by a missing capability, say. The window is
+    // then blind to a run's progress, but it can still show the document, run
+    // cells and stop them, so it opens in that state rather than saying
+    // "Starting…" forever with every button dead.
+    // Awaited, and the failures swallowed: until the subscriptions that did take
+    // are gone the window is half-listening, which is the state this is here to
+    // avoid. One that refuses to come off is not worth stopping the window for --
+    // the status already says the events cannot be relied on.
+    await Promise.allSettled(
+      attempts
+        .filter((attempt) => attempt.status === 'fulfilled')
+        .map((attempt) => attempt.value()),
+    )
+  }
+
   setBusy(false)
-  setStatus('Ready.', 'info')
-  await refresh()
+  // The status is set after the document is read, and only if reading it worked:
+  // "Ready." over the top of a failure would hide the one message explaining an
+  // empty window.
+  if (await refresh()) {
+    setStatus(
+      subscribed ? 'Ready.' : `Cannot follow a run: ${failure.reason}`,
+      subscribed ? 'info' : 'error',
+    )
+  }
 }
 
 start()
