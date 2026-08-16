@@ -237,8 +237,11 @@ report_state() {
 }
 
 # Armed before anything else can fail, and tolerant of a run that is not known yet.
+# Every variable the handler reads is set first: under `set -u` an unset one would
+# abort the handler itself, taking the recovery instructions with it.
 run_id=""
 run_url=""
+dispatched="false"
 trap report_state ERR
 
 # The newest run as it stands, read before dispatching so that ours can be told
@@ -250,7 +253,6 @@ previous=$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '
 # alone is not enough: two dispatches of the same commit are indistinguishable,
 # and "the newest run" can be somebody else's, or one queued behind ours.
 nonce="$(date +%s)-$$"
-dispatched="false"
 # The commit goes with it. `--ref main` resolves when the dispatch lands, so a
 # commit that arrives in between would be built and published in place of this one;
 # the workflow compares the two and stops rather than release something else.
