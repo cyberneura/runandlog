@@ -18,6 +18,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# One argument at most, and only a known one. `--crates` and `--retry` were both
+# real options once; taking a leftover call silently and releasing anyway would be
+# the worst of the readings.
+if [[ $# -gt 1 ]]; then
+    echo "Usage: scripts/release.sh [patch|minor|major]" >&2
+    exit 1
+fi
 BUMP="${1:-minor}"
 case "$BUMP" in
     patch | minor | major) ;;

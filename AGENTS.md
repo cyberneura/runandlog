@@ -159,10 +159,13 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 ## リリース
 
 **`Cargo.toml` の version を main で変えると、それがリリースになる。** ワークフローは
-`push` (paths: Cargo.toml) と `workflow_dispatch` で起動し、**その version が既に
-リリース済みかどうか**だけで実行するか決める。`scripts/release.sh [patch|minor|major]` は
+**main への push すべて**と `workflow_dispatch` で起動し、**その version が既にリリース済みか
+どうか**だけで実行するか決める。`scripts/release.sh [patch|minor|major]` は
 version を書き換えて push するだけの薄いスクリプトで、手で Cargo.toml を編集して push しても同じ。
 
+- **paths フィルタは付けない。** `Cargo.toml` に絞ると安く済むが、ビルドや workflow や
+  コードの不具合で失敗したリリースを「原因を直して push」で再試行できなくなる (その修正は
+  Cargo.toml を触らない)。判定は checkout と API 1 回で済むので、絞る価値より安い。
 - **判定は「diff で version が変わったか」ではなく「その version が公開済みか」。** squash /
   rebase / 直 push で diff の形は変わるが、公開済みかどうかは変わらない。この判定にすると
   **何度実行しても安全**になり、失敗したリリースは原因を直して push すればそのまま続きになる

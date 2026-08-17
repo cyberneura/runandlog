@@ -8,14 +8,16 @@ name: Release
 # already. Asking that makes the workflow idempotent: run again over a released
 # version and nothing happens; run again over a failed one and it carries on.
 #
-# `paths` only keeps CI off pushes that cannot possibly be a release. Correctness
-# rests on the check in `plan`, not on it.
+# Every push to main is looked at, with no path filter. Filtering on Cargo.toml
+# would be cheaper, but it would also mean that a release which failed on the
+# build, the workflow or the code itself could not be retried by pushing the fix
+# -- the fix does not touch Cargo.toml. The check below costs a checkout and one
+# API call, which is less than the recovery it would otherwise cost.
 on:
   push:
     branches: [main]
-    paths: ["Cargo.toml"]
-  # For a version that is right but whose run failed for a reason since fixed. The
-  # same check applies, so this cannot republish anything.
+  # For a version that is right but whose run failed for a reason since fixed and
+  # not yet pushed. The same check applies, so this cannot republish anything.
   workflow_dispatch:
 
 permissions:
