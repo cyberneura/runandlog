@@ -76,10 +76,20 @@ cargo update --workspace --quiet
 # Checked rather than assumed: a reformat or a rename would leave a substitution
 # above matching nothing, and a half-bumped tree pushes a commit that releases
 # nothing while looking like it should.
-written=$(cargo metadata --format-version 1 --no-deps \
-    | jq -r '.packages[] | select(.name == "runandlog") | .version')
+metadata=$(cargo metadata --format-version 1 --no-deps)
+written=$(jq -r '.packages[] | select(.name == "runandlog") | .version' <<< "$metadata")
 if [[ $written != "$next" ]]; then
     echo "Error: Cargo.toml still says $written. Check the substitutions." >&2
+    exit 1
+fi
+# The version cli asks of core, read back through cargo rather than by matching the
+# line again: a substitution that missed because the line was reformatted would
+# also be missed by a check written the same way. A mismatch here is not caught
+# until `cargo publish`, by which point the release is out.
+required=$(jq -r '.packages[] | select(.name == "runandlog") | .dependencies[]
+    | select(.name == "runandlog-core") | .req' <<< "$metadata")
+if [[ $required != "^$next" ]]; then
+    echo "Error: runandlog depends on runandlog-core $required, not ^$next." >&2
     exit 1
 fi
 if ! grep -q "\"version\": \"$next\"" crates/runandlog-cli/tauri.conf.json; then
