@@ -40,6 +40,17 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.decide.outputs.release }}
     steps:
+      # A dispatch names its own ref, and a branch carrying an unreleased version
+      # would otherwise be built and published from wherever it sits. Releases come
+      # from main; a push cannot be anything else, but a dispatch can.
+      - name: Refuse to release from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::releases come from main, and this run is on ${REF}"
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
