@@ -1,77 +1,47 @@
 name: Release
 
-# Started by hand, never by a push: one dispatch is one version.
-# Locally that is `scripts/release.sh [patch|minor|major]`, which bumps the
-# version first.
+# Releases follow the version in Cargo.toml: change it on main and the release
+# happens. Nothing else starts one.
+#
+# What decides whether to release is not the diff -- squash, rebase and a direct
+# push each leave a different one -- but whether that version has been released
+# already. Asking that makes the workflow idempotent: run again over a released
+# version and nothing happens; run again over a failed one and it carries on.
+#
+# `paths` only keeps CI off pushes that cannot possibly be a release. Correctness
+# rests on the check in `plan`, not on it.
 on:
+  push:
+    branches: [main]
+    paths: ["Cargo.toml"]
+  # For a version that is right but whose run failed for a reason since fixed. The
+  # same check applies, so this cannot republish anything.
   workflow_dispatch:
-    inputs:
-      publish_crates:
-        description: "Publish both crates to crates.io as well"
-        type: boolean
-        default: false
-      dispatch_id:
-        description: "Word echoed in the run name, so that whoever started this run can find it"
-        type: string
-        default: ""
-      expected_sha:
-        description: "Commit to release; the run stops unless main is still on it"
-        type: string
-        required: true
 
-# The name carries the word back, since a caller cannot otherwise tell its own run
-# from another dispatch of the same commit.
-run-name: Release ${{ inputs.dispatch_id && format('({0})', inputs.dispatch_id) || '' }}
-
-# Only the job that creates the release needs to write. The job that handles the
-# signing certificate is left with read.
 permissions:
   contents: read
 
-# Serialised, because a cancelled run leaves its version bumped on main and never
-# released. Both keys are needed:
-#   cancel-in-progress: false — a later dispatch must not kill a running one.
-#   queue: max — hold up to 100 pending. The default `queue: single` keeps only
-#     one pending run and replaces it, so three dispatches in a row lose the
-#     middle version.
+# Serialised so that two pushes in quick succession cannot build the same version
+# twice. `queue: max` holds up to 100 pending rather than the default `single`,
+# which keeps one and cancels the rest; it may not be paired with
+# `cancel-in-progress: true`.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
   queue: max
 
 jobs:
-  # The version is settled once and handed to every job. Reading Cargo.toml in
-  # each of them would let a tag and its artifacts disagree if main moved.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      # `--ref main` resolves when the dispatch lands, not when it was sent, so a
-      # commit that arrives in between would be the one built and published. The
-      # caller says which commit it meant; anything else stops here.
-      - name: Check the commit is the one that was asked for
-        env:
-          EXPECTED: ${{ inputs.expected_sha }}
-          ACTUAL: ${{ github.sha }}
-        run: |
-          # Empty is refused rather than waved through: a check that any caller can
-          # skip by leaving a field blank is not a check. Dispatching by hand means
-          # pasting the commit, which is the point -- saying which one is meant.
-          if [ -z "$EXPECTED" ]; then
-            echo "::error::expected_sha is empty. Pass the commit to release (scripts/release.sh does)."
-            exit 1
-          fi
-          if [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "::error::this run is on $ACTUAL, but $EXPECTED was the commit meant for release"
-            exit 1
-          fi
 
       - name: Read version
         id: version
@@ -83,31 +53,30 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing v$VERSION"
 
-      - name: Refuse a version that is already published
+      - name: Decide whether this version still needs releasing
+        id: decide
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Caught before the build, so that a mistake does not cost a signing and
-          # notarisation round.
-          #
           # This endpoint answers for published releases only -- a draft has no tag
-          # for it to find -- which is exactly the question here. Drafts are dealt
-          # with by the release job, which has the write access to see them.
+          # for it to find -- which is the question being asked here. A draft left
+          # by a failed run is dealt with in the release job, which can see it.
           #
-          # Only a 404 counts as "no such release". Treating every failed lookup
-          # that way would let a rate limit or an outage read as absence.
+          # Only 404 counts as "not released". A rate limit or an outage read that
+          # way would build and publish a version that is already out.
           status=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" \
             --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true)
           case "$status" in
             404)
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "Releasing v${VERSION}"
               ;;
             200)
-              echo "::error::v${VERSION} is already published. Bump the version first (scripts/release.sh does it)."
-              exit 1
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "v${VERSION} is already released; nothing to do."
               ;;
             *)
               echo "::error::could not tell whether v${VERSION} exists (HTTP ${status:-none}). Not guessing."
@@ -117,6 +86,7 @@ jobs:
 
   build:
     needs: plan
+    if: needs.plan.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -130,8 +100,7 @@ jobs:
           # Linux gets the CLI and TUI alone. The default features pull in Tauri,
           # and a binary linked against webkit2gtk will not start where that
           # library is absent. Asking for no webview is worth more here than the
-          # window -- though the binary is still linked against glibc, so it is not
-          # portable to every distribution either.
+          # window -- though it is still a glibc build, not a portable one.
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: "--no-default-features"
@@ -279,6 +248,7 @@ jobs:
   # missing a platform.
   release:
     needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -298,6 +268,9 @@ jobs:
           COMMIT: ${{ github.sha }}
           EXPECTED_ASSETS: "2"
         run: |
+          # `--paginate` hands back one array per page, so the pages are flattened
+          # into a single one before anything asks a question of them.
+          set -o pipefail
           # Drafts left by a run that failed partway are cleared, so that the same
           # version can be built again instead of being blocked by its own remains.
           # A published release is never touched: it is the thing this workflow
@@ -307,9 +280,6 @@ jobs:
           # for that endpoint to find, so a lookup would report nothing and the
           # create below would add a *second* draft under the same name -- from
           # there, which one gets its assets counted, or published, is a coin toss.
-          # `--paginate` hands back one array per page, so the pages are flattened
-          # into a single one before anything asks a question of them.
-          set -o pipefail
           releases=$(gh api "repos/${GH_REPO}/releases" --paginate --jq '.[]' | jq -s '.') || {
             echo "::error::could not list the releases. Not guessing."
             exit 1
@@ -329,8 +299,8 @@ jobs:
             gh api -X DELETE "repos/${GH_REPO}/releases/${id}"
           done
 
-          # The checksums go into the notes so that the Homebrew cask can be
-          # updated without fetching the assets again.
+          # The checksums go into the notes so that a cask can be fixed by hand
+          # without fetching the assets again.
           {
             echo "## Checksums"
             echo
@@ -354,11 +324,11 @@ jobs:
           fi
           gh release edit "v${VERSION}" --draft=false --latest
 
-  # Only when asked for. A version on crates.io cannot be taken back, so this is
-  # never the default.
+  # Publishing cannot be undone, so this waits to be switched on with
+  # `gh variable set PUBLISH_CRATES --body true` rather than being on by default.
   crates:
     needs: [plan, release]
-    if: inputs.publish_crates
+    if: needs.plan.outputs.release == 'true' && vars.PUBLISH_CRATES == 'true'
     # On macOS, because `cargo publish` builds what it is about to publish and the
     # default features need a webview. It is there already, where on Linux it
     # would have to be installed and kept up with.
@@ -381,16 +351,17 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not set. Create a token on crates.io and add it with 'gh secret set CARGO_REGISTRY_TOKEN'."
+            echo "::error::PUBLISH_CRATES is on but CARGO_REGISTRY_TOKEN is not set. Add it with 'gh secret set CARGO_REGISTRY_TOKEN'."
             exit 1
           fi
 
           # What cargo resolves against is the sparse index, not the web API, and
           # the two do not update together. Asking the index is therefore the only
           # answer that means "the next crate can depend on this one".
-          # The index nests by name length, and the short cases are not the same
-          # shape as the common one. Getting it wrong yields a 404, which reads as
-          # "not published" and would publish a version a second time.
+          #
+          # The path nests by name length, and the short cases are not the shape of
+          # the common one. Getting it wrong yields a 404, which reads as "not
+          # published" and would publish a version a second time.
           index_url() {
             case ${#1} in
               1) path="1/$1" ;;
@@ -402,8 +373,7 @@ jobs:
           }
 
           # Only 200 and 404 are answers. Anything else -- a rate limit, an outage,
-          # a broken connection -- is not evidence of absence, and treating it as
-          # such would publish a version twice or declare a good one missing.
+          # a broken connection -- is not evidence of absence.
           indexed() {
             name=$1
             body=$(mktemp)
@@ -413,8 +383,6 @@ jobs:
               404) answer="no" ;;
               200)
                 # A 200 whose body will not parse is a broken answer, not a "no".
-                # Both are checked separately so that a truncated response cannot
-                # read as an absent version.
                 if ! jq -e . < "$body" >/dev/null 2>&1; then
                   answer="unknown:unparsable"
                 elif jq -e --arg v "$VERSION" 'select(.vers == $v)' < "$body" >/dev/null; then
@@ -455,7 +423,7 @@ jobs:
                     ;;
                   no) ;;
                   *)
-                    echo "::error::publishing ${name} ${VERSION} failed and the index cannot be read. Check crates.io before rerunning."
+                    echo "::error::publishing ${name} ${VERSION} failed and the index cannot be read."
                     exit 1
                     ;;
                 esac
@@ -472,10 +440,7 @@ jobs:
                 yes) return ;;
                 no) ;;
                 *)
-                  # Publishing already succeeded, so this is not "it did not
-                  # publish" -- it is "the index cannot be read". Saying which is
-                  # what tells the next person whether to rerun or to wait.
-                  echo "::error::${name} ${VERSION} was published, but the index could not be read. Check crates.io before rerunning."
+                  echo "::error::${name} ${VERSION} was published, but the index could not be read."
                   exit 1
                   ;;
               esac

@@ -17,11 +17,16 @@ cargo install --path crates/runandlog-cli                       # with the GUI
 cargo install --path crates/runandlog-cli --no-default-features # without it
 ```
 
-Once a release has been published, from crates.io, and on macOS through Homebrew:
+On macOS, through Homebrew:
+
+```shell
+brew install --cask cyberneura/tap/runandlog
+```
+
+From crates.io, once a version has been published there:
 
 ```shell
 cargo install runandlog
-brew install --cask cyberneura/tap/runandlog
 ```
 
 Each installs the `runandlog` binary. Building the GUI needs the system webview,

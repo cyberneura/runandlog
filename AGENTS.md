@@ -158,44 +158,38 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 
 ## リリース
 
-`scripts/release.sh` (既定 minor) が version を上げて push し、GitHub Actions の Release
-ワークフローを起動して watch する。ワークフローは **workflow_dispatch のみ**で、push では走らない。
+**`Cargo.toml` の version を main で変えると、それがリリースになる。** ワークフローは
+`push` (paths: Cargo.toml) と `workflow_dispatch` で起動し、**その version が既に
+リリース済みかどうか**だけで実行するか決める。`scripts/release.sh [patch|minor|major]` は
+version を書き換えて push するだけの薄いスクリプトで、手で Cargo.toml を編集して push しても同じ。
 
-- **version は毎回上げる。** 公開済みの version で起動すると plan ジョブが即失敗する
-  (mac の署名と公証を無駄に回さないよう、ビルド前に見ている)。
-- **push した後に失敗すると、リリースされない version が main に残る。** 次に普通に実行すると
-  さらに上の version を振ってしまうので、スクリプトはその状態を検出して止まる。
-  `scripts/release.sh --retry` が同じ version でやり直す。
-- **watch する run は、dispatch ごとの合言葉 (`dispatch_id` → `run-name`) と push した SHA の
-  両方で特定する。** 「最新の run」を見ると、今回の run がまだ登録されていない時に**前回の結果**を
-  今回のものとして報告する。合言葉が `displayTitle` に出ない場合に備えて、SHA と run id の
-  大小によるフォールバックも持たせてある。
-- **未リリースの version が残っているかは、自分が書いた bump コミット (`Release v<version>`) で
-  判定する。** リリース履歴では区別が付かない — 0 件なら「初回」と「初回が失敗して残った」が
-  同じに見え、1 件でもあれば別 version の draft が「過去に出した証拠」に見える。
-- **mac は arm64 のみ、既定 feature (GUI 込み) でビルドして Developer ID で署名 + 公証する。**
-  Homebrew の cask は quarantine を付けるので、署名も公証も無いと受け取った側の初回起動が
-  止まる。素のバイナリは staple できないので、チケットは Apple 側にしか残らない
-  (Gatekeeper はオンラインで引く)。**公証の結果は `--output-format json` の `status` で見る。**
-  提出が完了しさえすれば `notarytool` は成功終了しうるので、終了コードだけでは Invalid を拾えない。
-- **Linux は `--no-default-features`。** 既定 feature には Tauri が入り、webkit2gtk に
-  動的リンクしたバイナリは同じ webkit を持たない環境で起動しない。ただし glibc には
-  動的リンクしたままなので、**「どの Linux でも動く」わけではない** (ビルドした runner より
-  古い glibc では起動しない)。
-- **Release は draft で作ってからアセットを数えて公開する。** `gh release create` は先に
-  Release を作ってからアップロードするので、途中で失敗すると**公開済みで中身の欠けた Release**
-  が残る。draft で残っている間は誰にも見えず、同じ version の再実行が**それを消して作り直す**
-  (公開済みの Release には触らない)。
-- Homebrew の cask は別リポジトリ (`cyberneura/homebrew-tap`) なので、CI ではなく
-  `scripts/update-cask.sh` が手元の認証情報で更新する。tap への書き込み権を持つ token を
-  この repo の secret に置かずに済む。**cask の `binary` はアーカイブ内のディレクトリを含めた
-  パスで書く** (cask はトップレベルのディレクトリに降りてくれない)。
-- crates.io は `--crates` を指定した時だけ。公開は取り消せないので既定は off。
-  `CARGO_REGISTRY_TOKEN` の secret が要る。**publish ジョブは macOS で走らせる**:
-  `cargo publish` は公開するものをビルドして検証し、既定 feature には webview が要るため。
-  publish 済みの version は飛ばすので、片方だけ通った後の再実行が続きから進められる。
-  `Cargo.toml` の `runandlog-core = { path = ..., version = ... }` は workspace version と
-  揃っている必要がある (揃っていないと publish が拒否される)。release.sh が両方書き換える。
+- **判定は「diff で version が変わったか」ではなく「その version が公開済みか」。** squash /
+  rebase / 直 push で diff の形は変わるが、公開済みかどうかは変わらない。この判定にすると
+  **何度実行しても安全**になり、失敗したリリースは原因を直して push すればそのまま続きになる
+  (version を上げ直す必要が無い)。
+- **公開済み判定は 404 だけを「未公開」と読む。** rate limit や障害を未公開と読むと、公開済みの
+  version をもう一度ビルドして publish しにいく。
+- **mac は arm64 のみ、既定 feature (GUI 込み) で Developer ID 署名 + 公証。** cask は
+  quarantine を付けるので、署名も公証も無いと受け取った側の初回起動が止まる。素のバイナリは
+  staple できないのでチケットは Apple 側に残る (Gatekeeper がオンラインで引く)。**公証の結果は
+  `--output-format json` の `status` で見る** — 提出が完了しさえすれば `notarytool` は成功
+  終了しうる。
+- **Linux は `--no-default-features`。** 既定 feature には Tauri が入り、webkit2gtk に動的
+  リンクしたバイナリは同じ webkit を持たない環境で起動しない。ただし glibc には動的リンク
+  したままなので「どの Linux でも動く」わけではない。
+- **Release は draft で作ってアセット数を数えてから公開する。** `gh release create` は先に
+  Release を作ってからアップロードするので、途中で失敗すると公開済みで中身の欠けた Release が
+  残る。**残った draft は次の実行が消して作り直す** (公開済みには触らない)。draft は
+  `/releases` の列挙で探す — **`releases/tags/{tag}` は draft を返さない** (draft に tag は
+  まだ無い) ので、tag で引くと同じ名前の draft が 2 つできる。
+- **Homebrew cask はこのリポジトリでは触らない。** `cyberneura/homebrew-tap` 側の workflow が
+  毎時、各プロジェクトの最新 Release を見て cask を更新する。各プロジェクトから tap へ push する
+  形にすると、**tap に書ける token を全プロジェクトに配る**ことになるため。
+- **crates.io はリポジトリ変数で有効化する** (`gh variable set PUBLISH_CRATES --body true`)。
+  secrets は `if:` で参照できないので変数で分岐する。`CARGO_REGISTRY_TOKEN` が要る。
+- **crates.io は sparse index (`index.crates.io`) に聞く。** cargo が解決に使うのは index で、
+  web API に出ていても index が追い付いていなければ次の crate のビルドが落ちる。公開済みの
+  version は飛ばすので、片方だけ通った後の再実行が続きから進む。
 
 ## 未実装 / 今後
 
