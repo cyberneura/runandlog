@@ -190,6 +190,11 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   形にすると、**tap に書ける token を全プロジェクトに配る**ことになるため。
 - **crates.io はリポジトリ変数で有効化する** (`gh variable set PUBLISH_CRATES --body true`)。
   secrets は `if:` で参照できないので変数で分岐する。`CARGO_REGISTRY_TOKEN` が要る。
+- **`runandlog` の publish は `--no-verify`。** 検証はパッケージを展開してビルドすることだが、
+  その最中に `tauri-build` が `gen/schemas/` をソースディレクトリに書くため、cargo が
+  「build script が OUT_DIR の外を書き換えた」として拒否する (v0.3.0 の publish が実際にこれで
+  落ちた)。検証を戻す先が無いので、**同じ run の build ジョブ**が同じ commit・同じ feature・
+  同じ OS でビルドしていることをもって代える。`runandlog-core` は従来どおり検証する。
 - **crates.io は sparse index (`index.crates.io`) に聞く。** cargo が解決に使うのは index で、
   web API に出ていても index が追い付いていなければ次の crate のビルドが落ちる。公開済みの
   version は飛ばすので、片方だけ通った後の再実行が続きから進む。

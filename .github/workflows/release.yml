@@ -412,6 +412,17 @@ jobs:
           # Publishing takes two steps and neither can be undone, so each crate is
           # looked up first: a rerun after one of them failed has to finish the half
           # that is left rather than stop on the half that is done.
+          # `runandlog` is published without the verification build, and only it.
+          # Verifying means unpacking the tarball and building it, and `tauri-build`
+          # writes its permission schemas into the source directory while doing so --
+          # which cargo, rightly, calls a build script modifying something outside
+          # OUT_DIR and refuses. There is nowhere to put that check back, so it goes
+          # where it is already done: the build job in this same run compiles this
+          # commit, with these features, on this platform.
+          verify_flag() {
+            [ "$1" = "runandlog" ] && echo "--no-verify" || echo ""
+          }
+
           publish() {
             name=$1
             case "$(indexed "$name")" in
@@ -426,7 +437,8 @@ jobs:
             # A failure here is not proof that nothing was published: the registry
             # can take the crate and the response still be lost. The index is the
             # only thing that settles it.
-            if ! cargo publish -p "$name"; then
+            # shellcheck disable=SC2046 - the flag is one word or none
+            if ! cargo publish -p "$name" $(verify_flag "$name"); then
               for _ in $(seq 12); do
                 sleep 10
                 case "$(indexed "$name")" in
@@ -464,3 +476,33 @@ jobs:
 
           publish runandlog-core
           publish runandlog
+
+      # After the publish, never before it: an announcement of a version nobody can
+      # install yet sends people to fetch something that is not there. Neither of
+      # these may fail the run -- the crate is out either way, and a webhook that is
+      # down is not a reason to look at a red release.
+      - name: Say so
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ALEXA_WEBHOOK_TOKEN: ${{ secrets.ALEXA_WEBHOOK_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -n --arg text "runandlog ${VERSION} is on crates.io. <${RUN_URL}|Detail>" \
+              '{channel: "C06TSP3NVJL", username: "crates.io", icon_emoji: ":package:", text: $text}' \
+              | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+          else
+            echo "::notice::SLACK_WEBHOOK_URL is not set; not announcing to Slack"
+          fi
+
+          if [ -n "$ALEXA_WEBHOOK_TOKEN" ]; then
+            jq -n --arg text "Runandlog ${VERSION} is on crates dot io." \
+              '{device: "書斎 Echo Dot", text: $text}' \
+              | curl -sS -X POST -H 'Content-Type: application/json' \
+                  -H "Authorization: Bearer $ALEXA_WEBHOOK_TOKEN" \
+                  -d @- "https://alexa-webhook.ytyng.com/speak"
+          else
+            echo "::notice::ALEXA_WEBHOOK_TOKEN is not set; not speaking"
+          fi
