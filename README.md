@@ -23,7 +23,7 @@ On macOS, through Homebrew:
 brew install --cask cyberneura/tap/runandlog
 ```
 
-From crates.io, once a version has been published there:
+From crates.io:
 
 ```shell
 cargo install runandlog
