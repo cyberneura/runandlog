@@ -5,5 +5,6 @@
 
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod live;
 pub mod session;
 pub mod tui;

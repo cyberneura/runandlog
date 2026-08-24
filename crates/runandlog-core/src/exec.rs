@@ -210,6 +210,45 @@ pub fn run_cancellable(
     options: &ExecOptions,
     canceller: &Canceller,
 ) -> std::io::Result<ExecOutcome> {
+    run_streaming(command, options, canceller, |_| {})
+}
+
+/// Runs `command` through a shell, handing its output to `on_output` as it
+/// arrives.
+///
+/// This is [`run_cancellable`] with a window onto a run in progress, for front
+/// ends that show what a command is printing rather than only what it printed.
+/// The chunks concatenate into exactly [`ExecOutcome::output`], so a front end can
+/// draw them as they come without having to reconcile them with the finished
+/// result afterwards.
+///
+/// While the command runs, `on_output` is called from a thread of its own --
+/// neither the one reading the pipe nor the one supervising the command -- so
+/// taking a long time in it costs nothing but the freshness of the display. It
+/// cannot stall the reader, which is what would fill the pipe and stop the command
+/// itself, and it cannot hold up the timeout or a cancellation.
+///
+/// **The last piece is reported on the calling thread**, after that thread has
+/// ended, so a callback is never called from two threads at once but need not
+/// always see the same one. One that keeps its state in the closure notices
+/// nothing; one that reaches for a thread-local should not.
+///
+/// That final call does hold up this one: it happens before the outcome is
+/// returned, so a callback that never returns leaves the caller waiting on itself.
+/// The command is not left running by it -- the timeout and any cancellation have
+/// already been carried out by then.
+///
+/// What is reported is what is captured, so a command that reaches
+/// [`ExecOptions::max_output_bytes`] stops producing chunks even though it goes on
+/// printing -- exactly as it stops adding to `output`. Reporting past the cap would
+/// mean showing text the result will not contain, and the two agreeing is the
+/// property a front end is built on.
+pub fn run_streaming(
+    command: &str,
+    options: &ExecOptions,
+    canceller: &Canceller,
+    on_output: impl FnMut(&str) + Send,
+) -> std::io::Result<ExecOutcome> {
     // Spawning in a directory that does not exist surfaces only as "the shell
     // failed to start", which says nothing about the real cause.
     if !options.cwd.is_dir() {
@@ -295,69 +334,192 @@ pub fn run_cancellable(
     });
 
     let child = Arc::new(Mutex::new(child));
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let exit_code = loop {
-        // Asked before the child is polled, and not after: `cancel` kills the group
-        // before this loop gets to look at anything, so polling first would find a
-        // dead child and report a plain signal kill instead of a cancellation.
-        if canceller.is_cancelled() {
-            cancelled = true;
-            let mut child = child.lock().unwrap();
-            // `Canceller::cancel` has normally killed the group already; killing a
-            // group that is gone is a no-op, and doing it here is what covers a
-            // cancel that arrived before the command had a group to kill.
-            canceller.kill_and_forget(&mut child);
-            break child.wait()?.code();
-        }
-        let mut guard = child.lock().unwrap();
-        let status = canceller.poll_with_group(|| guard.try_wait())?;
-        drop(guard);
-        if let Some(status) = status {
-            break status.code();
-        }
-        if let Some(limit) = options.timeout
-            && start.elapsed() >= limit
-        {
-            timed_out = true;
-            let mut child = child.lock().unwrap();
-            canceller.kill_and_forget(&mut child);
-            break child.wait()?.code();
-        }
-        thread::sleep(POLL_INTERVAL);
-    };
-    // Take the elapsed time here: waiting for the reader to drain is bookkeeping,
-    // not part of how long the command took.
-    let duration = start.elapsed();
-    // A cancel that lands between the flag being checked above and the command being
-    // polled kills it without this loop ever taking the cancel branch: the poll finds
-    // an already dead command and reports a plain signal kill. The flag is set before
-    // the kill, so asking it here tells the two apart.
-    let cancelled = cancelled || (canceller.is_cancelled() && exit_code.is_none());
+    // Reporting the output as it arrives is left to a thread of its own, rather than
+    // done between the polls below. Those polls are what enforce the timeout and
+    // notice a cancellation, and a front end that blocks in its callback -- printing
+    // to a pipe nobody is draining, say -- would otherwise let a command run for as
+    // long as the front end took, whatever limit it was given.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::scope(|scope| -> std::io::Result<ExecOutcome> {
+        // The buffer is borrowed and the receiver moved: a `Receiver` may travel to
+        // another thread but not be shared with one.
+        let reported = &buffer;
+        let reporter = scope.spawn(move || report_output(reported, done_rx, on_output));
 
-    // Every path out of the loop above cleared the group in the same breath as the
-    // reaping, so a cancel arriving from here on kills nothing. That includes this
-    // drain wait: when a descendant outlives the shell and holds the pipe, it
-    // survives a cancel that lands in the DRAIN_GRACE window. Keeping the id usable
-    // that long is the worse trade -- the group may still hold those descendants, or
-    // may be gone with its number already reissued, and from here the two cannot be
-    // told apart.
-    if drained_rx.recv_timeout(DRAIN_GRACE).is_err() {
-        // A grandchild is still holding the pipe and producing output. Tell the
-        // reader thread to stop at its next read so it does not run forever.
-        stop.store(true, Ordering::Relaxed);
-    }
-    let output = String::from_utf8_lossy(&buffer.lock().unwrap()).to_string();
+        let mut timed_out = false;
+        let mut cancelled = false;
+        let exit_code = loop {
+            // Asked before the child is polled, and not after: `cancel` kills the group
+            // before this loop gets to look at anything, so polling first would find a
+            // dead child and report a plain signal kill instead of a cancellation.
+            if canceller.is_cancelled() {
+                cancelled = true;
+                let mut child = child.lock().unwrap();
+                // `Canceller::cancel` has normally killed the group already; killing a
+                // group that is gone is a no-op, and doing it here is what covers a
+                // cancel that arrived before the command had a group to kill.
+                canceller.kill_and_forget(&mut child);
+                break child.wait()?.code();
+            }
+            let mut guard = child.lock().unwrap();
+            let status = canceller.poll_with_group(|| guard.try_wait())?;
+            drop(guard);
+            if let Some(status) = status {
+                break status.code();
+            }
+            if let Some(limit) = options.timeout
+                && start.elapsed() >= limit
+            {
+                timed_out = true;
+                let mut child = child.lock().unwrap();
+                canceller.kill_and_forget(&mut child);
+                break child.wait()?.code();
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+        // Take the elapsed time here: waiting for the reader to drain is bookkeeping,
+        // not part of how long the command took.
+        let duration = start.elapsed();
+        // A cancel that lands between the flag being checked above and the command being
+        // polled kills it without this loop ever taking the cancel branch: the poll finds
+        // an already dead command and reports a plain signal kill. The flag is set before
+        // the kill, so asking it here tells the two apart.
+        let cancelled = cancelled || (canceller.is_cancelled() && exit_code.is_none());
 
-    Ok(ExecOutcome {
-        started_at,
-        duration,
-        exit_code,
-        output,
-        timed_out,
-        cancelled,
-        truncated: truncated.load(Ordering::Relaxed),
+        // Every path out of the loop above cleared the group in the same breath as the
+        // reaping, so a cancel arriving from here on kills nothing. That includes this
+        // drain wait: when a descendant outlives the shell and holds the pipe, it
+        // survives a cancel that lands in the DRAIN_GRACE window. Keeping the id usable
+        // that long is the worse trade -- the group may still hold those descendants, or
+        // may be gone with its number already reissued, and from here the two cannot be
+        // told apart.
+        if drained_rx.recv_timeout(DRAIN_GRACE).is_err() {
+            // A grandchild is still holding the pipe and producing output. Tell the
+            // reader thread to stop at its next read so it does not run forever.
+            stop.store(true, Ordering::Relaxed);
+        }
+
+        // Wakes the reporter now rather than at its next poll, so an ordinary run does
+        // not end with a wait for a thread that has nothing left to do.
+        drop(done_tx);
+        // Joined before the last flush below: the reporter owns the callback until it
+        // returns it, which is what keeps the callback from ever being called from two
+        // threads at once.
+        let (mut on_output, emitted) = match reporter.join() {
+            Ok(reported) => reported,
+            // A callback that panics used to unwind through this call. Keep it doing
+            // so, rather than swallowing the panic on a thread the caller cannot see.
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+
+        // Whatever arrived after the reporter's last flush -- including the bytes of a
+        // character that was still incomplete then -- still has to be reported, or the
+        // chunks would add up to all but the tail of the output. Both are taken from
+        // one snapshot, under one lock, so nothing can slip in between them and leave
+        // the two disagreeing.
+        //
+        // The callback is then called with the lock released. A run whose DRAIN_GRACE
+        // expired leaves the reader thread still going, and holding the lock through a
+        // slow callback would park it on the mutex -- which is the pipe going undrained,
+        // the one thing a front end must never be able to cause.
+        let (last, output) = {
+            let captured = buffer.lock().unwrap();
+            let last = (emitted < captured.len())
+                .then(|| String::from_utf8_lossy(&captured[emitted..]).to_string());
+            (last, String::from_utf8_lossy(&captured).to_string())
+        };
+        if let Some(last) = last {
+            on_output(&last);
+        }
+
+        Ok(ExecOutcome {
+            started_at,
+            duration,
+            exit_code,
+            output,
+            timed_out,
+            cancelled,
+            truncated: truncated.load(Ordering::Relaxed),
+        })
     })
+}
+
+/// Hands the captured output to `on_output` until the run says it is over,
+/// returning the callback along with how much of the output it has been given.
+///
+/// Runs on a thread of its own; see [`run_streaming`]. The last piece is left to the
+/// caller, which can take it together with the finished output and so cannot cut the
+/// two apart.
+fn report_output<F: FnMut(&str)>(
+    buffer: &Mutex<Vec<u8>>,
+    done: mpsc::Receiver<()>,
+    mut on_output: F,
+) -> (F, usize) {
+    let mut emitted = 0;
+    loop {
+        flush_output(buffer, &mut emitted, &mut on_output);
+        match done.recv_timeout(POLL_INTERVAL) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return (on_output, emitted),
+            // Nothing yet: the command is still running, so keep reporting.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// Hands the callback the output captured since the last time, advancing
+/// `emitted` past it.
+///
+/// The lock is released before the callback runs. The callback belongs to a front
+/// end and may take real time -- drawing a screen, sending an event to a window --
+/// and holding the lock through it would stall the reader thread, which fills the
+/// pipe and stops the command itself.
+fn flush_output(buffer: &Mutex<Vec<u8>>, emitted: &mut usize, on_output: &mut impl FnMut(&str)) {
+    let chunk = {
+        let buffer = buffer.lock().unwrap();
+        let (chunk, used) = decode_ready(&buffer[*emitted..]);
+        *emitted += used;
+        chunk
+    };
+    if !chunk.is_empty() {
+        on_output(&chunk);
+    }
+}
+
+/// Decodes as much of `pending` as can be decoded without waiting for more bytes,
+/// returning the text and how many bytes it consumed.
+///
+/// A character split across two reads is left behind rather than turned into a
+/// replacement character: the rest of it is on its way, and reporting it whole one
+/// poll later is better than reporting damage now. Bytes that cannot become a
+/// character whatever follows them are replaced on the spot, the way
+/// `String::from_utf8_lossy` would -- which is what makes the chunks add up to the
+/// same text as the finished output.
+fn decode_ready(pending: &[u8]) -> (String, usize) {
+    let mut text = String::new();
+    let mut used = 0;
+    loop {
+        let error = match std::str::from_utf8(&pending[used..]) {
+            Ok(rest) => {
+                text.push_str(rest);
+                return (text, pending.len());
+            }
+            Err(error) => error,
+        };
+        if let Ok(head) = std::str::from_utf8(&pending[used..used + error.valid_up_to()]) {
+            text.push_str(head);
+        }
+        used += error.valid_up_to();
+        match error.error_len() {
+            // The tail is the beginning of a character whose remaining bytes have
+            // not been read yet.
+            None => return (text, used),
+            // Always at least one byte, so this cannot spin.
+            Some(length) => {
+                text.push(char::REPLACEMENT_CHARACTER);
+                used += length;
+            }
+        }
+    }
 }
 
 /// Puts the pipe in non-blocking mode so a read can never park indefinitely.
@@ -704,6 +866,119 @@ mod tests {
         assert!(!outcome.cancelled);
         assert!(outcome.is_success());
         assert!(!canceller.is_cancelled());
+    }
+
+    #[test]
+    fn the_output_is_reported_while_the_command_is_still_running() {
+        // The point of the callback: a front end should be able to show the first
+        // line before the command that printed it has finished. Arriving in one
+        // chunk at the end would satisfy "the chunks add up" while being no better
+        // than reading `output`.
+        let mut chunks = Vec::new();
+        let outcome = run_streaming(
+            "echo first; sleep 0.4; echo second",
+            &options(),
+            &Canceller::new(),
+            |chunk| chunks.push(chunk.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.output, "first\nsecond\n");
+        assert!(
+            chunks.first().is_some_and(|first| first == "first\n"),
+            "expected the first line on its own, got {chunks:?}"
+        );
+        assert_eq!(chunks.concat(), outcome.output);
+    }
+
+    #[test]
+    fn the_reported_chunks_add_up_to_the_whole_output() {
+        // A front end draws the chunks and then the finished result. If the two
+        // disagreed -- a dropped tail, a character reported twice -- the display
+        // would change under the user when the command ended.
+        let mut seen = String::new();
+        let outcome = run_streaming(
+            // Long enough to span several reads, and multi-byte so that a character
+            // can land across the boundary between two of them.
+            "for i in $(seq 1 400); do echo \"行 $i ✓\"; done",
+            &options(),
+            &Canceller::new(),
+            |chunk| seen.push_str(chunk),
+        )
+        .unwrap();
+
+        assert!(outcome.is_success());
+        assert_eq!(seen, outcome.output);
+    }
+
+    #[test]
+    fn a_cancelled_run_reports_what_it_printed() {
+        let mut seen = String::new();
+        let mut opts = options();
+        opts.timeout = None;
+        let canceller = Canceller::new();
+        let from_another_thread = canceller.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            from_another_thread.cancel();
+        });
+
+        let outcome = run_streaming("echo before; sleep 30", &opts, &canceller, |chunk| {
+            seen.push_str(chunk)
+        })
+        .unwrap();
+
+        assert!(outcome.cancelled);
+        assert_eq!(seen, outcome.output);
+        assert!(seen.contains("before"));
+    }
+
+    #[test]
+    fn a_front_end_that_blocks_does_not_hold_up_the_timeout() {
+        // The polling that enforces the timeout must not be behind the callback. A
+        // front end printing into a pipe nobody is draining blocks in there, and a
+        // command given a limit would then run for as long as the front end took.
+        let mut opts = options();
+        opts.timeout = Some(Duration::from_millis(200));
+        let start = Instant::now();
+
+        let outcome = run_streaming("echo hello; sleep 30", &opts, &Canceller::new(), |_| {
+            thread::sleep(Duration::from_secs(1));
+        })
+        .unwrap();
+
+        assert!(outcome.timed_out);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the run took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_character_split_across_two_reads_is_held_back_until_it_is_whole() {
+        // Reporting the first byte of a character on its own would put a replacement
+        // character in the middle of the stream, where the finished output has none.
+        let text = "行".as_bytes();
+        let (early, used) = decode_ready(&text[..1]);
+        assert_eq!(early, "");
+        assert_eq!(used, 0);
+
+        let (whole, used) = decode_ready(text);
+        assert_eq!(whole, "行");
+        assert_eq!(used, text.len());
+    }
+
+    #[test]
+    fn bytes_that_cannot_become_a_character_are_replaced_rather_than_awaited() {
+        // Waiting for the rest of a sequence that can never be valid would stall the
+        // live display for the whole run.
+        let (text, used) = decode_ready(b"a\xffb");
+        assert_eq!(text, "a\u{fffd}b");
+        assert_eq!(used, 3);
+        // The same substitution `String::from_utf8_lossy` makes, so the chunks and
+        // the finished output stay identical.
+        assert_eq!(text, String::from_utf8_lossy(b"a\xffb"));
     }
 
     #[test]

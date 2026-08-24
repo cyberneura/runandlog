@@ -121,8 +121,12 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
         }
         let cell = &session.doc().cells[index];
         println!("[{}] {}", index + 1, first_line(&cell.command));
-        let outcome = session.run_cell_cancellable(index, &canceller)?;
-        print!("{}", outcome.output);
+        // Printed as it arrives rather than once the command has finished. A run
+        // that takes minutes otherwise looks like a hung terminal, and the output
+        // that would have said what it is doing only appears once it no longer
+        // matters. The chunks add up to `outcome.output`, so nothing is printed
+        // twice by not printing that afterwards.
+        let outcome = session.run_cell_streaming(index, &canceller, print_as_it_arrives())?;
         println!("--- {}", outcome.status_text());
         failed |= !outcome.is_success();
         if interrupt_requested() {
@@ -143,6 +147,41 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// A printer for a running command's output, showing each piece as it arrives.
+///
+/// Flushed by hand: stdout is only line-buffered when it is a terminal, and even
+/// then a command printing a prompt or a progress line without a newline would sit
+/// in the buffer -- which is the very output a live view exists to show. Redirected
+/// to a file it is block-buffered, and nothing would appear until the block filled.
+///
+/// Written through `write_all` rather than `print!`, and silenced for the rest of
+/// the run once stdout refuses a write. The macro panics on a closed stdout -- a run
+/// piped into `head`, say -- and this callback is called from inside the run, so the
+/// panic would come back out of it before the finished result could be written into
+/// the Markdown. By then the output on screen is going nowhere anyway; the file must
+/// still get it.
+fn print_as_it_arrives() -> impl FnMut(&str) + Send {
+    printer(std::io::stdout())
+}
+
+/// The body of [`print_as_it_arrives`], with the destination passed in so that what
+/// it does when writing fails can be tested without closing the real stdout.
+fn printer(mut out: impl std::io::Write + Send) -> impl FnMut(&str) + Send {
+    let mut printable = true;
+    move |chunk| {
+        if !printable {
+            return;
+        }
+        if out
+            .write_all(chunk.as_bytes())
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            printable = false;
+        }
+    }
 }
 
 /// Turns Ctrl-C into a request to stop the running command.
@@ -324,6 +363,48 @@ mod tests {
         // a keyboard, so the two cannot share one code.
         assert_eq!(signal_exit_code(2), 130);
         assert_eq!(signal_exit_code(15), 143);
+    }
+
+    /// A destination that refuses everything after the first write, the way stdout
+    /// does once the command it was piped into has gone.
+    #[derive(Default)]
+    struct ClosesAfterOneWrite {
+        written: Vec<String>,
+    }
+
+    impl std::io::Write for ClosesAfterOneWrite {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if !self.written.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ));
+            }
+            self.written
+                .push(String::from_utf8_lossy(buffer).to_string());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn printing_gives_up_quietly_once_the_output_has_nowhere_to_go() {
+        // `print!` panics when stdout is closed -- a run piped into `head`. This
+        // callback is called from inside the run, so a panic would come back out of
+        // it before the result could be written into the Markdown: the command would
+        // have run for nothing. Once, so the rest of the run costs nothing either.
+        let mut destination = ClosesAfterOneWrite::default();
+        {
+            let mut print = printer(&mut destination);
+            print("first\n");
+            print("second\n");
+            print("third\n");
+        }
+
+        assert_eq!(destination.written, vec!["first\n"]);
     }
 
     #[test]
