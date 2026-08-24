@@ -222,16 +222,21 @@ pub fn run_cancellable(
 /// draw them as they come without having to reconcile them with the finished
 /// result afterwards.
 ///
-/// `on_output` runs on a thread of its own -- neither the one reading the pipe nor
-/// the one supervising the command -- so taking a long time in it costs nothing but
-/// the freshness of the display. It cannot stall the reader, which is what would
-/// fill the pipe and stop the command itself, and it cannot hold up the timeout or
-/// a cancellation.
+/// While the command runs, `on_output` is called from a thread of its own --
+/// neither the one reading the pipe nor the one supervising the command -- so
+/// taking a long time in it costs nothing but the freshness of the display. It
+/// cannot stall the reader, which is what would fill the pipe and stop the command
+/// itself, and it cannot hold up the timeout or a cancellation.
 ///
-/// It does hold up this call, though: the last piece of output is reported before
-/// the outcome is returned, so a callback that never returns leaves the caller
-/// waiting on itself. The command is not left running by it -- the timeout and any
-/// cancellation have already been carried out by then.
+/// **The last piece is reported on the calling thread**, after that thread has
+/// ended, so a callback is never called from two threads at once but need not
+/// always see the same one. One that keeps its state in the closure notices
+/// nothing; one that reaches for a thread-local should not.
+///
+/// That final call does hold up this one: it happens before the outcome is
+/// returned, so a callback that never returns leaves the caller waiting on itself.
+/// The command is not left running by it -- the timeout and any cancellation have
+/// already been carried out by then.
 ///
 /// What is reported is what is captured, so a command that reaches
 /// [`ExecOptions::max_output_bytes`] stops producing chunks even though it goes on
