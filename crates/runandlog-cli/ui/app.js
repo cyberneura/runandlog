@@ -157,7 +157,14 @@ function appendLive(index, text) {
   }
   live += text
   if (live.length > LIVE_MAX_CHARS) {
-    live = live.slice(live.length - LIVE_MAX_CHARS)
+    let start = live.length - LIVE_MAX_CHARS
+    // A character outside the basic plane -- an emoji, say -- is two code units,
+    // and a cut between them leaves the second one on its own, which draws as a
+    // replacement glyph. Dropping it costs one character of the oldest text.
+    if (isLowSurrogate(live.charCodeAt(start))) {
+      start += 1
+    }
+    live = live.slice(start)
   }
   // Written straight into the existing element rather than by redrawing: a command
   // printing steadily would otherwise rebuild every cell several times a second.
@@ -166,6 +173,11 @@ function appendLive(index, text) {
     element.textContent = live
     scrollToEnd(element)
   }
+}
+
+/** Whether a code unit is the second half of a character, not one by itself. */
+function isLowSurrogate(unit) {
+  return unit >= 0xdc00 && unit <= 0xdfff
 }
 
 /**

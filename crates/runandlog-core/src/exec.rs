@@ -232,6 +232,12 @@ pub fn run_cancellable(
 /// the outcome is returned, so a callback that never returns leaves the caller
 /// waiting on itself. The command is not left running by it -- the timeout and any
 /// cancellation have already been carried out by then.
+///
+/// What is reported is what is captured, so a command that reaches
+/// [`ExecOptions::max_output_bytes`] stops producing chunks even though it goes on
+/// printing -- exactly as it stops adding to `output`. Reporting past the cap would
+/// mean showing text the result will not contain, and the two agreeing is the
+/// property a front end is built on.
 pub fn run_streaming(
     command: &str,
     options: &ExecOptions,
