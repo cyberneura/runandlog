@@ -249,9 +249,14 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   - 逆に**絶対に文字になれないバイトはその場で置換する**。続きを待つと表示が実行中ずっと止まる。
   - ループの最後に、未報告のバイト (保留中の断片を含む) を lossy で 1 回流す。
 - 各フロントの使い方:
-  - **非対話実行** (`main::print_as_it_arrives`) は届いたそばから print して**毎回明示的に
+  - **非対話実行** (`main::print_as_it_arrives`) は届いたそばから書いて**毎回明示的に
     flush** する。stdout は端末なら行バッファ、リダイレクトならブロックバッファなので、
     改行の無い進捗行はライブ表示の本命なのにバッファに残る。
+    **`print!` は使わない。** stdout が閉じている (`| head` 等) と panic するマクロで、
+    このコールバックは実行の内側から呼ばれるため、**結果を Markdown に書き戻す前に**
+    panic が飛び出してコマンドを走らせ損になる (Codex の PR レビュー指摘)。
+    `write_all` で書き、失敗したらその実行の残りは黙って捨てる
+    (テスト: `printing_gives_up_quietly_once_the_output_has_nowhere_to_go`)。
   - **TUI** はワーカーから mpsc でチャンクを送り、描画スレッドが `try_recv` で拾う
     (`collect_output`)。ロック共有にするとワーカーが描画を待ちうる。表示は
     `live::LiveOutput` の末尾 3 行で、**行数は常に固定**。出力のたびに高さが変わると
@@ -282,7 +287,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 117 件 (linux では 121 件。/proc を見るテストが 1 件、
+cargo test                  # 118 件 (linux では 122 件。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
