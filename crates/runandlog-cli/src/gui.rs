@@ -36,8 +36,19 @@ use crate::session::Session;
 const EVENT_DOCUMENT: &str = "runandlog://document";
 /// Event marking the start of a run.
 const EVENT_STARTED: &str = "runandlog://started";
+/// Event carrying a piece of a running command's output.
+const EVENT_OUTPUT: &str = "runandlog://output";
 /// Event marking the end of a run, successful or not.
 const EVENT_FINISHED: &str = "runandlog://finished";
+
+/// How much of one piece of output is sent to the window at a time.
+///
+/// A command can print faster than anything can be read, and the window only shows
+/// the tail of what it has been sent. Sending megabytes through the IPC for a view
+/// that drops all but the end of it is work with nothing to show for it, so an
+/// overlong piece is cut to its end. Nothing is lost by it: the whole output is
+/// written back to the Markdown when the command finishes.
+const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
 /// A cell as the window shows it.
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +70,17 @@ struct CellView {
 struct DocumentView {
     path: String,
     cells: Vec<CellView>,
+}
+
+/// A piece of what a running command has printed.
+///
+/// Carries the cell it belongs to: a piece that arrives after the window has moved
+/// on -- the last of a run whose result is already drawn, say -- must not be shown
+/// under whatever cell is running now.
+#[derive(Debug, Clone, Serialize)]
+struct OutputChunk {
+    index: usize,
+    text: String,
 }
 
 /// How a run ended, for the status line.
@@ -331,8 +353,19 @@ async fn execute(
     let _ = app.emit(EVENT_STARTED, index);
     // The lock is deliberately not held here: the run can take minutes, and the
     // window keeps reading the document while it does.
+    let reporter = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        runandlog_core::run_cancellable(&command, &options, &canceller)
+        runandlog_core::run_streaming(&command, &options, &canceller, |chunk| {
+            // Sent as the command prints rather than kept until it ends: a run that
+            // takes minutes should show what it is doing while it does it.
+            let _ = reporter.emit(
+                EVENT_OUTPUT,
+                OutputChunk {
+                    index,
+                    text: crate::live::tail(chunk, MAX_OUTPUT_CHUNK_BYTES).to_string(),
+                },
+            );
+        })
     })
     .await
     .map_err(|error| format!("The worker thread died unexpectedly: {error}"))

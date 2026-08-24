@@ -48,6 +48,11 @@ runandlog exam.md --run-all    # run every cell in order
 runandlog exam.md --gui        # open the desktop app
 ```
 
+A running command's output is shown as it is printed, not once the command has
+finished: a non-interactive run prints it straight through, and the TUI and the
+desktop app show the tail of it under the cell being run. What ends up in the
+Markdown is the same text, so nothing appears twice.
+
 During a non-interactive run (`--run` or `--run-all`), Ctrl-C stops the command
 that is running -- along with the descendants still in its process group -- and
 writes the output it produced up to that point back into the Markdown before
@@ -79,6 +84,15 @@ Ctrl-C stops the command the same way; see the key table below.
 | `q` / `Esc` | Quit (while a command is running, quitting waits for it to finish) |
 | `Ctrl-C` | Quit at once, stopping the running command and keeping the output it produced |
 
+While a cell runs, its last three lines of output are shown underneath it, in
+place of the result of the previous run, and are replaced by the new result once
+the command finishes. The marker beside each cell carries how far this session has
+got: green for a cell that has not been run since the file was opened, yellow for
+the one running now, blue for one that finished, red for one that failed, timed
+out or was stopped. A finished cell's command is dimmed. Reloading the file clears
+all of that -- after a reload, the cell at a given position need not be the one
+that ran.
+
 ### The desktop app
 
 `--gui` opens a window showing the same document the TUI shows: the file path,
@@ -87,6 +101,11 @@ holds a result, since pressing it replaces that result -- and the result of the 
 run. **Run all** runs every cell in order, **Stop** ends the command that is
 running and keeps what it printed, **Reload** picks up edits made in an external
 editor.
+
+The cell being run shows what the command is printing, scrolled to the newest
+line, and the finished result takes its place when the command ends. Only the tail
+is kept: a command that prints without stopping fills neither the window nor its
+memory, and the whole output goes into the Markdown either way.
 
 Results are written back to the Markdown exactly as they are from the CLI and the
 TUI: the same markers, the same separate-file handling, the same refusal to write

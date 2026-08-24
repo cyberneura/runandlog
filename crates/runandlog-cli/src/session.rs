@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use runandlog_core::{
     Canceller, Document, ExecOptions, ExecOutcome, RenderContext, Sidecar, render_result,
-    run_cancellable, splice,
+    run_streaming, splice,
 };
 
 /// State for a single Markdown file.
@@ -89,10 +89,25 @@ impl Session {
         index: usize,
         canceller: &Canceller,
     ) -> io::Result<ExecOutcome> {
-        let outcome = run_cancellable(
+        self.run_cell_streaming(index, canceller, |_| {})
+    }
+
+    /// Runs a cell, handing its output to `on_output` as it arrives.
+    ///
+    /// For a caller that shows the command's progress rather than waiting for the
+    /// result. The chunks add up to `ExecOutcome::output`, so showing them and then
+    /// the result does not repeat anything.
+    pub fn run_cell_streaming(
+        &mut self,
+        index: usize,
+        canceller: &Canceller,
+        on_output: impl FnMut(&str) + Send,
+    ) -> io::Result<ExecOutcome> {
+        let outcome = run_streaming(
             &self.doc.cells[index].command.clone(),
             &self.exec,
             canceller,
+            on_output,
         )?;
         self.apply_outcome(index, &outcome)?;
         Ok(outcome)

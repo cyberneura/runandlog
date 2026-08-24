@@ -20,6 +20,16 @@ const reloadButton = document.getElementById('reload')
 
 /** Index of the cell being run, or null when idle. */
 let running = null
+/**
+ * What the running command has printed so far.
+ *
+ * Only ever the tail of it: the whole output goes into the Markdown when the
+ * command finishes, so keeping more here would grow the window's memory with a
+ * command that prints without stopping, for text nobody is reading.
+ */
+let live = ''
+/** How much of a running command's output the window keeps. */
+const LIVE_MAX_CHARS = 20000
 /** Buttons are disabled while a run is in flight. */
 let busy = false
 /**
@@ -114,13 +124,61 @@ function renderCell(cell) {
 
   section.append(head, command)
 
-  if (hasResult) {
+  if (running === cell.index) {
+    // While a cell runs, its live output takes the place of the result of the
+    // previous run. Showing both would stack one cell's output from two different
+    // runs, which reads as a single long result.
+    const output = document.createElement('pre')
+    output.className = 'result live'
+    output.textContent = live
+    section.append(output)
+    scrollToEnd(output)
+  } else if (hasResult) {
     const result = document.createElement('pre')
     result.className = 'result'
     result.textContent = cell.result
     section.append(result)
   }
   return section
+}
+
+/** Keeps the newest line in view, the way a terminal does. */
+function scrollToEnd(element) {
+  element.scrollTop = element.scrollHeight
+}
+
+/** Adds a piece of output to the live view of the cell being run. */
+function appendLive(index, text) {
+  // A piece can arrive after the window has moved on -- the tail of a run whose
+  // result is already drawn. Showing it under the cell running now would put one
+  // command's output beneath another's.
+  if (running !== index) {
+    return
+  }
+  live += text
+  if (live.length > LIVE_MAX_CHARS) {
+    live = live.slice(live.length - LIVE_MAX_CHARS)
+  }
+  // Written straight into the existing element rather than by redrawing: a command
+  // printing steadily would otherwise rebuild every cell several times a second.
+  const element = liveElement(index)
+  if (element) {
+    element.textContent = live
+    scrollToEnd(element)
+  }
+}
+
+/**
+ * The live output element of a cell, if it is on screen.
+ *
+ * Absent while the first draw after the run started is still in flight, which is
+ * harmless: that draw takes `live` as it is by then.
+ */
+function liveElement(index) {
+  if (!Number.isInteger(index)) {
+    return null
+  }
+  return cellsEl.querySelector(`section.cell[data-index="${index}"] pre.live`)
 }
 
 /** Redraws from the backend's copy of the document. Reports whether it worked. */
@@ -152,6 +210,7 @@ async function runCell(index) {
     await reload(true)
   } finally {
     running = null
+    live = ''
     setBusy(false)
     await refresh()
   }
@@ -178,6 +237,7 @@ async function runAll() {
     await reload(true)
   } finally {
     running = null
+    live = ''
     setBusy(false)
     await refresh()
   }
@@ -217,18 +277,28 @@ async function start() {
   setBusy(true)
   setStatus('Starting…', 'info')
   // Settled rather than raced: a rejection from `Promise.all` would leave whatever
-  // subscriptions did succeed in place, half-listening. Either all three are on or
+  // subscriptions did succeed in place, half-listening. Either all of them are on or
   // none are, so the rest of the window has one state to reason about.
   const attempts = await Promise.allSettled([
     listen('runandlog://document', (event) => {
+      // The document arrives once a run has been written back, so the live view of
+      // it has served its purpose. Cleared before the draw: left set, the finished
+      // result would be hidden behind the output it is made of until the next
+      // redraw.
+      running = null
+      live = ''
       render(event.payload)
     }),
     listen('runandlog://started', (event) => {
       running = event.payload
+      live = ''
       stopButton.disabled = false
       setStatus(`Running cell ${event.payload + 1}…`, 'info')
-      // Redraw so the cell being run shows its spinner label.
+      // Redraw so the cell being run shows its spinner label and its live output.
       refresh()
+    }),
+    listen('runandlog://output', (event) => {
+      appendLive(event.payload.index, event.payload.text)
     }),
     listen('runandlog://finished', () => {
       running = null

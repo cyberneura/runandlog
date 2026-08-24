@@ -152,6 +152,24 @@ pre {
   color: var(--muted);
 }
 
+/* The output of the command running right now. Bounded and scrolled to its end,
+   so that a command printing thousands of lines pushes neither the cells below it
+   off the window nor the newest line out of sight. */
+.result.live {
+  border-top: 1px dashed var(--accent);
+  color: var(--fg);
+  max-height: 14em;
+  overflow-y: auto;
+}
+
+/* Said in the stylesheet rather than written into the element: the live block is
+   filled with whatever the command prints, and a placeholder put there as text
+   would have to be told apart from output on every append. */
+.result.live:empty::before {
+  content: 'Waiting for output…';
+  color: var(--muted);
+}
+
 .empty {
   color: var(--muted);
 }

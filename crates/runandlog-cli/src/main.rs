@@ -121,8 +121,12 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
         }
         let cell = &session.doc().cells[index];
         println!("[{}] {}", index + 1, first_line(&cell.command));
-        let outcome = session.run_cell_cancellable(index, &canceller)?;
-        print!("{}", outcome.output);
+        // Printed as it arrives rather than once the command has finished. A run
+        // that takes minutes otherwise looks like a hung terminal, and the output
+        // that would have said what it is doing only appears once it no longer
+        // matters. The chunks add up to `outcome.output`, so nothing is printed
+        // twice by not printing that afterwards.
+        let outcome = session.run_cell_streaming(index, &canceller, print_as_it_arrives)?;
         println!("--- {}", outcome.status_text());
         failed |= !outcome.is_success();
         if interrupt_requested() {
@@ -143,6 +147,21 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Prints a piece of a running command's output straight away.
+///
+/// Flushed by hand: stdout is only line-buffered when it is a terminal, and even
+/// then a command printing a prompt or a progress line without a newline would sit
+/// in the buffer -- which is the very output a live view exists to show. Redirected
+/// to a file it is block-buffered, and nothing would appear until the block filled.
+fn print_as_it_arrives(chunk: &str) {
+    use std::io::Write;
+
+    print!("{chunk}");
+    // A failure here is a closed or full stdout, which the next `println!` reports
+    // in the ordinary way. Nothing useful can be done about it mid-command.
+    let _ = std::io::stdout().flush();
 }
 
 /// Turns Ctrl-C into a request to stop the running command.
