@@ -180,6 +180,22 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 (本体の範囲が 100..923 の 824x824 になっているか)。ヘッドレスなので Dock での
 見え方は確認できないが、縮小して暗い背景に合成すれば小サイズの潰れは見られる。
 
+## CI (GitHub Actions)
+
+`.github/workflows/test.yml` が **PR のチェックであると同時にリリースの門番**。
+`workflow_call` と `pull_request` の両方を持たせて 1 本にしてある。
+
+- **`release.yml` は `uses:` でこれを呼び、`build` を `needs: test` にしている。**
+  呼び出した再利用ワークフローの job は**呼び出し元と同じ run に入る**ので `needs` が効く。
+  同じ push で起動する別ワークフローにすると `needs` で依存させられず、テストが赤くても
+  リリースは普通に進む (方針: cyberneura-github-actions の `docs/build-requires-tests.md`)。
+- **matrix は `release.yml` の build matrix と feature まで揃える。** macOS は既定 feature
+  (GUI 込み) で、Linux は `--no-default-features`。逆にすると「配布しないコードを検査して、
+  配布するコードを検査しない」ことになる。GUI のテストは macOS の脚でだけ走る。
+- **`test` job は `needs: plan` + リリース時だけ**という条件にしてある。version を変えない
+  main への push でテストが走らないが、そこは PR 側の起動が埋める。
+- `cargo fmt --check` は OS にも feature にも依存しないので ubuntu の脚だけで走らせる。
+
 ## リリース
 
 **`Cargo.toml` の version を main で変えると、それがリリースになる。** ワークフローは
