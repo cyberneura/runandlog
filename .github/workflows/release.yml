@@ -97,8 +97,20 @@ jobs:
               ;;
           esac
 
-  build:
+  # The gate. Called rather than written out here so that a pull request and a
+  # release run the same checks from the same file; being called puts its jobs
+  # in this run, which is what lets `needs` hold the build back.
+  #
+  # It hangs off `plan` under the same condition as the build, so a push to main
+  # that does not change the version costs nothing. What that leaves untested is
+  # covered on the way in: test.yml also runs on every pull request.
+  test:
     needs: plan
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: [plan, test]
     if: needs.plan.outputs.release == 'true'
     strategy:
       fail-fast: false
