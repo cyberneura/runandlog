@@ -3,14 +3,23 @@
 :root {
   /* The page sits a shade behind the cards rather than level with them: with both
      white, a card was told from the page by its border alone and the document read
-     as one flat sheet. */
-  --bg: #e5e7eb;
-  --card: #ffffff;
+     as one flat sheet.
+
+     The neutrals carry a little of the accent's hue rather than being grey. Flat
+     grey next to a blue accent reads as a screenshot of a disabled window; a few
+     points of saturation are enough to make the surfaces look lit without turning
+     the window into a coloured thing. */
+  --bg: #e3e7f0;
+  --card: #fcfdff;
   --fg: #1f2328;
-  --muted: #656d76;
-  --border: #d0d7de;
-  --surface: #f6f8fa;
+  --muted: #5f6675;
+  --border: #ccd3e2;
+  --surface: #f0f3fa;
   --accent: #1f6feb;
+  /* The same accent at low opacity, for the halo around a running cell. Kept as
+     its own variable because a colour cannot be given an alpha in a place that
+     only takes `var()`. */
+  --accent-soft: rgba(31, 111, 235, 0.25);
   --ok: #1a7f37;
   --error: #cf222e;
 }
@@ -18,13 +27,14 @@
 @media (prefers-color-scheme: dark) {
   :root {
     /* Same relationship the other way round: the page is the darker of the two. */
-    --bg: #010409;
-    --card: #0d1117;
+    --bg: #05070e;
+    --card: #0d1220;
     --fg: #e6edf3;
-    --muted: #8b949e;
-    --border: #30363d;
-    --surface: #161b22;
+    --muted: #8b93a7;
+    --border: #2b3346;
+    --surface: #151b2a;
     --accent: #4493f8;
+    --accent-soft: rgba(68, 147, 248, 0.28);
     --ok: #3fb950;
     --error: #f85149;
   }
@@ -107,8 +117,52 @@ button:disabled {
   overflow: hidden;
 }
 
+/* A running cell keeps a breathing halo, so that it is picked out of the list
+   from across the window and not only by the label on its button. */
 .cell.running {
   border-color: var(--accent);
+  animation: cell-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes cell-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--accent-soft);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+}
+
+/* The turning ring in the head of a running cell. */
+.spinner {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spinner-turn 0.8s linear infinite;
+}
+
+@keyframes spinner-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Movement is the point of both of these, but it is also what makes a window
+   unusable for a reader who cannot take it. The cell stays picked out by its
+   border and a steady halo, and the ring by being a ring. */
+@media (prefers-reduced-motion: reduce) {
+  .cell.running {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  .spinner {
+    animation: none;
+  }
 }
 
 .cell-head {

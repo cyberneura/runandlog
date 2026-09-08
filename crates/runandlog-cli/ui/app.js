@@ -63,8 +63,17 @@ function setBusy(value) {
   }
 }
 
-/** Draws the document. Called for the first paint and after every write-back. */
+/**
+ * Draws the document. Called for the first paint and after every write-back.
+ *
+ * Every draw replaces the whole list, which drops the scroll position: with no
+ * children the list has nothing to scroll, so the browser clamps `scrollTop` to
+ * zero and running a cell threw the reader back to the top of the file. The
+ * position is taken before the swap and put back after it, once the new cells
+ * give the list its height again.
+ */
 function render(doc) {
+  const scrollTop = cellsEl.scrollTop
   pathEl.textContent = doc.path
   pathEl.title = doc.path
   cellsEl.replaceChildren()
@@ -80,6 +89,15 @@ function render(doc) {
   for (const cell of doc.cells) {
     cellsEl.append(renderCell(cell))
   }
+  // A result appearing or disappearing changes the height, so the old offset can
+  // be past the new end. Assigning it is enough: the browser clamps it to what
+  // the list can now scroll, which keeps the top of the view as close to where
+  // it was as the new content allows.
+  cellsEl.scrollTop = scrollTop
+  // The live block is scrolled to its end here rather than while it is being
+  // built: a detached element has no height, so the scroll would have gone
+  // nowhere.
+  scrollToEnd(liveElement(running))
 }
 
 function renderCell(cell) {
@@ -97,6 +115,16 @@ function renderCell(cell) {
   number.className = 'number'
   number.textContent = String(cell.number)
   head.append(number)
+
+  if (running === cell.index) {
+    // A turning ring beside the number, so that a cell that is working says so
+    // even where the head is the only part on screen. Marked as decoration: the
+    // button label beside it already says "Running…" in words.
+    const spinner = document.createElement('span')
+    spinner.className = 'spinner'
+    spinner.setAttribute('aria-hidden', 'true')
+    head.append(spinner)
+  }
 
   const button = document.createElement('button')
   button.className = 'run'
@@ -132,7 +160,6 @@ function renderCell(cell) {
     output.className = 'result live'
     output.textContent = live
     section.append(output)
-    scrollToEnd(output)
   } else if (hasResult) {
     const result = document.createElement('pre')
     result.className = 'result'
@@ -144,6 +171,9 @@ function renderCell(cell) {
 
 /** Keeps the newest line in view, the way a terminal does. */
 function scrollToEnd(element) {
+  if (!element) {
+    return
+  }
   element.scrollTop = element.scrollHeight
 }
 
