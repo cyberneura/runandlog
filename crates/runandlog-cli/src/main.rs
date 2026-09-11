@@ -19,8 +19,15 @@ fn signal_exit_code(signal: i32) -> u8 {
 
 /// Runs the shell commands written in a Markdown file and writes the results
 /// back into the same file.
+///
+/// Cells are numbered from 1, in the order they appear in the file. That is the
+/// number `--list` prints, `--run N` takes, the TUI and the window show, and the
+/// result block written back names ("Ran result: cell 3 - ..."). Headings in the
+/// file are not it: they are written by hand and need not be numbered, need not
+/// be one per cell, and fall out of step as soon as a cell is inserted. Work from
+/// the number in the result block.
 #[derive(Parser, Debug)]
-#[command(name = "runandlog", version, about, long_about = None)]
+#[command(name = "runandlog", version, about, long_about)]
 struct Args {
     /// The Markdown file to work on.
     file: PathBuf,

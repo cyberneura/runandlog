@@ -135,6 +135,13 @@ than opening a window.
 A fenced code block becomes a cell when its info string is `shell`, `sh`, `bash`,
 or `zsh`. Blocks in any other language are left alone.
 
+**Cells are numbered from 1, in the order they appear in the file.** That is the
+number `--list` prints, `--run N` takes, the TUI and the desktop app show, and
+the result block names. Headings are not it: they are written by hand and need
+not be numbered, need not be one per cell, and fall out of step as soon as a cell
+is inserted. Anything reading the file -- a person or an agent -- should work
+from the number in the result block.
+
 ````markdown
 ```shell
 date
@@ -160,7 +167,7 @@ date
 ```
 
 <!-- runandlog:begin -->
-Ran result: 2026-08-14 09:53:32 (exit 0, 0.02s, 1 lines)
+Ran result: cell 1 - 2026-08-14 09:53:32 (exit 0, 0.02s, 1 lines)
 
 ```text
 Fri Aug 14 09:53:32 JST 2026
@@ -168,10 +175,14 @@ Fri Aug 14 09:53:32 JST 2026
 <!-- runandlog:end -->
 ````
 
+The first line carries the cell number, when the run started, how it ended, how
+long it took, and how many lines it printed.
+
 The result is wrapped in HTML comment markers. They are valid Markdown, they do
 not show up when rendered, and they let a re-run replace the previous result
 reliably -- so no matter how many times a cell runs, exactly one result block
-remains.
+remains. Nothing reads the first line to find the block, so a result written
+before the number existed is replaced the same way.
 
 ### Sending the result to a separate file
 

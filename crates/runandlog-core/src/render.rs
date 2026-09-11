@@ -59,7 +59,7 @@ pub fn render_result(
         .as_deref()
         .filter(|link| out_file_allowed && is_inside_dir(link));
     let rejected = cell.out_file.is_some() && designated.is_none();
-    let summary = summary_line(outcome, line_count, rejected);
+    let summary = summary_line(cell, outcome, line_count, rejected);
 
     let sidecar = sidecar_for(designated, ctx, cell, line_count, &output);
     let body = match &sidecar {
@@ -159,11 +159,29 @@ fn is_inside_dir(link: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-fn summary_line(outcome: &ExecOutcome, line_count: usize, rejected_out_file: bool) -> String {
+/// The first line of a result block.
+///
+/// It carries the cell number because the result is the one place a reader is
+/// certain to pass through, and nothing else in the file ties a result back to a
+/// cell: headings are written by hand and need not be numbered, need not be one
+/// per cell, and need not be in step after a cell is inserted. A reader working
+/// from headings alone -- an agent summarising the file, say -- has been off by
+/// one and had no way to notice.
+///
+/// The number is one-based, the same number `--list`, `--run N`, the TUI and the
+/// window show. It is the number a person says out loud, and it is not bent to
+/// suit a zero-based reader.
+fn summary_line(
+    cell: &Cell,
+    outcome: &ExecOutcome,
+    line_count: usize,
+    rejected_out_file: bool,
+) -> String {
     let timestamp = outcome.started_at.format("%Y-%m-%d %H:%M:%S");
     let seconds = outcome.duration.as_secs_f64();
     let mut summary = format!(
-        "Ran result: {timestamp} ({}, {seconds:.2}s, {line_count} lines)",
+        "Ran result: cell {} - {timestamp} ({}, {seconds:.2}s, {line_count} lines)",
+        cell.display_number(),
         outcome.status_text()
     );
     if outcome.truncated {
@@ -254,9 +272,69 @@ mod tests {
         );
         assert_eq!(
             rendered.markdown,
-            "<!-- runandlog:begin -->\nRan result: 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)\n\n```text\nFri Aug 14 09:53:32 JST 2026\n```\n<!-- runandlog:end -->\n"
+            "<!-- runandlog:begin -->\nRan result: cell 1 - 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)\n\n```text\nFri Aug 14 09:53:32 JST 2026\n```\n<!-- runandlog:end -->\n"
         );
         assert!(rendered.sidecar.is_none());
+    }
+
+    #[test]
+    fn the_summary_names_the_cell_it_belongs_to() {
+        // The number is what ties a result back to a cell: headings are written by
+        // hand and need not be numbered, one per cell, or in step after an
+        // insertion, so a reader working from them alone has nothing to check
+        // against.
+        let md = "```shell\na\n```\n\n```shell\nb\n```\n\n```shell\nc\n```\n";
+        let cells = Document::parse(md).cells;
+        for (position, cell) in cells.iter().enumerate() {
+            let rendered = render_result(cell, &outcome("x\n"), &context(50), true);
+            assert!(
+                rendered
+                    .markdown
+                    .contains(&format!("Ran result: cell {} - ", position + 1)),
+                "cell at position {position} said: {}",
+                rendered.markdown.lines().nth(1).unwrap_or_default()
+            );
+        }
+    }
+
+    #[test]
+    fn the_cell_number_is_one_based() {
+        // `--list`, `--run N`, the TUI and the window all count from one, and the
+        // number in the file is the same one. Zero-based would read as a different
+        // cell to anyone acting on it.
+        let rendered = render_result(
+            &cell("```shell\ndate\n```\n"),
+            &outcome("x\n"),
+            &context(50),
+            true,
+        );
+        assert!(rendered.markdown.contains("Ran result: cell 1 - "));
+        assert!(!rendered.markdown.contains("cell 0"));
+    }
+
+    #[test]
+    fn a_result_without_a_number_is_replaced_whole() {
+        // Blocks written before the number existed have to keep working. Nothing
+        // reads the summary line -- the markers are what locate the block -- so a
+        // re-run replaces the old header along with the rest of it.
+        let md = concat!(
+            "```shell\ndate\n```\n\n",
+            "<!-- runandlog:begin -->\n",
+            "Ran result: 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)\n\n",
+            "```text\nold\n```\n",
+            "<!-- runandlog:end -->\n",
+        );
+        let doc = Document::parse(md);
+        let target = &doc.cells[0];
+        assert!(target.result_span.is_some(), "the old block was not found");
+        let rendered = render_result(target, &outcome("new\n"), &context(50), true);
+        let (start, end) = target.result_span.unwrap();
+        let updated = format!("{}{}{}", &md[..start], rendered.markdown, &md[end..]);
+        assert!(updated.contains("Ran result: cell 1 - "));
+        assert!(!updated.contains("old"));
+        // Exactly one block remains: the old header did not survive alongside it.
+        assert_eq!(updated.matches("Ran result:").count(), 1);
+        assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
     }
 
     #[test]
