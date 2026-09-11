@@ -13,4 +13,4 @@ pub mod render;
 
 pub use exec::{Canceller, ExecOptions, ExecOutcome, run, run_cancellable, run_streaming};
 pub use parse::{Cell, Document, Edit, splice};
-pub use render::{RenderContext, ResultRender, Sidecar, render_result};
+pub use render::{RenderContext, ResultRender, Sidecar, render_result, renumber_result};

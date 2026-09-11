@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use runandlog_core::{
     Canceller, Document, ExecOptions, ExecOutcome, RenderContext, Sidecar, render_result,
-    run_streaming, splice,
+    renumber_result, run_streaming, splice,
 };
 
 /// State for a single Markdown file.
@@ -152,10 +152,21 @@ impl Session {
             debug_assert!(rendered.sidecar.is_none());
         }
 
-        let updated = splice(
-            &self.doc.text,
-            vec![self.doc.result_edit(&cell, &rendered.markdown)],
+        // Result blocks belonging to other cells are brought back in step at the
+        // same time. A cell number is a position, so inserting or deleting a
+        // runnable block moves every number after it, and the blocks already in the
+        // file would otherwise keep saying what their cell used to be -- the number
+        // a reader is told to work from. They correct themselves the next time
+        // anything in the file runs. Nothing outside the result markers is touched.
+        let mut edits = vec![self.doc.result_edit(&cell, &rendered.markdown)];
+        edits.extend(
+            self.doc
+                .cells
+                .iter()
+                .filter(|other| other.index != cell.index)
+                .filter_map(|other| renumber_result(&self.doc.text, other)),
         );
+        let updated = splice(&self.doc.text, edits);
         write_atomically(&self.path, &updated)?;
         self.doc = Document::parse(&updated);
         Ok(())
