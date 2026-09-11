@@ -102,6 +102,10 @@ run. **Run all** runs every cell in order, **Stop** ends the command that is
 running and keeps what it printed, **Reload** picks up edits made in an external
 editor.
 
+Each cell also has a `❐ Copy` button at the end of its header, which puts that
+cell's command on the clipboard and shows a check for three seconds. It stays
+available while a command is running, since copying changes nothing.
+
 The cell being run shows what the command is printing, scrolled to the newest
 line, and the finished result takes its place when the command ends. Only the tail
 is kept: a command that prints without stopping fills neither the window nor its
