@@ -249,7 +249,12 @@ async function copyCommand(index, command) {
   try {
     await navigator.clipboard.writeText(command)
   } catch (error) {
-    setStatus(`Could not copy: ${error}`, 'error')
+    // Reported unless a reload has since thrown this press away: after one, the
+    // status belongs to the reload, and a prompt declined afterwards would
+    // replace it with an error about a press the reader has moved on from.
+    if (generation === copyGeneration) {
+      setStatus(`Could not copy: ${error}`, 'error')
+    }
     return
   }
   // Reloaded while this was in flight: the cells on screen are not the ones this

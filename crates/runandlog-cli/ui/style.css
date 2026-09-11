@@ -189,6 +189,15 @@ button:disabled {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   color: var(--muted);
+  /* Gives way to Copy rather than pushing it out of the cell. A flex item will
+     not shrink below the width of its content unless told to, so a long unbroken
+     file name overflowed the head and the cell's `overflow: hidden` clipped the
+     button off the end -- the one action every cell is supposed to keep. Same
+     treatment as the file path in the window header. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Copy is pushed to the end of the head rather than placed after the last thing
