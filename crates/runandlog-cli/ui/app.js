@@ -460,7 +460,14 @@ async function reload(quiet) {
   // the cells where they were -- so the check survives that.
   forgetCopied()
   try {
-    render(await invoke('reload'))
+    const doc = await invoke('reload')
+    // Again, for a press made while the file was being re-read. Copy stays
+    // enabled through a reload, and such a press is numbered after the call
+    // above, so only a second one can tell it that the cell it aimed at may not
+    // be at that index any more. Nothing can come between this and the draw:
+    // both run without yielding.
+    forgetCopied()
+    render(doc)
     if (!quiet) {
       setStatus('Reloaded.', 'ok')
     }
