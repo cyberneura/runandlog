@@ -239,8 +239,13 @@ pub fn renumber_result(text: &str, cell: &Cell) -> Option<Edit> {
             }
             after
         }
-        // Written before the number existed: put one in.
-        None => rest,
+        // Written before the number existed: put one in, but only once the rest of
+        // the line is the shape this program writes. `Ran result: ` alone is not
+        // enough of a signature -- a header reworded by hand
+        // (`Ran result: imported from CI`) starts the same way, and giving it a
+        // number would be inventing one for a run nobody recorded (Codex review).
+        None if starts_with_timestamp(rest) => rest,
+        None => return None,
     };
     let replacement = format!("{SUMMARY_PREFIX}{wanted}{tail}");
     if replacement == line {
@@ -251,6 +256,23 @@ pub fn renumber_result(text: &str, cell: &Cell) -> Option<Edit> {
         end: line_end,
         replacement,
     })
+}
+
+/// Whether the text opens with the timestamp `summary_line` writes.
+///
+/// Matched by shape rather than parsed: the question is only whether this looks
+/// like a line this program produced, and a date that is the right shape but an
+/// impossible day (`2026-13-40 ...`) still came from here or from something
+/// imitating it closely enough that a number belongs on it.
+fn starts_with_timestamp(text: &str) -> bool {
+    // The `%Y-%m-%d %H:%M:%S` the summary is formatted with, with `d` for a digit.
+    const SHAPE: &[u8] = b"dddd-dd-dd dd:dd:dd";
+    let bytes = text.as_bytes();
+    bytes.len() >= SHAPE.len()
+        && SHAPE.iter().zip(bytes).all(|(want, got)| match want {
+            b'd' => got.is_ascii_digit(),
+            other => got == other,
+        })
 }
 
 /// Wraps the output in a code fence.
@@ -461,6 +483,13 @@ mod tests {
             "Result from yesterday",
             "ran result: cell 1 - lowercase",
             "Ran result: cell - 2026-08-14 (no digits)",
+            // Reworded by hand. It starts the way ours do, but the rest is not a
+            // run this program recorded, so a number would be invented.
+            "Ran result: imported from CI",
+            "Ran result: see the log",
+            // Nearly the timestamp, but not it.
+            "Ran result: 2026-08-14 09:53 (exit 0)",
+            "Ran result: 26-08-14 09:53:32 (exit 0)",
         ] {
             let md = format!(
                 "```shell\nfirst\n```\n\n```shell\nsecond\n```\n\n{}",
