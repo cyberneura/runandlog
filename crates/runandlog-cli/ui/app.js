@@ -43,13 +43,24 @@ let copied = null
 /** Timer that takes the check away again, so a second copy can restart it. */
 let copiedTimer = null
 /**
- * Counts copies, so that a slow one cannot land on top of a later one.
+ * Counts copies, so that an overtaken one cannot put its check on the board.
  *
- * `writeText` is asynchronous and two presses can be in flight at once, in either
- * order: without this the first to be asked but the last to answer would put its
- * check on its own cell, on a clipboard that by then holds the other command.
+ * `writeText` is asynchronous and a second press can arrive while the first is
+ * still in flight. Which command the clipboard ends up holding is decided by
+ * which write happens last, so the presses are queued (`copyChain`) to make that
+ * the later one; this number is then what tells a press that it has been
+ * overtaken and should say nothing.
  */
 let copySeq = 0
+/**
+ * Queue of clipboard writes, so that two presses cannot race for the clipboard.
+ *
+ * Without it the clipboard is left holding whichever write the browser finished
+ * last, which need not be the one the reader pressed last -- and then the check
+ * names a different command than the clipboard holds. Both callbacks of the
+ * `then` continue the queue: one press failing must not stop the next.
+ */
+let copyChain = Promise.resolve()
 /** How long the Copy button shows its check. */
 const COPIED_MS = 3000
 /**
@@ -232,8 +243,16 @@ async function copyCommand(index, command) {
   // user declining) has to be said out loud rather than look like a button that
   // does nothing, which is what the status line is for.
   const seq = ++copySeq
+  const write = copyChain.then(
+    () => navigator.clipboard.writeText(command),
+    () => navigator.clipboard.writeText(command),
+  )
+  copyChain = write.then(
+    () => {},
+    () => {},
+  )
   try {
-    await navigator.clipboard.writeText(command)
+    await write
   } catch (error) {
     // A failure is reported whichever press it belonged to: the clipboard is in
     // no particular state and the reader pressed the button, so silence would be
@@ -241,6 +260,9 @@ async function copyCommand(index, command) {
     setStatus(`Could not copy: ${error}`, 'error')
     return
   }
+  // Overtaken: a later press is queued behind this write, so the clipboard is
+  // about to hold that command instead. Saying nothing leaves the check and the
+  // status to the press that ends up owning the clipboard.
   if (seq !== copySeq) {
     return
   }
@@ -273,8 +295,16 @@ function showCopied(index) {
   }, COPIED_MS)
 }
 
-/** Drops the check, both the state and what is on screen. */
+/**
+ * Drops the check: the state, what is on screen, and any copy still in flight.
+ *
+ * The number is raised first and unconditionally. A press whose `writeText` has
+ * not answered yet -- a permission prompt is open, say -- leaves nothing on
+ * screen to clear, and left valid it would put its check on whichever cell ends
+ * up at its index once the reload has redrawn the list.
+ */
 function forgetCopied() {
+  copySeq += 1
   if (copied === null) {
     return
   }
