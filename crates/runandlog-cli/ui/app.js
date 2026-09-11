@@ -33,6 +33,26 @@ const LIVE_MAX_CHARS = 20000
 /** Buttons are disabled while a run is in flight. */
 let busy = false
 /**
+ * Index of the cell whose Copy button is showing its check, or null.
+ *
+ * Held here rather than on the button so that a redraw -- one arrives whenever a
+ * run is written back -- keeps showing the check on the cell that was copied,
+ * instead of silently putting the label back.
+ */
+let copied = null
+/** Timer that takes the check away again, so a second copy can restart it. */
+let copiedTimer = null
+/**
+ * Counts copies, so that a slow one cannot land on top of a later one.
+ *
+ * `writeText` is asynchronous and two presses can be in flight at once, in either
+ * order: without this the first to be asked but the last to answer would put its
+ * check on its own cell, on a clipboard that by then holds the other command.
+ */
+let copySeq = 0
+/** How long the Copy button shows its check. */
+const COPIED_MS = 3000
+/**
  * Whether the backend's events are being listened to. See `start`.
  *
  * Taken for granted until `start` learns otherwise, so that the moment before the
@@ -146,6 +166,22 @@ function renderCell(cell) {
     head.append(out)
   }
 
+  // Copy sits at the far end of the head, away from Run: the two do very
+  // different things, and one of them runs a command the reader may only have
+  // wanted the text of. Appended last so that it stays at the end whether or not
+  // the cell writes to a file; the stylesheet is what pushes it over.
+  //
+  // Not disabled while a run is in flight, unlike Run: copying reads the document
+  // and changes nothing, so there is no reason to make the reader wait for a
+  // command to finish.
+  const copy = document.createElement('button')
+  copy.className = 'copy'
+  copy.type = 'button'
+  copy.title = 'Copy the command'
+  copy.addEventListener('click', () => copyCommand(cell.index, cell.command))
+  dressCopyButton(copy, cell.index)
+  head.append(copy)
+
   const command = document.createElement('pre')
   command.className = 'command'
   command.textContent = cell.command
@@ -167,6 +203,96 @@ function renderCell(cell) {
     section.append(result)
   }
   return section
+}
+
+/**
+ * Gives a Copy button the label and the mark for the state it is in.
+ *
+ * The label is a glyph plus a word, like Run: the button reads the same way
+ * whether or not the glyph renders. The `copied` attribute is what the stylesheet
+ * colours, so the check is told from the default label by more than its shape.
+ *
+ * The glyph is U+2750, from the same dingbat block as the check, rather than one
+ * of the copy-shaped characters higher up (U+29C9, U+2398): those are missing
+ * from the fonts a plain Linux webview falls back to, and a tofu box beside a
+ * word is worse than a plainer pair of squares.
+ */
+function dressCopyButton(button, index) {
+  const isCopied = copied === index
+  button.textContent = isCopied ? '✓ Copied' : '❐ Copy'
+  button.dataset.copied = String(isCopied)
+}
+
+/** Puts the command on the clipboard and shows the check on that cell. */
+async function copyCommand(index, command) {
+  // `navigator.clipboard` is the only way out of here: the window has no clipboard
+  // plugin, and adding one for a button would mean a Rust dependency and a
+  // capability for what the webview already does. Both webviews serve the window
+  // from a secure origin, so it is there -- but a refusal (a webview without it, a
+  // user declining) has to be said out loud rather than look like a button that
+  // does nothing, which is what the status line is for.
+  const seq = ++copySeq
+  try {
+    await navigator.clipboard.writeText(command)
+  } catch (error) {
+    // A failure is reported whichever press it belonged to: the clipboard is in
+    // no particular state and the reader pressed the button, so silence would be
+    // the wrong answer even for a press that has been overtaken.
+    setStatus(`Could not copy: ${error}`, 'error')
+    return
+  }
+  if (seq !== copySeq) {
+    return
+  }
+  showCopied(index)
+  setStatus(`Copied the command of cell ${index + 1}.`, 'ok')
+}
+
+/**
+ * Shows the check on one cell's Copy button for `COPIED_MS`.
+ *
+ * The label is written straight into the button rather than by redrawing: a redraw
+ * replaces every cell, which would throw away the live output of a command that is
+ * running while the reader copies a different cell.
+ */
+function showCopied(index) {
+  clearTimeout(copiedTimer)
+  const previous = copied
+  copied = index
+  // A press on a second cell while the first still shows its check: only one cell
+  // was copied, so the first one goes back at once instead of keeping a check that
+  // is no longer true.
+  if (previous !== null && previous !== index) {
+    repaintCopyButton(previous)
+  }
+  repaintCopyButton(index)
+  copiedTimer = setTimeout(() => {
+    copied = null
+    copiedTimer = null
+    repaintCopyButton(index)
+  }, COPIED_MS)
+}
+
+/** Drops the check, both the state and what is on screen. */
+function forgetCopied() {
+  if (copied === null) {
+    return
+  }
+  clearTimeout(copiedTimer)
+  copiedTimer = null
+  const was = copied
+  copied = null
+  repaintCopyButton(was)
+}
+
+/** Re-dresses a cell's Copy button, if that cell is on screen. */
+function repaintCopyButton(index) {
+  const button = cellsEl.querySelector(
+    `section.cell[data-index="${index}"] button.copy`,
+  )
+  if (button) {
+    dressCopyButton(button, index)
+  }
 }
 
 /** Keeps the newest line in view, the way a terminal does. */
@@ -297,6 +423,12 @@ async function stop() {
 }
 
 async function reload(quiet) {
+  // Re-reading the file can add, remove or reorder cells, and the check is held
+  // by index: kept, it would move to whichever cell landed on that index. The TUI
+  // drops its per-cell state on reload for the same reason. A write-back
+  // (`runandlog://document`) is not this case -- it replaces one result and leaves
+  // the cells where they were -- so the check survives that.
+  forgetCopied()
   try {
     render(await invoke('reload'))
     if (!quiet) {

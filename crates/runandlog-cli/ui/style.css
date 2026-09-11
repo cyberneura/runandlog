@@ -191,6 +191,36 @@ button:disabled {
   color: var(--muted);
 }
 
+/* Copy is pushed to the end of the head rather than placed after the last thing
+   before it: a cell that writes to a file has an extra label in between, and
+   without this the button would sit at a different distance from the edge
+   depending on the cell. The auto margin also gives a long `→ out.txt` somewhere
+   to grow into. */
+.copy {
+  margin-left: auto;
+  flex: none;
+  /* Room for the wider of the two labels, so that pressing the button does not
+     move its own left edge: "✓ Copied" is about 16px wider than "❐ Copy", and
+     with the button held against the right edge that jump is all the reader sees.
+     In em rather than px because the labels are set in the window's font. */
+  min-width: 6.6em;
+}
+
+/* Confirmation of a copy, alongside the check in the label: the glyph alone is a
+   small change to read in a row of buttons. Kept to the button rather than
+   flashing the cell, since nothing about the cell has changed. */
+.copy[data-copied='true'] {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+/* The hover rule above would paint the accent over the confirmation while the
+   pointer is still on the button it was just pressed with -- which is always. */
+.copy[data-copied='true']:hover:not(:disabled) {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
 pre {
   margin: 0;
   padding: 10px 12px;
