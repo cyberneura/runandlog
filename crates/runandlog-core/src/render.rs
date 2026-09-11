@@ -3,7 +3,14 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::exec::ExecOutcome;
-use crate::parse::{BEGIN_MARKER, Cell, END_MARKER};
+use crate::parse::{BEGIN_MARKER, Cell, END_MARKER, Edit};
+
+/// How a result block's first line starts.
+const SUMMARY_PREFIX: &str = "Ran result: ";
+/// What follows it when the cell number is there.
+const CELL_PREFIX: &str = "cell ";
+/// What separates the cell number from the rest of the line.
+const CELL_SUFFIX: &str = " - ";
 
 /// The context needed to format a result.
 #[derive(Debug, Clone)]
@@ -195,6 +202,57 @@ fn summary_line(
     summary
 }
 
+/// An edit that corrects the cell number in a result block already in the file,
+/// or `None` when the number is right, absent in a way that cannot be fixed, or
+/// there is no result block.
+///
+/// Cell numbers are positions, so inserting or deleting a runnable block moves
+/// every number after it. The blocks already written keep the number their cell
+/// had when it ran, and that number is what the README tells a reader to work
+/// from -- so left alone it would be quietly wrong, which is the failure this
+/// whole line was added to end (Codex review).
+///
+/// **Only the first line of a result block is touched, and only when it looks
+/// like one this program wrote.** Everything between the markers belongs to
+/// runandlog, so correcting a number there is not an edit to the reader's file in
+/// the way rewriting their prose would be; a line that has been reworded by hand
+/// is left alone rather than guessed at.
+pub fn renumber_result(text: &str, cell: &Cell) -> Option<Edit> {
+    let (start, end) = cell.result_span?;
+    // The summary is the line after the begin marker. `result_span` starts at the
+    // marker line, which the parser has already matched.
+    let after_marker = start + text[start..end].find('\n')? + 1;
+    let line_end = after_marker + text[after_marker..end].find('\n')?;
+    let line = &text[after_marker..line_end];
+
+    let rest = line.strip_prefix(SUMMARY_PREFIX)?;
+    let wanted = format!("{CELL_PREFIX}{}{CELL_SUFFIX}", cell.display_number());
+    let tail = match rest.strip_prefix(CELL_PREFIX) {
+        // Written with a number: replace it, unless it is already right.
+        Some(numbered) => {
+            let digits: String = numbered.chars().take_while(char::is_ascii_digit).collect();
+            let after = numbered
+                .strip_prefix(&digits[..])?
+                .strip_prefix(CELL_SUFFIX)?;
+            if digits.is_empty() {
+                return None;
+            }
+            after
+        }
+        // Written before the number existed: put one in.
+        None => rest,
+    };
+    let replacement = format!("{SUMMARY_PREFIX}{wanted}{tail}");
+    if replacement == line {
+        return None;
+    }
+    Some(Edit {
+        start: after_marker,
+        end: line_end,
+        replacement,
+    })
+}
+
 /// Wraps the output in a code fence.
 ///
 /// The fence is lengthened so that a run of backticks inside the output cannot
@@ -335,6 +393,91 @@ mod tests {
         // Exactly one block remains: the old header did not survive alongside it.
         assert_eq!(updated.matches("Ran result:").count(), 1);
         assert_eq!(updated.matches(BEGIN_MARKER).count(), 1);
+    }
+
+    /// The document text plus the cells parsed from it, for the renumber tests.
+    fn parsed(md: &str) -> (String, Vec<Cell>) {
+        (md.to_string(), Document::parse(md).cells)
+    }
+
+    fn block(summary: &str) -> String {
+        format!("<!-- runandlog:begin -->\n{summary}\n\n```text\nx\n```\n<!-- runandlog:end -->\n")
+    }
+
+    #[test]
+    fn renumber_corrects_a_stale_number() {
+        // A cell inserted above moves every number after it, and the blocks
+        // already in the file keep the one their cell had when it ran.
+        let md = format!(
+            "```shell\nfirst\n```\n\n```shell\nsecond\n```\n\n{}",
+            block("Ran result: cell 1 - 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)")
+        );
+        let (text, cells) = parsed(&md);
+        let edit = renumber_result(&text, &cells[1]).expect("the stale number was not corrected");
+        assert_eq!(
+            edit.replacement,
+            "Ran result: cell 2 - 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)"
+        );
+        let spliced = crate::parse::splice(&text, vec![edit]);
+        assert!(spliced.contains("Ran result: cell 2 - "));
+        assert_eq!(spliced.matches("Ran result:").count(), 1);
+        // Only the one line moved: the fence above and the output below are intact.
+        assert!(spliced.contains("```shell\nsecond\n```"));
+        assert!(spliced.contains("```text\nx\n```"));
+    }
+
+    #[test]
+    fn renumber_leaves_a_correct_number_alone() {
+        let md = format!(
+            "```shell\nfirst\n```\n\n{}",
+            block("Ran result: cell 1 - 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)")
+        );
+        let (text, cells) = parsed(&md);
+        assert!(renumber_result(&text, &cells[0]).is_none());
+    }
+
+    #[test]
+    fn renumber_adds_a_number_to_an_older_block() {
+        // Written before the number existed. Bringing it in step costs the reader
+        // nothing and saves them from a block that says nothing at all.
+        let md = format!(
+            "```shell\nfirst\n```\n\n```shell\nsecond\n```\n\n{}",
+            block("Ran result: 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)")
+        );
+        let (text, cells) = parsed(&md);
+        let edit = renumber_result(&text, &cells[1]).expect("no number was added");
+        assert_eq!(
+            edit.replacement,
+            "Ran result: cell 2 - 2026-08-14 09:53:32 (exit 0, 0.12s, 1 lines)"
+        );
+    }
+
+    #[test]
+    fn renumber_leaves_a_line_it_did_not_write_alone() {
+        // Between the markers is this program's ground, but a first line that does
+        // not look like one of ours has been put there by someone, and guessing at
+        // its shape would rewrite what they meant.
+        for summary in [
+            "Result from yesterday",
+            "ran result: cell 1 - lowercase",
+            "Ran result: cell - 2026-08-14 (no digits)",
+        ] {
+            let md = format!(
+                "```shell\nfirst\n```\n\n```shell\nsecond\n```\n\n{}",
+                block(summary)
+            );
+            let (text, cells) = parsed(&md);
+            assert!(
+                renumber_result(&text, &cells[1]).is_none(),
+                "rewrote a line it did not write: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn renumber_does_nothing_without_a_result_block() {
+        let (text, cells) = parsed("```shell\nfirst\n```\n");
+        assert!(renumber_result(&text, &cells[0]).is_none());
     }
 
     #[test]

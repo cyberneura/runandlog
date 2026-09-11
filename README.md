@@ -142,6 +142,11 @@ not be numbered, need not be one per cell, and fall out of step as soon as a cel
 is inserted. Anything reading the file -- a person or an agent -- should work
 from the number in the result block.
 
+Inserting or deleting a block moves every number after it. Running anything in
+the file brings the result blocks already in it back in step, so the numbers are
+right again from the next run onwards; only the first line of a result block is
+rewritten.
+
 ````markdown
 ```shell
 date
