@@ -43,24 +43,18 @@ let copied = null
 /** Timer that takes the check away again, so a second copy can restart it. */
 let copiedTimer = null
 /**
- * Counts copies, so that an overtaken one cannot put its check on the board.
+ * Raised whenever copies still waiting for an answer must be thrown away.
  *
- * `writeText` is asynchronous and a second press can arrive while the first is
- * still in flight. Which command the clipboard ends up holding is decided by
- * which write happens last, so the presses are queued (`copyChain`) to make that
- * the later one; this number is then what tells a press that it has been
- * overtaken and should say nothing.
- */
-let copySeq = 0
-/**
- * Queue of clipboard writes, so that two presses cannot race for the clipboard.
+ * Only reload does that, and only because the check is held by index: a press
+ * whose `writeText` has not answered yet has nothing on screen to clear, so
+ * without this it would come back after the redraw and mark whichever cell had
+ * landed on its index.
  *
- * Without it the clipboard is left holding whichever write the browser finished
- * last, which need not be the one the reader pressed last -- and then the check
- * names a different command than the clipboard holds. Both callbacks of the
- * `then` continue the queue: one press failing must not stop the next.
+ * It deliberately does **not** count presses. Two presses in flight at once are
+ * settled by which write the platform finished last, and a promise resolving is
+ * the only sign of that; so the last answer wins, rather than the last press.
  */
-let copyChain = Promise.resolve()
+let copyGeneration = 0
 /** How long the Copy button shows its check. */
 const COPIED_MS = 3000
 /**
@@ -242,28 +236,25 @@ async function copyCommand(index, command) {
   // from a secure origin, so it is there -- but a refusal (a webview without it, a
   // user declining) has to be said out loud rather than look like a button that
   // does nothing, which is what the status line is for.
-  const seq = ++copySeq
-  const write = copyChain.then(
-    () => navigator.clipboard.writeText(command),
-    () => navigator.clipboard.writeText(command),
-  )
-  copyChain = write.then(
-    () => {},
-    () => {},
-  )
+  //
+  // **Called straight from the click, before anything is awaited.** WebKit -- both
+  // targets here -- only allows a clipboard write while the press that asked for
+  // it is still counted as user activation. Holding the call back to run it after
+  // an earlier write settled (to make two presses land in the order they were
+  // made) spends that activation waiting, and the second press then fails outright
+  // with NotAllowedError. A press that does nothing is a worse outcome than the
+  // one it would buy: the check briefly naming the other of two commands pressed
+  // within the same moment (Codex review).
+  const generation = copyGeneration
   try {
-    await write
+    await navigator.clipboard.writeText(command)
   } catch (error) {
-    // A failure is reported whichever press it belonged to: the clipboard is in
-    // no particular state and the reader pressed the button, so silence would be
-    // the wrong answer even for a press that has been overtaken.
     setStatus(`Could not copy: ${error}`, 'error')
     return
   }
-  // Overtaken: a later press is queued behind this write, so the clipboard is
-  // about to hold that command instead. Saying nothing leaves the check and the
-  // status to the press that ends up owning the clipboard.
-  if (seq !== copySeq) {
+  // Reloaded while this was in flight: the cells on screen are not the ones this
+  // press was made against, so its index means nothing now.
+  if (generation !== copyGeneration) {
     return
   }
   showCopied(index)
@@ -298,13 +289,13 @@ function showCopied(index) {
 /**
  * Drops the check: the state, what is on screen, and any copy still in flight.
  *
- * The number is raised first and unconditionally. A press whose `writeText` has
- * not answered yet -- a permission prompt is open, say -- leaves nothing on
+ * The generation is raised first and unconditionally. A press whose `writeText`
+ * has not answered yet -- a permission prompt is open, say -- leaves nothing on
  * screen to clear, and left valid it would put its check on whichever cell ends
  * up at its index once the reload has redrawn the list.
  */
 function forgetCopied() {
-  copySeq += 1
+  copyGeneration += 1
   if (copied === null) {
     return
   }
