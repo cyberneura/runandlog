@@ -29,9 +29,9 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -97,7 +97,12 @@ struct Shared {
     /// The run whose helpers are answered. Zero while no run is in progress --
     /// before the first, between runs, after the last -- and then nothing is
     /// answered.
-    current_run: AtomicU64,
+    ///
+    /// A lock rather than an atomic because an answer is delivered *under* it:
+    /// the run cannot end between the check that it is still on and the write,
+    /// and once [`RunInProgress::drop`] has returned, no answer of that run is
+    /// still on its way.
+    current_run: Mutex<u64>,
     /// Number for the next run. Never reused, so a helper of an old run can never
     /// match a new one.
     next_run: AtomicU64,
@@ -117,14 +122,21 @@ pub struct RunInProgress {
 
 impl Drop for RunInProgress {
     fn drop(&mut self) {
+        let mut current = self.shared.current_run();
         // Only while it is still this run. A newer one may have started already,
         // and an old token dropping late must not end it.
-        let _ = self.shared.current_run.compare_exchange(
-            self.run,
-            0,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        if *current == self.run {
+            *current = 0;
+        }
+    }
+}
+
+impl Shared {
+    fn current_run(&self) -> std::sync::MutexGuard<'_, u64> {
+        // A poisoned lock holds a number all the same.
+        self.current_run
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -156,7 +168,7 @@ impl Askpass {
             socket,
             helper,
             closing: AtomicBool::new(false),
-            current_run: AtomicU64::new(0),
+            current_run: Mutex::new(0),
             next_run: AtomicU64::new(1),
         });
         let listener = {
@@ -191,7 +203,7 @@ impl Askpass {
 /// Starts a new run and adds its variables to `options`.
 fn apply(shared: &Arc<Shared>, options: &mut ExecOptions) -> RunInProgress {
     let run = shared.next_run.fetch_add(1, Ordering::SeqCst);
-    shared.current_run.store(run, Ordering::SeqCst);
+    *shared.current_run() = run;
     options
         .env
         .extend(environment(shared, run, |name| std::env::var_os(name)));
@@ -292,11 +304,11 @@ fn answer(mut stream: UnixStream, prompter: &Prompter, shared: &Shared) -> io::R
     let Some((run, prompt)) = split_run(&message) else {
         return stream.write_all(REPLY_CANCEL);
     };
-    if run == 0 || run != shared.current_run.load(Ordering::SeqCst) {
+    if run == 0 || run != *shared.current_run() {
         return stream.write_all(REPLY_CANCEL);
     }
     let prompt = String::from_utf8_lossy(prompt);
-    let current = || shared.current_run.load(Ordering::SeqCst) == run;
+    let current = || *shared.current_run() == run;
     // A prompt is given up once its run has ended as well as once its helper has
     // gone: the check above cannot rule out a run that ends right after it, and a
     // question left up from the previous cell would be read as the next one's.
@@ -307,14 +319,20 @@ fn answer(mut stream: UnixStream, prompter: &Prompter, shared: &Shared) -> io::R
     // macOS lets it succeed while there is buffer space, which it always is.
     let gone = || shared.closing.load(Ordering::SeqCst) || !current() || peer_has_gone(&stream);
     match prompter(prompt.trim_end(), &gone) {
-        // Looked at once more: the run may have ended between the user answering
-        // and the answer getting here, and then the helper is not the one they
-        // answered.
-        Some(secret) if current() => {
+        Some(secret) => {
+            // Looked at once more, and held: the run may have ended between the
+            // user answering and the answer getting here, and it must not end
+            // between here and the write either. The write times out, so the
+            // hold is short even for a helper that has stopped reading.
+            let current = shared.current_run();
+            if *current != run {
+                drop(current);
+                return stream.write_all(REPLY_CANCEL);
+            }
             stream.write_all(REPLY_OK)?;
             stream.write_all(secret.as_bytes())
         }
-        _ => stream.write_all(REPLY_CANCEL),
+        None => stream.write_all(REPLY_CANCEL),
     }
 }
 
@@ -703,7 +721,7 @@ mod tests {
     #[test]
     fn the_hook_starts_a_run_like_apply_does() {
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
-        let current = || askpass.shared.current_run.load(Ordering::SeqCst);
+        let current = || *askpass.shared.current_run();
         let hook = askpass.hook();
         let mut options = ExecOptions::new(std::env::temp_dir());
         let first = hook(&mut options);
