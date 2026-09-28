@@ -282,3 +282,45 @@ pre {
 .status[data-kind='error'] {
   color: var(--error);
 }
+
+/* The prompt a command raises when it asks for a password (sudo -A and the like). */
+.password {
+  width: min(420px, calc(100vw - 32px));
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--fg);
+}
+
+.password::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.password form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.password label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  /* The prompt is the command's own text, which can be long. */
+  overflow-wrap: anywhere;
+}
+
+.password input {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+}
+
+.password-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

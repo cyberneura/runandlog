@@ -50,7 +50,7 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 
 ## 実装上の注意
 
-- `exec::run` はコマンドを専用のプロセスグループで起動し、タイムアウト時はグループごと kill する。
+- `exec::run` はコマンドを専用のセッション (= 専用のプロセスグループ) で起動し、タイムアウト時はグループごと kill する。
   シェルだけを kill すると、シェルが起動したコマンドが走り続けたうえパイプも開いたままになり、
   出力の読み取りが終わらない。タイムアウト無しの場合はこの保護が効かないので、読み取りは
   `DRAIN_GRACE` で打ち切って読めた分を結果とする。
@@ -105,6 +105,60 @@ public リポジトリなので、**README・コードコメント・UI 文字�
     「グループが消えて番号が再利用された」のか「元の子孫がまだ属している」のかを区別できない。
     パイプを掴んだ子孫は生き残る。
   - **キャンセルされた実行も結果を書き戻す。** 途中まで出た出力を残すのがキャンセルの目的。
+
+## パスワードを求めるコマンド (askpass、CYBERNEURA-DEV-879)
+
+- **コマンドは `setsid` で新しいセッションに入れて起動する** (`exec::detach_from_terminal`)。
+  以前の `process_group(0)` だけだと、制御端末は runandlog と同じ端末のまま「前面でない
+  プロセスグループ」になるだけで、**`/dev/tty` を直接読むプログラム (sudo は stdin に関係なく
+  そうする) は SIGTTIN で停止し、キャンセルされるまで永久に待つ**。セッションを分ければ
+  制御端末が無くなり、open が ENXIO で即座に失敗する。回帰テストは
+  `exec::tests::the_command_has_no_terminal_to_wait_on` (端末付きで回さないと差が出ない。
+  `script -qec 'cargo test ...' /dev/null` で確認した)。
+  セッションリーダーはプロセスグループリーダーでもあるので、グループ kill はそのまま効く。
+- **その代わりに askpass ヘルパーを提供する** (`crates/runandlog-cli/src/askpass.rs`)。
+  ヘルパーの実体は runandlog 自身で、一時ディレクトリ (0700) に置いた
+  `runandlog-askpass` という名前の symlink 経由で起動される。`main` は **clap より前に**
+  argv[0] のファイル名を見て振り分ける (ヘルパーに渡るのはプロンプトで Markdown ではない)。
+  ヘルパーは同じディレクトリの Unix ソケットへプロンプトを送り、起動元の runandlog が
+  フロント (非対話 = `/dev/tty` に echo off で、TUI = ステータス行、GUI = ダイアログ) で聞いて返す。
+  - 設定する変数は `SUDO_ASKPASS` / `SSH_ASKPASS` (+ `SSH_ASKPASS_REQUIRE=force`) /
+    `GIT_ASKPASS` と、ソケットの場所の `RUNANDLOG_ASKPASS_SOCKET`。**利用者が既に
+    設定している askpass は上書きしない。**
+    **ssh は `force` でなければならない** (Codex レビュー指摘、`readpass.c` で確認)。
+    `prefer` は「ディスプレイがあれば」の条件を残すので、macOS と SSH 越しでは効かない。
+  - **sudo は `DISPLAY` / `WAYLAND_DISPLAY` が無いと `-A` 無しではヘルパーを使わない**
+    (sudo の `tgetpass.c`)。macOS と SSH 越しでは `sudo -A` と書いてもらうしかない。
+    `DISPLAY` を偽装すると X に繋ぎに行くプログラムを壊すのでやらない。
+  - **端末の無い非対話実行 (cron / CI) ではヘルパーを出さない。** 出すと sudo のエラーが
+    「askpass が失敗した」になり、本当の原因 (端末も askpass も無い) が読めなくなる。
+  - **プロンプトは `gone` を `PROMPT_POLL` (100ms) ごとに見て、真になったら諦める**
+    (`Prompter` の第 2 引数)。`gone` は「ヘルパーが消えた (コマンドの終了・タイムアウト・
+    Stop)」か「`Askpass` の drop 中」。ヘルパーの生死はソケットへ心拍 (NUL 1 バイト) を
+    書いて EPIPE で知る (ヘルパーは応答の先頭の NUL を読み飛ばす)。非対話実行はこれに
+    `interrupt_requested` (Ctrl-C) を足す。
+  - **`Askpass` の drop はプロンプトの終了を待つ** (Codex レビュー指摘)。端末プロンプトは
+    戻るまで echo を切っているので、待たずにプロセスが終わると利用者の端末が echo off の
+    まま残る。端末設定は `RestoreTerminal` の Drop で戻す。
+    既知の穴: プロンプト中に Ctrl-C を 100ms 以内に 2 回押すと、2 回目の `_exit` が
+    復元より先に走りうる (シグナルハンドラで termios を戻す仕組みは入れていない)。
+  - **プロンプトは 1 度に 1 つ** (ソケットの accept を直列に処理する)。フロントは 1 つしか出せない。
+  - **コマンドが終わったら出ているプロンプトは捨てる** (TUI は `password.take()`、GUI は
+    `abandon_passwords`)。sender を drop すると helper 側は「断られた」になる。GUI の
+    フロントは `finished` と `runCell` / `runAll` の finally でダイアログを閉じる。
+    GUI は要求に id を振り、終わった要求への遅れた答えが次の要求に当たらないようにしている。
+  - **実行中でない時に来た要求は即座に断る** (コマンドが背景に残した子プロセス等)。
+    どのセルの質問か示せないため。GUI は受付可否 (`Passwords::accepting`) を要求の
+    登録と**同じロック**で持つ (Codex レビュー指摘。`busy` を見てから登録すると、その間に
+    `abandon_passwords` が走って終わった実行の要求が残る。`busy` は書き戻し中やセル間も
+    真なので「実行中」の判定にもならない)。
+  - **GUI はフロントの購読が成功してから受け付ける** (`listen_for_passwords`、Codex レビュー
+    指摘)。購読に失敗した縮退モードでは要求を出しても誰も見ないので、即座に断る。
+  - 答えは出力にも Markdown にも入らない。コマンドの stdout に出るのはヘルパーの
+    stdout で、それは sudo 等が読むパイプであって runandlog が取り込むパイプではない。
+- `y/N` の確認や全画面エディタのような「パスワード以外の端末入力」は対象外。pty で走らせて
+  入力を中継する案もあったが、「stdout と stderr を 1 本のパイプで受ける」設計と、
+  出力に制御シーケンスや `\r\n` が混ざることの影響が大きいので採っていない。
 
 ## 既知の制約: unix 以外は未対応
 
@@ -387,7 +441,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 131 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 146 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check

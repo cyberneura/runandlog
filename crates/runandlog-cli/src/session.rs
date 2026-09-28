@@ -72,6 +72,12 @@ impl Session {
         self.exec.clone()
     }
 
+    /// The execution settings, for a front end that has more to add to them once
+    /// it is up -- the askpass helper, which needs a front end to answer it.
+    pub fn exec_options_mut(&mut self) -> &mut ExecOptions {
+        &mut self.exec
+    }
+
     /// Runs a cell and writes the result back to the Markdown (and to a separate
     /// file when needed).
     ///

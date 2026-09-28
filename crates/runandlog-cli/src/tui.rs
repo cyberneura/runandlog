@@ -38,11 +38,93 @@ const LIVE_TAIL_LINES: usize = 3;
 const LIVE_LIMIT: usize = 16 * 1024;
 
 /// Opens the TUI.
-pub fn run(session: Session) -> io::Result<()> {
+pub fn run(mut session: Session) -> io::Result<()> {
+    let (password_tx, password_rx) = mpsc::channel();
+    // Kept alive until the TUI closes: dropping it takes the socket away. A failure
+    // to start leaves commands where they were before there was a helper -- asking
+    // for a password fails at once -- which is no reason to refuse to open.
+    #[cfg(unix)]
+    let _askpass = start_askpass(&mut session, password_tx);
+    #[cfg(not(unix))]
+    drop(password_tx);
     let terminal = ratatui::init();
-    let result = App::new(session).run(terminal);
+    let result = App::new(session, password_rx).run(terminal);
     ratatui::restore();
     result
+}
+
+/// A command asking the user for a password, waiting for the answer on `reply`.
+struct PasswordRequest {
+    prompt: String,
+    reply: mpsc::Sender<Option<String>>,
+}
+
+/// The password prompt on screen, and what has been typed into it so far.
+struct PasswordPrompt {
+    request: PasswordRequest,
+    typed: String,
+}
+
+impl PasswordPrompt {
+    /// Sends the answer, or `None` for "declined".
+    fn answer(self, answer: Option<String>) {
+        // The helper may be gone already -- its command was cancelled, say -- and
+        // then there is nobody left to tell.
+        let _ = self.request.reply.send(answer);
+    }
+}
+
+/// Starts the askpass helper, forwarding its prompts to the TUI over `requests`.
+#[cfg(unix)]
+fn start_askpass(
+    session: &mut Session,
+    requests: mpsc::Sender<PasswordRequest>,
+) -> Option<crate::askpass::Askpass> {
+    let askpass = crate::askpass::Askpass::start(Box::new(move |prompt, gone| {
+        let (reply, answer) = mpsc::channel();
+        requests
+            .send(PasswordRequest {
+                prompt: prompt.to_string(),
+                reply,
+            })
+            .ok()?;
+        // A dropped sender -- the TUI closed, or the run ended with the prompt up --
+        // is a decline.
+        crate::askpass::wait_for_answer(&answer, gone)
+    }))
+    .ok()?;
+    askpass.apply(session.exec_options_mut());
+    Some(askpass)
+}
+
+/// What a key does to the password prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptKey {
+    Type(char),
+    Erase,
+    Send,
+    Decline,
+    Ignore,
+}
+
+/// Reads a key as input to the password prompt.
+///
+/// Ctrl-C is not handled here: it keeps meaning "stop the command", which declines
+/// the prompt along the way.
+fn prompt_key(key: KeyEvent) -> PromptKey {
+    match key.code {
+        KeyCode::Enter => PromptKey::Send,
+        KeyCode::Esc => PromptKey::Decline,
+        KeyCode::Backspace => PromptKey::Erase,
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            PromptKey::Type(c)
+        }
+        _ => PromptKey::Ignore,
+    }
 }
 
 /// Whether a "run all" batch may go on to the next cell.
@@ -151,6 +233,10 @@ struct App {
     running: Option<(usize, usize)>,
     /// What the command being run has printed so far.
     live: LiveOutput,
+    /// Prompts for a password from the askpass helper.
+    password_requests: mpsc::Receiver<PasswordRequest>,
+    /// The password prompt on screen, if a command is asking for one.
+    password: Option<PasswordPrompt>,
     /// Cells run since the file was opened, and whether each one succeeded.
     ///
     /// Keyed by index, and dropped whenever the file is re-read: after a reload the
@@ -160,7 +246,7 @@ struct App {
 }
 
 impl App {
-    fn new(session: Session) -> App {
+    fn new(session: Session, password_requests: mpsc::Receiver<PasswordRequest>) -> App {
         let status = if session.is_empty() {
             "No runnable cells. Press q to quit.".to_string()
         } else {
@@ -174,6 +260,8 @@ impl App {
             status,
             running: None,
             live: LiveOutput::new(LIVE_LIMIT),
+            password_requests,
+            password: None,
             finished: HashMap::new(),
             quit: false,
         }
@@ -215,21 +303,36 @@ impl App {
                 .scroll((self.scroll as u16, 0));
             frame.render_widget(body, areas[1]);
 
-            let status = match self.running {
-                Some((index, phase)) => format!(
-                    "{} running cell {}",
-                    SPINNER[phase % SPINNER.len()],
-                    index + 1
-                ),
-                None => self.status.clone(),
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    status,
+            let status = match (&self.password, self.running) {
+                (Some(prompt), _) => Line::from(vec![
+                    Span::styled(
+                        format!("{} ", prompt.request.prompt),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    // One mark per character, so the typing can be seen to land
+                    // without showing what was typed.
+                    Span::raw("*".repeat(prompt.typed.chars().count())),
+                    Span::styled(
+                        "  (Enter: send  Esc: decline  Ctrl-C: stop)",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                (None, Some((index, phase))) => Line::from(Span::styled(
+                    format!(
+                        "{} running cell {}",
+                        SPINNER[phase % SPINNER.len()],
+                        index + 1
+                    ),
                     Style::default().fg(Color::DarkGray),
-                ))),
-                areas[2],
-            );
+                )),
+                (None, None) => Line::from(Span::styled(
+                    self.status.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            };
+            frame.render_widget(Paragraph::new(status), areas[2]);
         })?;
         Ok(())
     }
@@ -340,6 +443,12 @@ impl App {
     }
 
     fn handle_events(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        // Nothing is running, so whatever asks now is a leftover from a command that
+        // has already been written back -- a background process it started, say.
+        // There is no cell to show the prompt against, so it is declined.
+        while let Ok(request) = self.password_requests.try_recv() {
+            let _ = request.reply.send(None);
+        }
         if !event::poll(TICK)? {
             return Ok(());
         }
@@ -445,6 +554,11 @@ impl App {
         // one being run rather than looking untouched until the first tick.
         self.running = Some((index, 0));
         let outcome = self.wait_for(index, rx, output_rx, terminal, &canceller);
+        // A prompt still up belongs to a command that has ended: its helper is gone
+        // with it.
+        if let Some(prompt) = self.password.take() {
+            prompt.answer(None);
+        }
         self.running = None;
         self.live.clear();
         match outcome {
@@ -503,6 +617,10 @@ impl App {
                 if is_cancel_key(key) {
                     canceller.cancel();
                     self.quit = true;
+                } else if self.password.is_some() {
+                    // While a prompt is up, keys are what is being typed into it --
+                    // `q` included, which is a letter of the password here.
+                    self.type_into_prompt(key);
                 } else if is_quit_key(key) {
                     // Quit after the command finishes; its result still gets written back.
                     self.quit = true;
@@ -510,6 +628,43 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Puts up the next password prompt, if a command is asking and none is up.
+    fn take_password_request(&mut self) {
+        if self.password.is_none()
+            && let Ok(request) = self.password_requests.try_recv()
+        {
+            self.password = Some(PasswordPrompt {
+                request,
+                typed: String::new(),
+            });
+        }
+    }
+
+    /// Applies a key to the password prompt on screen.
+    fn type_into_prompt(&mut self, key: KeyEvent) {
+        let Some(prompt) = self.password.as_mut() else {
+            return;
+        };
+        match prompt_key(key) {
+            PromptKey::Type(c) => prompt.typed.push(c),
+            PromptKey::Erase => {
+                prompt.typed.pop();
+            }
+            PromptKey::Send => {
+                if let Some(prompt) = self.password.take() {
+                    let typed = prompt.typed.clone();
+                    prompt.answer(Some(typed));
+                }
+            }
+            PromptKey::Decline => {
+                if let Some(prompt) = self.password.take() {
+                    prompt.answer(None);
+                }
+            }
+            PromptKey::Ignore => {}
+        }
     }
 
     /// Takes whatever the running command has printed since the last look.
@@ -544,6 +699,7 @@ impl App {
                     phase += 1;
                     self.running = Some((index, phase));
                     self.collect_output(&output_rx);
+                    self.take_password_request();
                     self.redraw(terminal)?;
                     self.drain_events_while_running(canceller)?;
                 }
@@ -617,6 +773,35 @@ mod tests {
         assert_eq!(command_style(CellState::Running), Style::default());
         assert_ne!(command_style(CellState::Done), Style::default());
         assert_ne!(command_style(CellState::Failed), Style::default());
+    }
+
+    #[test]
+    fn keys_go_into_the_password_prompt() {
+        assert_eq!(
+            prompt_key(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            PromptKey::Type('q')
+        );
+        assert_eq!(
+            prompt_key(key(KeyCode::Char('Q'), KeyModifiers::SHIFT)),
+            PromptKey::Type('Q')
+        );
+        assert_eq!(
+            prompt_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            PromptKey::Send
+        );
+        assert_eq!(
+            prompt_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            PromptKey::Decline
+        );
+        assert_eq!(
+            prompt_key(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            PromptKey::Erase
+        );
+        // A control chord is not a character of the password.
+        assert_eq!(
+            prompt_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            PromptKey::Ignore
+        );
     }
 
     #[test]

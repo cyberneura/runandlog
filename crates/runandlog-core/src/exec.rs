@@ -4,6 +4,7 @@
 //! them back to Markdown as one log with the original interleaving preserved,
 //! so reading the two streams separately and concatenating them is not an option.
 
+use std::ffi::OsString;
 use std::io::{Read, pipe};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -41,6 +42,12 @@ pub struct ExecOptions {
     /// Cap on captured output in bytes. Anything beyond it is discarded and
     /// `truncated` is set.
     pub max_output_bytes: usize,
+    /// Environment variables set for the command on top of the inherited ones.
+    ///
+    /// This is how a front end hands a command the means to ask the user for a
+    /// password: the command has no terminal (see [`run_streaming`]), so programs
+    /// such as sudo can only ask through an askpass helper named here.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl ExecOptions {
@@ -55,6 +62,7 @@ impl ExecOptions {
             cwd: cwd.into(),
             timeout: None,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            env: Vec::new(),
         }
     }
 }
@@ -191,6 +199,12 @@ impl ExecOutcome {
 
 /// Runs `command` through a shell.
 ///
+/// The command runs without a terminal: stdin is empty and it is started in a
+/// session of its own, so it has no controlling terminal either. A program that
+/// insists on reading one -- sudo asking for a password, ssh asking about a host
+/// key -- fails at once instead of waiting forever for input nobody can give it.
+/// See [`ExecOptions::env`] for how such a program can still ask the user.
+///
 /// `Err` is returned only when the shell itself fails to start. A command that
 /// merely fails comes back as an `ExecOutcome` carrying its exit code.
 ///
@@ -270,11 +284,9 @@ pub fn run_streaming(
         .current_dir(&options.cwd)
         .stdin(Stdio::null())
         .stdout(writer)
-        .stderr(writer_for_stderr);
-    // Put the shell in its own process group so a timeout can take down its
-    // descendants along with it.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut builder, 0);
+        .stderr(writer_for_stderr)
+        .envs(options.env.iter().map(|(key, value)| (key, value)));
+    detach_from_terminal(&mut builder);
     let child = builder.spawn()?;
     // Registered before the cancel flag is read below, so a cancel that lands
     // during the spawn is picked up by one side or the other.
@@ -522,6 +534,38 @@ fn decode_ready(pending: &[u8]) -> (String, usize) {
     }
 }
 
+/// Starts the shell in a session of its own, which also makes it the leader of a
+/// process group of its own.
+///
+/// The process group is what lets a timeout or a cancel take down the shell's
+/// descendants along with it: they are killed as a group.
+///
+/// The session is what keeps the command away from the user's terminal. A process
+/// group alone still has the terminal as its controlling terminal, just not as the
+/// foreground group -- so a program that opens `/dev/tty` to ask for a password
+/// (sudo does exactly this, whatever stdin is) gets stopped by SIGTTIN on its first
+/// read and stays stopped. Nothing ever resumes it, and the run waits until it is
+/// cancelled. In a session of its own there is no controlling terminal to open, and
+/// the program reports that it needs one instead of hanging.
+#[cfg(unix)]
+fn detach_from_terminal(builder: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: setsid is async-signal-safe, and nothing else runs between fork and exec.
+    unsafe {
+        builder.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Off unix there are no sessions; the command keeps whatever console it inherits.
+#[cfg(not(unix))]
+fn detach_from_terminal(_builder: &mut Command) {}
+
 /// Puts the pipe in non-blocking mode so a read can never park indefinitely.
 ///
 /// Paired with [`wait_readable`]: the wait is what avoids a busy loop, and
@@ -590,7 +634,7 @@ fn is_retryable(error: &std::io::Error) -> bool {
 /// still open.
 #[cfg(unix)]
 fn kill_process_group(child: &mut Child) {
-    // Spawned with process_group(0), so the process group id equals the child's pid.
+    // Spawned as a session leader, so the process group id equals the child's pid.
     kill_group(child.id() as i32);
 }
 
@@ -641,7 +685,31 @@ mod tests {
             cwd: std::env::temp_dir(),
             timeout: Some(Duration::from_secs(10)),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_command_has_no_terminal_to_wait_on() {
+        // A command that reads the terminal directly -- sudo asking for a password --
+        // used to be stopped by SIGTTIN on its first read and wait there forever. With
+        // no controlling terminal the open fails at once, whatever terminal the tests
+        // themselves are run from.
+        let started = Instant::now();
+        let outcome = run("read line </dev/tty && echo read", &options()).unwrap();
+        assert!(!outcome.timed_out);
+        assert_ne!(outcome.exit_code, Some(0));
+        assert!(!outcome.output.contains("read\n"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn passes_the_extra_environment_to_the_command() {
+        let mut opts = options();
+        opts.env
+            .push(("RUNANDLOG_TEST_VALUE".into(), "from the front end".into()));
+        let outcome = run("echo \"$RUNANDLOG_TEST_VALUE\"", &opts).unwrap();
+        assert_eq!(outcome.output, "from the front end\n");
     }
 
     #[test]

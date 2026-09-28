@@ -66,6 +66,21 @@ struct Args {
 }
 
 fn main() -> ExitCode {
+    // Checked before the arguments are parsed: started as the askpass helper,
+    // runandlog is given a prompt, not a Markdown file.
+    #[cfg(unix)]
+    {
+        let mut argv = std::env::args_os();
+        if argv
+            .next()
+            .is_some_and(|argv0| runandlog::askpass::started_as_helper(&argv0))
+        {
+            let prompt = argv
+                .next()
+                .map(|prompt| prompt.to_string_lossy().into_owned());
+            return runandlog::askpass::helper_main(prompt);
+        }
+    }
     let args = Args::parse();
     match dispatch(args) {
         Ok(code) => code,
@@ -111,6 +126,8 @@ fn dispatch(args: Args) -> std::io::Result<ExitCode> {
 
     let canceller = Canceller::new();
     catch_interrupts(&canceller);
+    // Kept alive for the whole run: dropping it takes the socket away.
+    let _askpass = ask_on_the_terminal(&mut session);
 
     let mut failed = false;
     for index in targets {
@@ -272,6 +289,26 @@ fn interrupt_exit_code() -> u8 {
 /// process group there either. Ctrl-C keeps its default meaning.
 #[cfg(not(unix))]
 fn catch_interrupts(_canceller: &Canceller) {}
+
+/// Lets the commands of a non-interactive run ask for a password on the terminal
+/// runandlog was started from.
+///
+/// Only when there is one. A run from cron or CI has nobody to ask, and there the
+/// helper is better not offered at all: sudo then says plainly that it needs a
+/// terminal or an askpass, instead of reporting that the askpass failed.
+#[cfg(unix)]
+fn ask_on_the_terminal(session: &mut Session) -> Option<runandlog::askpass::Askpass> {
+    use runandlog::askpass::{Askpass, terminal_prompter};
+
+    let askpass = Askpass::start(terminal_prompter(interrupt_requested)?).ok()?;
+    askpass.apply(session.exec_options_mut());
+    Some(askpass)
+}
+
+#[cfg(not(unix))]
+fn ask_on_the_terminal(_session: &mut Session) -> Option<()> {
+    None
+}
 
 /// Opens the desktop app.
 ///
