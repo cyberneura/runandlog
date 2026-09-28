@@ -585,13 +585,11 @@ fn start_askpass(app: &AppHandle) {
         return;
     };
     let state = app.state::<GuiState>();
-    askpass.apply(
-        state
-            .session
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .exec_options_mut(),
-    );
+    state
+        .session
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_run_hook(askpass.hook());
     *app.state::<AskpassSlot>()
         .0
         .lock()

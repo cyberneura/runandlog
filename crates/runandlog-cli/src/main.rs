@@ -301,7 +301,7 @@ fn ask_on_the_terminal(session: &mut Session) -> Option<runandlog::askpass::Askp
     use runandlog::askpass::{Askpass, terminal_prompter};
 
     let askpass = Askpass::start(terminal_prompter(interrupt_requested)?).ok()?;
-    askpass.apply(session.exec_options_mut());
+    session.set_run_hook(askpass.hook());
     Some(askpass)
 }
 

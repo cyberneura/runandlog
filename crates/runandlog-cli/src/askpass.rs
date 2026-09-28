@@ -14,6 +14,13 @@
 //! The socket and the symlink live in a directory only the user can enter (0700),
 //! created for this process and removed when the [`Askpass`] is dropped. The answer
 //! is never written anywhere else: not to the captured output, not to the Markdown.
+//!
+//! Each run of a command is numbered, and its helper sends the number with the
+//! prompt ([`RUN_VAR`]). Only the current run's helpers are answered: a process a
+//! previous cell left behind in the background, still holding that cell's
+//! environment, cannot put a question up while the next cell is running and have
+//! it taken for the next cell's. What the user types goes to the command they were
+//! shown.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -22,7 +29,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +41,10 @@ use runandlog_core::ExecOptions;
 pub const HELPER_NAME: &str = "runandlog-askpass";
 /// Variable through which the helper finds the socket.
 const SOCKET_VAR: &str = "RUNANDLOG_ASKPASS_SOCKET";
+/// Variable naming the run the command belongs to. Set afresh for every run; the
+/// helper sends it ahead of the prompt and the listener answers only the current
+/// run's helpers.
+const RUN_VAR: &str = "RUNANDLOG_ASKPASS_RUN";
 /// The variables the helper is offered under.
 ///
 /// One the user has already set is left alone: an askpass they chose -- a graphical
@@ -71,11 +82,23 @@ pub type Prompter = Box<dyn Fn(&str, &dyn Fn() -> bool) -> Option<String> + Send
 /// adds to their options.
 pub struct Askpass {
     dir: PathBuf,
-    socket: PathBuf,
-    helper: PathBuf,
-    closing: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     listener: Option<thread::JoinHandle<()>>,
 }
+
+/// What the listener thread and the run-time side both look at.
+struct Shared {
+    socket: PathBuf,
+    helper: PathBuf,
+    closing: AtomicBool,
+    /// The run whose helpers are answered. Zero until the first run starts, so
+    /// that nothing is answered before then.
+    current_run: AtomicU64,
+}
+
+/// What a front end gives the [`crate::session::Session`] so that every run picks
+/// up the helper's variables -- with its own run number -- as it starts.
+pub type RunHook = Arc<dyn Fn(&mut ExecOptions) + Send + Sync>;
 
 impl Askpass {
     /// Creates the socket and starts answering on it with `prompter`.
@@ -101,55 +124,82 @@ impl Askpass {
                 return Err(error);
             }
         };
-        let closing = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared {
+            socket,
+            helper,
+            closing: AtomicBool::new(false),
+            current_run: AtomicU64::new(0),
+        });
         let listener = {
-            let closing = Arc::clone(&closing);
-            thread::spawn(move || serve(listener, &closing, prompter))
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || serve(listener, &shared, prompter))
         };
         Ok(Askpass {
             dir,
-            socket,
-            helper,
-            closing,
+            shared,
             listener: Some(listener),
         })
     }
 
-    /// Adds the variables that point commands at the helper.
+    /// Adds the variables that point commands at the helper, for one run.
+    ///
+    /// **Once per run, as it starts.** Each call begins a new run: helpers started
+    /// with the variables of an earlier call are no longer answered. Front ends
+    /// hand this to the session as a [`RunHook`] (see [`Askpass::hook`]) rather
+    /// than calling it themselves.
     pub fn apply(&self, options: &mut ExecOptions) {
-        options
-            .env
-            .extend(self.environment(|name| std::env::var_os(name)));
+        apply(&self.shared, options);
     }
 
-    /// The variables to add, given what the environment already has.
-    fn environment(&self, current: impl Fn(&str) -> Option<OsString>) -> Vec<(OsString, OsString)> {
-        let mut env = vec![(SOCKET_VAR.into(), self.socket.clone().into_os_string())];
-        for name in HELPER_VARS {
-            if current(name).is_some_and(|value| !value.is_empty()) {
-                continue;
-            }
-            env.push((name.into(), self.helper.clone().into_os_string()));
-        }
-        // Whichever askpass ssh ends up with -- ours or the user's -- it is only
-        // ever going to be used if ssh is told to. Left to itself, or with `prefer`,
-        // ssh turns to the askpass only when it also sees a display (readpass.c),
-        // which macOS and an SSH session do not have; `never` rules it out. The
-        // command has no terminal for ssh to fall back on, so with anything but
-        // `force` nobody gets asked at all. Set regardless of what was inherited:
-        // a value set for interactive shells, where a terminal exists, does not
-        // carry the same meaning here.
-        env.push(("SSH_ASKPASS_REQUIRE".into(), "force".into()));
-        env
+    /// [`Askpass::apply`] as something a session can call for every run.
+    pub fn hook(&self) -> RunHook {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move |options| apply(&shared, options))
     }
+}
+
+/// Starts a new run and adds its variables to `options`.
+fn apply(shared: &Shared, options: &mut ExecOptions) {
+    let run = shared.current_run.fetch_add(1, Ordering::SeqCst) + 1;
+    options
+        .env
+        .extend(environment(shared, run, |name| std::env::var_os(name)));
+}
+
+/// The variables to add, given what the environment already has.
+fn environment(
+    shared: &Shared,
+    run: u64,
+    current: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(OsString, OsString)> {
+    let mut env = vec![
+        (SOCKET_VAR.into(), shared.socket.clone().into_os_string()),
+        (RUN_VAR.into(), run.to_string().into()),
+    ];
+    for name in HELPER_VARS {
+        if current(name).is_some_and(|value| !value.is_empty()) {
+            continue;
+        }
+        env.push((name.into(), shared.helper.clone().into_os_string()));
+    }
+    // Whichever askpass ssh ends up with -- ours or the user's -- it is only
+    // ever going to be used if ssh is told to. Left to itself, or with `prefer`,
+    // ssh turns to the askpass only when it also sees a display (readpass.c),
+    // which macOS and an SSH session do not have; `never` rules it out. The
+    // command has no terminal for ssh to fall back on, so with anything but
+    // `force` nobody gets asked at all. Set regardless of what was inherited:
+    // a value set for interactive shells, where a terminal exists, does not
+    // carry the same meaning here.
+    env.push(("SSH_ASKPASS_REQUIRE".into(), "force".into()));
+    env
 }
 
 impl Drop for Askpass {
     fn drop(&mut self) {
-        self.closing.store(true, Ordering::SeqCst);
+        self.shared.closing.store(true, Ordering::SeqCst);
         // The listener is parked in `accept`, or in a prompt; a connection is what
         // wakes it from the first, and the flag is what the prompt gives up on.
-        let _ = UnixStream::connect(&self.socket);
+        let _ = UnixStream::connect(&self.shared.socket);
         // Waited for, because the terminal prompt has the terminal's echo turned off
         // until it returns. Leaving without it would hand the user back a shell that
         // does not show what they type.
@@ -178,40 +228,66 @@ fn private_dir() -> io::Result<PathBuf> {
 ///
 /// One at a time on purpose: a front end shows one prompt, and a second command
 /// asking meanwhile is better kept waiting than shown over the first.
-fn serve(listener: UnixListener, closing: &AtomicBool, prompter: Prompter) {
+fn serve(listener: UnixListener, shared: &Shared, prompter: Prompter) {
     for stream in listener.incoming() {
-        if closing.load(Ordering::SeqCst) {
+        if shared.closing.load(Ordering::SeqCst) {
             return;
         }
         // A connection that fails or sends garbage is the helper's problem, not the
         // listener's; the next one is served as usual.
         if let Ok(stream) = stream {
-            let _ = answer(stream, &prompter, closing);
+            let _ = answer(stream, &prompter, shared);
         }
     }
 }
 
 /// Reads one prompt and writes back the user's answer.
-fn answer(mut stream: UnixStream, prompter: &Prompter, closing: &AtomicBool) -> io::Result<()> {
+fn answer(mut stream: UnixStream, prompter: &Prompter, shared: &Shared) -> io::Result<()> {
     stream.set_read_timeout(Some(PROMPT_READ_TIMEOUT))?;
     // A helper that stopped reading must not be able to hold the reply up.
     stream.set_write_timeout(Some(PROMPT_POLL))?;
-    let Some(prompt) = read_prompt(&mut stream)? else {
+    let Some(message) = read_prompt(&mut stream)? else {
         return stream.write_all(REPLY_CANCEL);
     };
-    let prompt = String::from_utf8_lossy(&prompt);
+    // A helper of another run -- one a finished cell left running in the
+    // background -- is refused without a word to the user. Answering it would put
+    // the question up under the cell that is running now, and send what the user
+    // types to a process they were not shown.
+    let Some((run, prompt)) = split_run(&message) else {
+        return stream.write_all(REPLY_CANCEL);
+    };
+    if run == 0 || run != shared.current_run.load(Ordering::SeqCst) {
+        return stream.write_all(REPLY_CANCEL);
+    }
+    let prompt = String::from_utf8_lossy(prompt);
+    let current = || shared.current_run.load(Ordering::SeqCst) == run;
+    // A prompt is given up once its run has ended as well as once its helper has
+    // gone: the check above cannot rule out a run that ends right after it, and a
+    // question left up from the previous cell would be read as the next one's.
+    //
     // The helper sends nothing after the prompt and keeps the connection open, so
     // end-of-file on it means the helper has gone. Reading is the check that works
     // the same everywhere: a write to a dead peer fails with EPIPE on Linux, but
     // macOS lets it succeed while there is buffer space, which it always is.
-    let gone = || closing.load(Ordering::SeqCst) || peer_has_gone(&stream);
+    let gone = || shared.closing.load(Ordering::SeqCst) || !current() || peer_has_gone(&stream);
     match prompter(prompt.trim_end(), &gone) {
-        Some(secret) => {
+        // Looked at once more: the run may have ended between the user answering
+        // and the answer getting here, and then the helper is not the one they
+        // answered.
+        Some(secret) if current() => {
             stream.write_all(REPLY_OK)?;
             stream.write_all(secret.as_bytes())
         }
-        None => stream.write_all(REPLY_CANCEL),
+        _ => stream.write_all(REPLY_CANCEL),
     }
+}
+
+/// Takes the run number off the front of the helper's message: a line of digits,
+/// then the prompt. `None` when it is not there.
+fn split_run(message: &[u8]) -> Option<(u64, &[u8])> {
+    let end = message.iter().position(|&byte| byte == b'\n')?;
+    let run = std::str::from_utf8(&message[..end]).ok()?.parse().ok()?;
+    Some((run, &message[end + 1..]))
 }
 
 /// Reads up to the [`PROMPT_END`]. `None` when the helper went away first, or sent
@@ -414,7 +490,13 @@ pub fn helper_main(prompt: Option<String>) -> ExitCode {
 fn ask(prompt: &str) -> io::Result<Option<String>> {
     let socket = std::env::var_os(SOCKET_VAR)
         .ok_or_else(|| io::Error::other(format!("{SOCKET_VAR} is not set")))?;
+    // Not defaulted: a helper that cannot say which run it belongs to is not
+    // answered, and that is the right outcome for one started outside a run.
+    let run =
+        std::env::var(RUN_VAR).map_err(|_| io::Error::other(format!("{RUN_VAR} is not set")))?;
     let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(run.as_bytes())?;
+    stream.write_all(b"\n")?;
     stream.write_all(prompt.as_bytes())?;
     stream.write_all(&[PROMPT_END])?;
     // The write side stays open on purpose: the listener reads end-of-file on it
@@ -434,6 +516,35 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc;
 
+    /// Starts a run, as a front end's session does before each command, and
+    /// returns its number.
+    fn start_run(askpass: &Askpass) -> u64 {
+        let mut options = ExecOptions::new(std::env::temp_dir());
+        askpass.apply(&mut options);
+        askpass.shared.current_run.load(Ordering::SeqCst)
+    }
+
+    /// What the helper sends: the run, a newline, the prompt, the terminator.
+    fn message(run: u64, prompt: &str) -> Vec<u8> {
+        let mut message = format!("{run}\n{prompt}").into_bytes();
+        message.push(PROMPT_END);
+        message
+    }
+
+    /// Connects as a helper of `run` would and sends `prompt`. The connection is
+    /// left open, as the helper leaves it.
+    fn helper(askpass: &Askpass, run: u64, prompt: &str) -> UnixStream {
+        let mut stream = UnixStream::connect(&askpass.shared.socket).unwrap();
+        stream.write_all(&message(run, prompt)).unwrap();
+        stream
+    }
+
+    fn reply_of(mut stream: UnixStream) -> Vec<u8> {
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).unwrap();
+        reply
+    }
+
     #[test]
     fn a_prompt_goes_to_the_front_end_and_the_answer_comes_back() {
         let (asked_tx, asked_rx) = mpsc::channel();
@@ -444,8 +555,8 @@ mod tests {
         }))
         .unwrap();
 
-        let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"[sudo] password for me: \0").unwrap();
+        let run = start_run(&askpass);
+        let mut stream = helper(&askpass, run, "[sudo] password for me: ");
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).unwrap();
 
@@ -456,11 +567,112 @@ mod tests {
     #[test]
     fn a_declined_prompt_is_told_apart_from_an_empty_password() {
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
-        let mut stream = UnixStream::connect(&askpass.socket).unwrap();
+        let run = start_run(&askpass);
+        assert_eq!(reply_of(helper(&askpass, run, "Password:")), REPLY_CANCEL);
+    }
+
+    #[test]
+    fn only_the_current_run_is_answered() {
+        let asked = Arc::new(AtomicBool::new(false));
+        let askpass = Askpass::start({
+            let asked = Arc::clone(&asked);
+            Box::new(move |_, _| {
+                asked.store(true, Ordering::SeqCst);
+                Some("s3cret".to_string())
+            })
+        })
+        .unwrap();
+
+        // Before any run: nothing to attribute a question to.
+        assert_eq!(reply_of(helper(&askpass, 0, "Password:")), REPLY_CANCEL);
+        assert_eq!(reply_of(helper(&askpass, 1, "Password:")), REPLY_CANCEL);
+        // A message with no run at all.
+        let mut stream = UnixStream::connect(&askpass.shared.socket).unwrap();
         stream.write_all(b"Password:\0").unwrap();
-        let mut reply = Vec::new();
-        stream.read_to_end(&mut reply).unwrap();
-        assert_eq!(reply, REPLY_CANCEL);
+        assert_eq!(reply_of(stream), REPLY_CANCEL);
+        assert!(!asked.load(Ordering::SeqCst));
+
+        let first = start_run(&askpass);
+        assert_eq!(
+            reply_of(helper(&askpass, first, "Password:")),
+            b"OK\ns3cret"
+        );
+        asked.store(false, Ordering::SeqCst);
+
+        // The next cell starts. A process the first one left behind still has the
+        // first run's number, and is not the one the user is looking at.
+        let second = start_run(&askpass);
+        assert_ne!(first, second);
+        assert_eq!(reply_of(helper(&askpass, first, "Password:")), REPLY_CANCEL);
+        assert!(!asked.load(Ordering::SeqCst));
+        assert_eq!(
+            reply_of(helper(&askpass, second, "Password:")),
+            b"OK\ns3cret"
+        );
+    }
+
+    #[test]
+    fn a_prompt_still_up_when_the_next_run_starts_is_given_up() {
+        // The run check on arrival cannot see a run that ends right after it. A
+        // question that is up when the next cell starts has to come down, or it
+        // is taken for the next cell's.
+        let (asked_tx, asked_rx) = mpsc::channel();
+        let asked_tx = Mutex::new(asked_tx);
+        let askpass = Askpass::start(Box::new(move |_, gone| {
+            asked_tx.lock().unwrap().send(()).unwrap();
+            let (_keep, answer) = mpsc::channel();
+            wait_for_answer(&answer, gone)
+        }))
+        .unwrap();
+
+        let run = start_run(&askpass);
+        let stream = helper(&askpass, run, "Password:");
+        asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        start_run(&askpass);
+        // The helper is still connected; only the run ending can have done this.
+        assert_eq!(reply_of(stream), REPLY_CANCEL);
+    }
+
+    #[test]
+    fn an_answer_arriving_after_the_run_ended_is_not_delivered() {
+        // The user answered the previous cell's question just as the next cell
+        // started. The answer is not the next cell's to receive, and the helper
+        // that asked belongs to a run that is over.
+        let (asked_tx, asked_rx) = mpsc::channel();
+        let asked_tx = Mutex::new(asked_tx);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let askpass = Askpass::start(Box::new(move |_, _| {
+            asked_tx.lock().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            Some("too late".to_string())
+        }))
+        .unwrap();
+
+        let run = start_run(&askpass);
+        let stream = helper(&askpass, run, "Password:");
+        asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        start_run(&askpass);
+        release_tx.send(()).unwrap();
+        assert_eq!(reply_of(stream), REPLY_CANCEL);
+    }
+
+    #[test]
+    fn the_hook_starts_a_run_like_apply_does() {
+        let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
+        let hook = askpass.hook();
+        let mut options = ExecOptions::new(std::env::temp_dir());
+        hook(&mut options);
+        let run = askpass.shared.current_run.load(Ordering::SeqCst);
+        assert_eq!(run, 1);
+        let value = options
+            .env
+            .iter()
+            .find(|(key, _)| key == RUN_VAR)
+            .map(|(_, value)| value.to_string_lossy().into_owned());
+        assert_eq!(value.as_deref(), Some("1"));
+        hook(&mut options);
+        assert_eq!(askpass.shared.current_run.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -474,15 +686,14 @@ mod tests {
             })
         })
         .unwrap();
+        let run = start_run(&askpass);
+        // The limit is on the whole message, run number included.
+        let head = format!("{run}\n");
         let exchange = |length: usize| {
-            let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-            stream.write_all(&vec![b'x'; length]).unwrap();
-            stream.write_all(&[PROMPT_END]).unwrap();
-            let mut reply = Vec::new();
-            stream.read_to_end(&mut reply).unwrap();
-            reply
+            let prompt = "x".repeat(length - head.len());
+            reply_of(helper(&askpass, run, &prompt))
         };
-        // The longest prompt allowed, and one byte more. The limit has to hold
+        // The longest message allowed, and one byte more. The limit has to hold
         // wherever the reads happen to split, so the extra byte arrives in the
         // same chunk as the terminator.
         assert_eq!(exchange(MAX_PROMPT_BYTES), b"OK\nnever sent");
@@ -503,12 +714,17 @@ mod tests {
         })
         .unwrap();
         // No PROMPT_END: the helper died mid-sentence (or is not our helper).
-        let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"Password:").unwrap();
+        let run = start_run(&askpass);
+        let mut stream = UnixStream::connect(&askpass.shared.socket).unwrap();
+        stream
+            .write_all(format!("{run}\nPassword:").as_bytes())
+            .unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
+        // The reply may not arrive at all: a peer that has closed its writing side
+        // before the listener accepted is reported closed outright on some systems.
         let mut reply = Vec::new();
-        stream.read_to_end(&mut reply).unwrap();
-        assert_eq!(reply, REPLY_CANCEL);
+        let _ = stream.read_to_end(&mut reply);
+        assert!(reply.is_empty() || reply == REPLY_CANCEL);
         assert!(!asked.load(Ordering::SeqCst));
     }
 
@@ -527,7 +743,7 @@ mod tests {
     #[test]
     fn an_askpass_the_user_chose_is_kept() {
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
-        let env = askpass.environment(|name| {
+        let env = environment(&askpass.shared, 1, |name| {
             (name == "SUDO_ASKPASS").then(|| OsString::from("/usr/bin/my-askpass"))
         });
         let names: Vec<_> = env
@@ -539,6 +755,7 @@ mod tests {
         assert!(names.contains(&"SSH_ASKPASS_REQUIRE".to_string()));
         assert!(names.contains(&"GIT_ASKPASS".to_string()));
         assert!(names.contains(&SOCKET_VAR.to_string()));
+        assert!(names.contains(&RUN_VAR.to_string()));
     }
 
     #[test]
@@ -546,7 +763,7 @@ mod tests {
         // The user's own SSH_ASKPASS is kept, but without `force` ssh would not
         // call it either: there is no display here, and no terminal.
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
-        let env = askpass.environment(|name| match name {
+        let env = environment(&askpass.shared, 1, |name| match name {
             "SSH_ASKPASS" => Some(OsString::from("/usr/bin/my-askpass")),
             "SSH_ASKPASS_REQUIRE" => Some(OsString::from("prefer")),
             _ => None,
@@ -565,9 +782,12 @@ mod tests {
         // The command that asked can end with the question still up -- a timeout
         // kills it, say. The prompt has to notice, or the terminal prompt keeps the
         // terminal's echo off and dropping the Askpass waits on it forever.
+        let (asked_tx, asked_rx) = mpsc::channel();
+        let asked_tx = Mutex::new(asked_tx);
         let (gave_up_tx, gave_up_rx) = mpsc::channel();
         let gave_up_tx = Mutex::new(gave_up_tx);
         let askpass = Askpass::start(Box::new(move |_, gone| {
+            asked_tx.lock().unwrap().send(()).unwrap();
             let started = std::time::Instant::now();
             while !gone() {
                 if started.elapsed() > Duration::from_secs(10) {
@@ -580,8 +800,12 @@ mod tests {
         }))
         .unwrap();
 
-        let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"Password:\0").unwrap();
+        let run = start_run(&askpass);
+        let stream = helper(&askpass, run, "Password:");
+        // Only once the question is up. A helper that closes before the listener
+        // has accepted it is not a prompt that has to be given up; on macOS such
+        // a connection is reported closed and never reaches the prompter at all.
+        asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(stream);
 
         assert!(gave_up_rx.recv_timeout(Duration::from_secs(5)).is_ok());
@@ -599,16 +823,14 @@ mod tests {
         .unwrap();
 
         // A helper that stays connected: only the drop can end the prompt.
-        let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"Password:\0").unwrap();
+        let run = start_run(&askpass);
+        let stream = helper(&askpass, run, "Password:");
         asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let started = std::time::Instant::now();
         drop(askpass);
         assert!(started.elapsed() < Duration::from_secs(5));
-        let mut reply = Vec::new();
-        stream.read_to_end(&mut reply).unwrap();
-        assert_eq!(reply, REPLY_CANCEL);
+        assert_eq!(reply_of(stream), REPLY_CANCEL);
     }
 
     #[test]

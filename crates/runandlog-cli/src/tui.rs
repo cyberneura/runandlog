@@ -93,7 +93,7 @@ fn start_askpass(
         crate::askpass::wait_for_answer(&answer, gone)
     }))
     .ok()?;
-    askpass.apply(session.exec_options_mut());
+    session.set_run_hook(askpass.hook());
     Some(askpass)
 }
 

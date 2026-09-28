@@ -4,17 +4,24 @@
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use runandlog_core::{
     Canceller, Document, ExecOptions, ExecOutcome, RenderContext, Sidecar, render_result,
     renumber_result, run_streaming, splice,
 };
 
+/// Something a front end adds to the options of each run as it starts. The askpass
+/// helper's variables go in this way, because they name the run: a helper left
+/// behind by an earlier run is told apart by them.
+pub type RunHook = Arc<dyn Fn(&mut ExecOptions) + Send + Sync>;
+
 /// State for a single Markdown file.
 pub struct Session {
     path: PathBuf,
     doc: Document,
     exec: ExecOptions,
+    run_hook: Option<RunHook>,
     render: RenderContext,
 }
 
@@ -37,6 +44,7 @@ impl Session {
             doc: Document::parse(&text),
             path,
             exec,
+            run_hook: None,
             render: RenderContext {
                 md_dir,
                 md_stem,
@@ -67,15 +75,25 @@ impl Session {
         self.doc.cells[index].command.clone()
     }
 
-    /// The execution settings, taken out so a run can happen on another thread.
+    /// The execution settings for a run about to start, taken out so the run can
+    /// happen on another thread.
+    ///
+    /// **One call per run.** The [`RunHook`] runs here, and it counts: calling this
+    /// for anything but the run it is going to be used for starts a run that never
+    /// happens, and cuts off the one in progress.
     pub fn exec_options(&self) -> ExecOptions {
-        self.exec.clone()
+        let mut options = self.exec.clone();
+        if let Some(hook) = &self.run_hook {
+            hook(&mut options);
+        }
+        options
     }
 
-    /// The execution settings, for a front end that has more to add to them once
-    /// it is up -- the askpass helper, which needs a front end to answer it.
-    pub fn exec_options_mut(&mut self) -> &mut ExecOptions {
-        &mut self.exec
+    /// Sets what every run's options get on top of the settings loaded with the
+    /// file -- for a front end that has more to add once it is up, such as the
+    /// askpass helper, which needs a front end to answer it.
+    pub fn set_run_hook(&mut self, hook: RunHook) {
+        self.run_hook = Some(hook);
     }
 
     /// Runs a cell and writes the result back to the Markdown (and to a separate
@@ -111,7 +129,7 @@ impl Session {
     ) -> io::Result<ExecOutcome> {
         let outcome = run_streaming(
             &self.doc.cells[index].command.clone(),
-            &self.exec,
+            &self.exec_options(),
             canceller,
             on_output,
         )?;
