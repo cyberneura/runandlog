@@ -17,6 +17,11 @@ const statusEl = document.getElementById('status')
 const runAllButton = document.getElementById('run-all')
 const stopButton = document.getElementById('stop')
 const reloadButton = document.getElementById('reload')
+const passwordDialog = document.getElementById('password')
+const passwordForm = document.getElementById('password-form')
+const passwordPrompt = document.getElementById('password-prompt')
+const passwordInput = document.getElementById('password-input')
+const passwordDecline = document.getElementById('password-decline')
 
 /** Index of the cell being run, or null when idle. */
 let running = null
@@ -64,6 +69,57 @@ const COPIED_MS = 3000
  * subscriptions settle -- where nothing is running yet -- does not offer Stop.
  */
 let subscribed = true
+
+/**
+ * Id of the password request the dialog is answering, or null when it is closed.
+ *
+ * The backend numbers requests so that an answer typed after the command has
+ * ended -- and a new one has asked -- cannot go to the wrong one.
+ */
+let passwordId = null
+
+/** Shows a command's request for a password. */
+function askPassword({ id, prompt }) {
+  passwordId = id
+  passwordPrompt.textContent =
+    running === null ? prompt : `Cell ${running + 1} asks: ${prompt}`
+  passwordInput.value = ''
+  if (!passwordDialog.open) {
+    passwordDialog.showModal()
+  }
+  passwordInput.focus()
+}
+
+/**
+ * Sends the answer, or null to decline, and closes the dialog.
+ *
+ * The field is emptied before anything is awaited, so the password does not sit
+ * in the page any longer than it takes to hand it over.
+ */
+async function answerPassword(answer) {
+  if (passwordId === null) {
+    return
+  }
+  const id = passwordId
+  dismissPassword()
+  try {
+    await invoke('answer_password', { id, answer })
+  } catch (error) {
+    setStatus(String(error), 'error')
+  }
+}
+
+/**
+ * Closes the dialog without answering. For when the command that asked has
+ * ended: the backend has already declined on its behalf.
+ */
+function dismissPassword() {
+  passwordId = null
+  passwordInput.value = ''
+  if (passwordDialog.open) {
+    passwordDialog.close()
+  }
+}
 
 function setStatus(text, kind) {
   statusEl.textContent = text
@@ -405,6 +461,7 @@ async function runCell(index) {
   } finally {
     running = null
     live = ''
+    dismissPassword()
     setBusy(false)
     await refresh()
   }
@@ -432,6 +489,7 @@ async function runAll() {
   } finally {
     running = null
     live = ''
+    dismissPassword()
     setBusy(false)
     await refresh()
   }
@@ -475,6 +533,16 @@ async function reload(quiet) {
 runAllButton.addEventListener('click', runAll)
 stopButton.addEventListener('click', stop)
 reloadButton.addEventListener('click', () => reload(false))
+passwordForm.addEventListener('submit', (event) => {
+  event.preventDefault()
+  answerPassword(passwordInput.value)
+})
+passwordDecline.addEventListener('click', () => answerPassword(null))
+// Escape closes a modal dialog on its own; the command still needs its answer.
+passwordDialog.addEventListener('cancel', (event) => {
+  event.preventDefault()
+  answerPassword(null)
+})
 
 // Nothing can be started until the events are subscribed. `listen` registers with
 // the backend asynchronously, and Stop is only offered once a run has said it
@@ -509,10 +577,24 @@ async function start() {
     }),
     listen('runandlog://finished', () => {
       running = null
+      // Whatever asked for a password has ended, and the backend has declined for it.
+      dismissPassword()
+    }),
+    listen('runandlog://password', (event) => {
+      askPassword(event.payload)
     }),
   ])
   const failure = attempts.find((attempt) => attempt.status === 'rejected')
   subscribed = failure === undefined
+  if (subscribed) {
+    // Only now can a password request be shown, so only now may the backend send
+    // one; until then it declines them for us.
+    try {
+      await invoke('listen_for_passwords')
+    } catch (error) {
+      setStatus(String(error), 'error')
+    }
+  }
   if (!subscribed) {
     // Subscribing can be refused -- by a missing capability, say. The window is
     // then blind to a run's progress, but it can still show the document, run

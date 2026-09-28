@@ -20,6 +20,17 @@
 
     <footer class="status" id="status">Ready.</footer>
 
+    <dialog id="password" class="password">
+      <form id="password-form">
+        <label id="password-prompt" for="password-input"></label>
+        <input id="password-input" type="password" autocomplete="off" spellcheck="false" />
+        <div class="password-actions">
+          <button id="password-decline" type="button">Cancel</button>
+          <button id="password-send" type="submit">Send</button>
+        </div>
+      </form>
+    </dialog>
+
     <script src="app.js"></script>
   </body>
 </html>

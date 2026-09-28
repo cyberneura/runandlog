@@ -61,6 +61,32 @@ Press it again to leave immediately without waiting for that write. SIGTERM does
 the same and exits with 143, so a job runner can tell the two apart. In the TUI,
 Ctrl-C stops the command the same way; see the key table below.
 
+### Commands that ask for a password
+
+Commands run without a terminal: stdin is empty, and they have no controlling
+terminal either. A program that insists on one fails straight away rather than
+waiting for input nobody can give it -- plain `sudo` reports that "a terminal is
+required to read the password".
+
+What such programs can use instead is an *askpass* helper, and runandlog provides
+one. When a command asks through it, the question is put to you wherever you are
+running runandlog: on the terminal (non-interactive runs), in the status line (TUI),
+or in a dialog (desktop app). Your answer goes to the command and nowhere else --
+it is not part of the output and is never written to the Markdown.
+
+| Program | How to write the cell |
+|---|---|
+| sudo | `sudo -A ...` (plain `sudo` also uses the helper on Linux when `DISPLAY` is set) |
+| ssh | nothing to add (`SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force` are set) |
+| git over HTTPS | nothing to add (`GIT_ASKPASS` is set; a credential helper still comes first) |
+
+An askpass you have set yourself (`SUDO_ASKPASS` and so on) is left in place.
+A non-interactive run with no terminal to ask on -- from cron or CI -- offers no
+helper, so the commands fail the way they would without one. Programs that read
+other kinds of input from the terminal (a `y/N` confirmation, a full-screen
+editor) cannot be answered; give them their input on the command line instead
+(`apt-get -y`, `ssh -o BatchMode=yes`, ...).
+
 ### Options
 
 | Option | Default | Description |
@@ -83,6 +109,10 @@ Ctrl-C stops the command the same way; see the key table below.
 | `R` | Reload the file |
 | `q` / `Esc` | Quit (while a command is running, quitting waits for it to finish) |
 | `Ctrl-C` | Quit at once, stopping the running command and keeping the output it produced |
+
+When a command asks for a password, the prompt takes over the status line: type
+the password (shown as `*`) and press `Enter` to send it or `Esc` to decline.
+While the prompt is up, every key but `Ctrl-C` is typed into it.
 
 While a cell runs, its last three lines of output are shown underneath it, in
 place of the result of the previous run, and are replaced by the new result once

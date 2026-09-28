@@ -21,9 +21,10 @@
 //!   the file, so byte offsets and result blocks change; sending a diff would
 //!   mean tracking that in two places.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError, mpsc};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -40,6 +41,9 @@ const EVENT_STARTED: &str = "runandlog://started";
 const EVENT_OUTPUT: &str = "runandlog://output";
 /// Event marking the end of a run, successful or not.
 const EVENT_FINISHED: &str = "runandlog://finished";
+/// Event carrying a command's request for a password. Answered with
+/// [`answer_password`].
+const EVENT_PASSWORD: &str = "runandlog://password";
 
 /// How much of one piece of output is sent to the window at a time.
 ///
@@ -94,6 +98,32 @@ struct RunReport {
     cancelled: bool,
 }
 
+/// A command asking for a password, as the window shows it.
+#[derive(Debug, Clone, Serialize)]
+struct PasswordRequest {
+    /// What the answer is sent back under.
+    id: u64,
+    /// What the command asked, word for word.
+    prompt: String,
+}
+
+/// Password requests waiting for the window to answer.
+///
+/// Whether a request may be taken at all lives under the same lock as the requests
+/// themselves. Checked apart, a command could end -- and its requests be declined --
+/// between the check and the registration, leaving a prompt for a run that is over.
+#[derive(Default)]
+struct Passwords {
+    /// Whether the window has subscribed to the requests. Until it has, nobody would
+    /// see one, and the command would wait on an answer that cannot come.
+    window_listens: bool,
+    /// Whether a command is running right now. Not the same as `busy`, which also
+    /// covers the write-back and the gaps between the cells of a batch.
+    accepting: bool,
+    next: u64,
+    pending: HashMap<u64, mpsc::Sender<Option<String>>>,
+}
+
 /// How a "run all" ended.
 ///
 /// `stopped` is carried separately because a batch can end on a Stop that landed
@@ -130,6 +160,7 @@ struct Operation {
 struct GuiState {
     session: Mutex<Session>,
     operation: Mutex<Operation>,
+    passwords: Mutex<Passwords>,
 }
 
 impl GuiState {
@@ -166,6 +197,80 @@ impl GuiState {
             canceller.cancel();
         }
         true
+    }
+
+    fn passwords(&self) -> std::sync::MutexGuard<'_, Passwords> {
+        // As with `operation`: nothing under this lock can panic.
+        self.passwords
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers a request for a password, returning its id and where the answer
+    /// will arrive. `None` when no command is running to have asked, when the
+    /// request's own run is over (`gone`), or when the window cannot show the
+    /// question.
+    ///
+    /// `gone` is asked under the lock: `accepting` may have been cleared for the
+    /// request's run and set again for the next one while the request was on its
+    /// way, and it is `gone` that tells the two runs apart.
+    fn request_password(
+        &self,
+        gone: &dyn Fn() -> bool,
+    ) -> Option<(u64, mpsc::Receiver<Option<String>>)> {
+        let mut passwords = self.passwords();
+        if !passwords.window_listens || !passwords.accepting || gone() {
+            // Outside a run it is a leftover from a command already written back -- a
+            // background process it started, say -- with no cell to show it against.
+            return None;
+        }
+        let id = passwords.next;
+        passwords.next += 1;
+        let (reply, answer) = mpsc::channel();
+        passwords.pending.insert(id, reply);
+        Some((id, answer))
+    }
+
+    /// Puts a registered request to the window with `show`, unless the request
+    /// has been abandoned since it was registered. Reports whether it was shown.
+    ///
+    /// Under the lock, so that abandoning a run's requests and showing one of them
+    /// cannot cross: a request registered just before its run ended would
+    /// otherwise come up under the next cell. A `show` that fails drops the
+    /// request, which the helper reads as a decline.
+    fn show_password_request(&self, id: u64, show: impl FnOnce() -> bool) -> bool {
+        let mut passwords = self.passwords();
+        if !passwords.pending.contains_key(&id) {
+            return false;
+        }
+        if show() {
+            return true;
+        }
+        passwords.pending.remove(&id);
+        false
+    }
+
+    /// Answers a request. Reports whether it was still waiting.
+    fn answer_password(&self, id: u64, answer: Option<String>) -> bool {
+        match self.passwords().pending.remove(&id) {
+            Some(reply) => reply.send(answer).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Starts taking requests, for the command about to run.
+    fn accept_passwords(&self) {
+        self.passwords().accepting = true;
+    }
+
+    /// Declines every request still waiting and stops taking new ones. Called when a
+    /// command ends: whatever asked is gone with it, and the window closes its
+    /// prompt on the same event.
+    fn abandon_passwords(&self) {
+        let mut passwords = self.passwords();
+        passwords.accepting = false;
+        // Dropping a sender is a decline to the helper waiting on it.
+        passwords.pending.clear();
     }
 
     /// Whether Stop has been pressed during the operation in flight.
@@ -325,6 +430,24 @@ fn cancel(state: State<'_, GuiState>) -> bool {
     state.stop()
 }
 
+/// Tells the backend that the window is listening for password requests.
+///
+/// Called once the subscriptions are in place. Before that -- and for good, if
+/// subscribing failed -- requests are declined at once rather than sent to nobody.
+#[tauri::command]
+fn listen_for_passwords(state: State<'_, GuiState>) {
+    state.passwords().window_listens = true;
+}
+
+/// Answers a command's request for a password. `None` declines it.
+///
+/// Reports whether the request was still waiting: one whose command has ended is
+/// gone, and the answer goes nowhere.
+#[tauri::command]
+fn answer_password(state: State<'_, GuiState>, id: u64, answer: Option<String>) -> bool {
+    state.answer_password(id, answer)
+}
+
 /// The body shared by [`run_cell`] and [`run_all`].
 ///
 /// Split out so that the busy flag is taken once for a whole batch: taking it per
@@ -334,12 +457,12 @@ async fn execute(
     state: &State<'_, GuiState>,
     index: usize,
 ) -> Result<RunReport, String> {
-    let (command, options) = {
+    let (command, run) = {
         let session = state.session.lock().map_err(lock_error)?;
         if index >= session.len() {
             return Err(format!("There is no cell {}.", index + 1));
         }
-        (session.command_of(index), session.exec_options())
+        (session.command_of(index), session.start_run())
     };
 
     // One handle per run: a stopped cell must not leave the next one unable to start.
@@ -351,11 +474,12 @@ async fn execute(
     }
 
     let _ = app.emit(EVENT_STARTED, index);
+    state.accept_passwords();
     // The lock is deliberately not held here: the run can take minutes, and the
     // window keeps reading the document while it does.
     let reporter = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        runandlog_core::run_streaming(&command, &options, &canceller, |chunk| {
+        let outcome = runandlog_core::run_streaming(&command, &run.options, &canceller, |chunk| {
             // Sent as the command prints rather than kept until it ends: a run that
             // takes minutes should show what it is doing while it does it.
             let _ = reporter.emit(
@@ -365,20 +489,26 @@ async fn execute(
                     text: crate::live::tail(chunk, MAX_OUTPUT_CHUNK_BYTES).to_string(),
                 },
             );
-        })
+        });
+        // The command is over; the write-back that follows is not part of the run.
+        drop(run);
+        outcome
     })
     .await
     .map_err(|error| format!("The worker thread died unexpectedly: {error}"))
     .inspect_err(|_| {
         state.arm(None);
+        state.abandon_passwords();
     })?
     .map_err(|error| format!("The run failed: {error}"))
     .inspect_err(|_| {
         state.arm(None);
+        state.abandon_passwords();
     })?;
     // Disarmed as soon as the command is over: from here on there is nothing to
     // stop, and a Stop that arrived late must not reach the *next* run.
     state.arm(None);
+    state.abandon_passwords();
 
     let view = {
         let mut session = state.session.lock().map_err(lock_error)?;
@@ -416,25 +546,88 @@ pub fn run(session: Session) -> io::Result<()> {
     // does not have to take the lock just to read the file name.
     let title = window_title(session.path());
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(GuiState {
             session: Mutex::new(session),
             operation: Mutex::new(Operation::default()),
+            passwords: Mutex::new(Passwords::default()),
         })
+        .manage(AskpassSlot::default())
         .setup(move |app| {
             // Say which file is open. tauri.conf.json cannot express this because
             // the path is only known at run time.
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&title);
             }
+            start_askpass(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            document, reload, run_cell, run_all, cancel
+            document,
+            reload,
+            run_cell,
+            run_all,
+            cancel,
+            listen_for_passwords,
+            answer_password
         ])
-        .run(tauri::generate_context!())
-        .map_err(io::Error::other)
+        .build(tauri::generate_context!())
+        .map_err(io::Error::other)?;
+    app.run(|app, event| {
+        if let tauri::RunEvent::Exit = event {
+            // The app may leave by exiting the process, which runs no destructors;
+            // taken here, the helper's directory does not outlive the window.
+            let slot = app.state::<AskpassSlot>();
+            drop(slot.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+        }
+    });
+    Ok(())
 }
+
+/// Holds the askpass helper for as long as the window is open.
+#[derive(Default)]
+struct AskpassSlot(
+    #[cfg(unix)] Mutex<Option<crate::askpass::Askpass>>,
+    #[cfg(not(unix))] Mutex<Option<()>>,
+);
+
+/// Lets commands ask for a password through the window.
+///
+/// A failure to start leaves commands where they were before there was a helper --
+/// asking for a password fails at once -- which is no reason to refuse to open.
+#[cfg(unix)]
+fn start_askpass(app: &AppHandle) {
+    let handle = app.clone();
+    let prompter = Box::new(move |prompt: &str, gone: &dyn Fn() -> bool| {
+        let state = handle.state::<GuiState>();
+        let (id, answer) = state.request_password(gone)?;
+        let request = PasswordRequest {
+            id,
+            prompt: prompt.to_string(),
+        };
+        // Not shown when the run ended in between; the wait below then finds the
+        // sender dropped and declines at once.
+        state.show_password_request(id, || handle.emit(EVENT_PASSWORD, request).is_ok());
+        // A dropped sender -- the run ended with the prompt up -- is a decline.
+        crate::askpass::wait_for_answer(&answer, gone)
+    });
+    let Ok(askpass) = crate::askpass::Askpass::start(prompter) else {
+        return;
+    };
+    let state = app.state::<GuiState>();
+    state
+        .session
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_run_hook(askpass.hook());
+    *app.state::<AskpassSlot>()
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(askpass);
+}
+
+#[cfg(not(unix))]
+fn start_askpass(_app: &AppHandle) {}
 
 /// Why the window cannot be opened, when there is no display to open it on.
 ///
@@ -547,7 +740,70 @@ mod tests {
             // The session is irrelevant to the busy flag, so any file will do.
             session: Mutex::new(session(&dir.write("doc.md", "# no cells\n"))),
             operation: Mutex::new(Operation::default()),
+            passwords: Mutex::new(Passwords::default()),
         }
+    }
+
+    #[test]
+    fn a_password_is_only_asked_for_while_a_command_runs() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        state.passwords().window_listens = true;
+        // Nothing is running: there is no cell to show the prompt against.
+        assert!(state.request_password(&|| false).is_none());
+
+        state.accept_passwords();
+        // A request whose own run is over is refused even while requests are
+        // being taken: the run it belongs to is not the one they are taken for.
+        assert!(state.request_password(&|| true).is_none());
+        let (id, answer) = state.request_password(&|| false).unwrap();
+        assert!(state.show_password_request(id, || true));
+        assert!(state.answer_password(id, Some("s3cret".to_string())));
+        assert_eq!(answer.recv().unwrap(), Some("s3cret".to_string()));
+        // Answered once; a second answer has nowhere to go.
+        assert!(!state.answer_password(id, None));
+    }
+
+    #[test]
+    fn a_prompt_left_up_when_the_command_ends_is_declined() {
+        let dir = TempDir::new();
+        let state = state(&dir);
+        state.passwords().window_listens = true;
+        state.accept_passwords();
+        let (id, answer) = state.request_password(&|| false).unwrap();
+        state.abandon_passwords();
+        // Registered just before the run ended: not shown, since nobody is running
+        // to have asked, and the window must not put it under the next cell.
+        assert!(!state.show_password_request(id, || unreachable!("shown after abandon")));
+        // The helper sees the dropped sender and tells its command "no password".
+        assert!(answer.recv().is_err());
+        // And an answer typed after that goes nowhere.
+        assert!(!state.answer_password(id, Some("late".to_string())));
+        // Nor can anything ask again until the next command starts.
+        assert!(state.request_password(&|| false).is_none());
+    }
+
+    #[test]
+    fn a_request_the_window_cannot_be_shown_is_declined() {
+        // A window that cannot be reached is a decline, not a wait.
+        let dir = TempDir::new();
+        let state = state(&dir);
+        state.passwords().window_listens = true;
+        state.accept_passwords();
+        let (id, answer) = state.request_password(&|| false).unwrap();
+        assert!(!state.show_password_request(id, || false));
+        assert!(answer.recv().is_err());
+        assert!(!state.answer_password(id, Some("late".to_string())));
+    }
+
+    #[test]
+    fn nothing_is_asked_through_a_window_that_is_not_listening() {
+        // Subscribing can fail, and the window then runs without events. A request
+        // sent to it would be seen by nobody and hold the command until Stop.
+        let dir = TempDir::new();
+        let state = state(&dir);
+        state.accept_passwords();
+        assert!(state.request_password(&|| false).is_none());
     }
 
     #[test]
