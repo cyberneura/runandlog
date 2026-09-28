@@ -1,0 +1,21 @@
+/* The Third-Party Licenses window. The colours come from style.css. */
+
+body.licenses {
+  margin: 0;
+  padding: 16px 20px;
+  background: var(--card);
+  color: var(--fg);
+}
+
+.licenses-intro {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+
+.licenses-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -254,6 +254,9 @@ jobs:
           mkdir -p "dist/$NAME"
           cp "target/${TARGET}/release/runandlog" "dist/$NAME/"
           cp README.md "dist/$NAME/"
+          # The licenses travel with the binary as files too, not only inside it
+          # (`runandlog --license`).
+          cp LICENSE THIRD-PARTY-NOTICES.txt "dist/$NAME/"
           # The archive carries its own directory rather than unpacking into the
           # current one. The Homebrew cask names that directory in its `binary`
           # path, since a cask does not descend into it on its own.

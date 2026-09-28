@@ -96,6 +96,7 @@ editor) cannot be answered; give them their input on the command line instead
 | `--cwd <DIR>` | Directory of the Markdown file | Working directory for the commands |
 | `--timeout <SECONDS>` | unlimited | Time limit per cell. On expiry the whole process group is killed |
 | `--gui` | - | Open in the desktop app (GUI) |
+| `--license` | - | Print the license of Run and Log and of the libraries it is built from, and exit. Takes no file |
 
 ### TUI keys
 
@@ -157,6 +158,10 @@ cargo build --no-default-features
 
 Such a build still accepts `--gui`, but reports that this build has no GUI rather
 than opening a window.
+
+**Third-Party Licenses**, right below **About** in the app menu (in the Help menu
+on Linux), opens a window with the license of Run and Log and of the libraries it
+is built from -- the same text `runandlog --license` prints.
 
 ## Writing the Markdown
 
@@ -286,3 +291,28 @@ examples/run-example.sh --gui        # open the desktop app
 
 Arguments are passed straight through. The binary is built from the current tree,
 or set `RUNANDLOG` to try one that already exists.
+
+## License
+
+Run and Log is released under the [MIT License](LICENSE).
+
+## Third-party licenses
+
+The released binaries are built from open source libraries whose licenses ask for
+their notices to travel with the binary. They are listed, with the license texts,
+in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which is also compiled into
+`runandlog` itself:
+
+- `runandlog --license` prints it, after Run and Log's own license
+- in the desktop app, **Third-Party Licenses** in the app menu shows the same text
+
+The file covers both release builds (macOS with the desktop app, Linux with the CLI
+and TUI only) and is generated, not written by hand. After adding or upgrading a
+dependency, generate it again and commit the result:
+
+```shell
+cargo install cargo-about --locked --features cli   # once
+scripts/generate-third-party-notices.sh
+```
+
+`cargo test` fails while the file is out of step with `Cargo.lock`.

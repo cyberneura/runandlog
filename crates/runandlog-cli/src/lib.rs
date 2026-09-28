@@ -8,5 +8,6 @@ pub mod askpass;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod live;
+pub mod notices;
 pub mod session;
 pub mod tui;
