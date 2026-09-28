@@ -54,6 +54,9 @@ const EVENT_PASSWORD: &str = "runandlog://password";
 /// written back to the Markdown when the command finishes.
 const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Id of the "Third-Party Licenses" menu item, and label of the window it opens.
+const LICENSES: &str = "licenses";
+
 /// A cell as the window shows it.
 #[derive(Debug, Clone, Serialize)]
 struct CellView {
@@ -528,6 +531,59 @@ async fn execute(
     Ok(report)
 }
 
+/// The licences shown in the Third-Party Licenses window: Run and Log's own, then
+/// those of the libraries compiled into it. The same text `--license` prints.
+#[tauri::command]
+fn third_party_notices() -> String {
+    crate::notices::license_text()
+}
+
+/// The app's menu: Tauri's default one, with "Third-Party Licenses" right below
+/// "About".
+///
+/// About sits first in the app menu on macOS and first in the Help menu
+/// elsewhere, which is where Tauri's default menu puts it; the item goes in at
+/// the position after it. Nothing else of the default menu is changed, so the
+/// Edit menu's copy and paste keep working in the window.
+fn app_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let menu = tauri::menu::Menu::default(app)?;
+    let about_menu = if cfg!(target_os = "macos") {
+        menu.items()?.into_iter().next()
+    } else {
+        menu.get(tauri::menu::HELP_SUBMENU_ID)
+    };
+    if let Some(submenu) = about_menu.as_ref().and_then(|item| item.as_submenu()) {
+        let licenses = tauri::menu::MenuItem::with_id(
+            app,
+            LICENSES,
+            "Third-Party Licenses",
+            true,
+            None::<&str>,
+        )?;
+        submenu.insert(&licenses, 1)?;
+    }
+    Ok(menu)
+}
+
+/// Opens the Third-Party Licenses window, or brings it forward when it is open.
+///
+/// The window gets no capability: it calls nothing but [`third_party_notices`],
+/// a command of the app's own, which needs none.
+fn show_licenses(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(LICENSES) {
+        return window.set_focus();
+    }
+    tauri::WebviewWindowBuilder::new(
+        app,
+        LICENSES,
+        tauri::WebviewUrl::App("licenses.html".into()),
+    )
+    .title("Third-Party Licenses")
+    .inner_size(720.0, 640.0)
+    .build()?;
+    Ok(())
+}
+
 /// A poisoned lock means another thread panicked while holding the session.
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> String {
     "The session is no longer usable because a background task panicked.".to_string()
@@ -553,6 +609,14 @@ pub fn run(session: Session) -> io::Result<()> {
             passwords: Mutex::new(Passwords::default()),
         })
         .manage(AskpassSlot::default())
+        .menu(app_menu)
+        .on_menu_event(|app, event| {
+            if event.id() == LICENSES
+                && let Err(error) = show_licenses(app)
+            {
+                eprintln!("runandlog: could not open the licenses window: {error}");
+            }
+        })
         .setup(move |app| {
             // Say which file is open. tauri.conf.json cannot express this because
             // the path is only known at run time.
@@ -569,7 +633,8 @@ pub fn run(session: Session) -> io::Result<()> {
             run_all,
             cancel,
             listen_for_passwords,
-            answer_password
+            answer_password,
+            third_party_notices
         ])
         .build(tauri::generate_context!())
         .map_err(io::Error::other)?;

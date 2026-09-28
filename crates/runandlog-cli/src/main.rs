@@ -1,6 +1,6 @@
 //! Entry point of the Run and Log CLI / TUI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -30,7 +30,15 @@ fn signal_exit_code(signal: i32) -> u8 {
 #[command(name = "runandlog", version, about, long_about)]
 struct Args {
     /// The Markdown file to work on.
-    file: PathBuf,
+    //
+    // An `Option` only so that `--license` can go without it: clap still requires
+    // it for everything else, so `dispatch` always has one.
+    #[arg(required_unless_present = "license")]
+    file: Option<PathBuf>,
+
+    /// Print the license of Run and Log and of the libraries it is built from, and exit.
+    #[arg(long, exclusive = true)]
+    license: bool,
 
     /// Open in the desktop app (GUI).
     #[arg(short, long)]
@@ -82,6 +90,9 @@ fn main() -> ExitCode {
         }
     }
     let args = Args::parse();
+    if args.license {
+        return print_license();
+    }
     match dispatch(args) {
         Ok(code) => code,
         Err(error) => {
@@ -99,8 +110,34 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--license`: prints the licences and exits.
+///
+/// Written rather than `print!`ed: piped into `head` or a pager that quits early,
+/// `print!` panics on the closed pipe instead of just stopping. A closed pipe is
+/// the reader having seen enough, so it is a success; any other failure (a full
+/// disk, say) means the text did not get where it was sent, and says so.
+fn print_license() -> ExitCode {
+    let text = runandlog::notices::license_text();
+    let mut stdout = std::io::stdout().lock();
+    let written = std::io::Write::write_all(&mut stdout, text.as_bytes())
+        .and_then(|()| std::io::Write::flush(&mut stdout));
+    match written {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("runandlog: could not print the license: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn dispatch(args: Args) -> std::io::Result<ExitCode> {
-    let mut session = Session::load(&args.file, exec_options(&args), args.max_inline_lines)?;
+    let Some(file) = args.file.as_deref() else {
+        // clap has refused a command line without FILE unless --license was on it,
+        // and --license returned before this.
+        return Err(std::io::Error::other("no Markdown file was given"));
+    };
+    let mut session = Session::load(file, exec_options(&args, file), args.max_inline_lines)?;
 
     if args.gui {
         // The GUI is checked before the other flags on purpose: --gui is a request
@@ -327,15 +364,12 @@ fn open_gui(_session: Session) -> std::io::Result<()> {
     ))
 }
 
-fn exec_options(args: &Args) -> ExecOptions {
+fn exec_options(args: &Args, file: &Path) -> ExecOptions {
     let cwd = args.cwd.clone().unwrap_or_else(|| {
         // Resolve first: Session::load canonicalizes the document, so with a symlink
         // argument the directory "containing the Markdown file" is the one holding
         // the real file, not the one holding the link.
-        let file = args
-            .file
-            .canonicalize()
-            .unwrap_or_else(|_| args.file.clone());
+        let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
         file.parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(PathBuf::from)

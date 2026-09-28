@@ -474,6 +474,39 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   判定は `App::finished` (このセッションで実行したセルの index → 成否) だけで行う。
 - **reload では `finished` を捨てる。** 再読み込み後の index は同じセルを指すとは限らない。
 
+## ライセンス表示 (CYBERNEURA-DEV-880)
+
+`LICENSE` (MIT、Cyberneura) と、配布バイナリに入る crate のライセンスを並べた
+`THIRD-PARTY-NOTICES.txt` をリポジトリ直下に置いている。バイナリには両方を埋め込み、
+`runandlog --license` と GUI のメニュー (macOS はアプリメニューの About の直下、
+それ以外は Help の About の直下) の **Third-Party Licenses** で表示する。
+
+- **依存を足す・上げる時は `scripts/generate-third-party-notices.sh` を流し直して
+  コミットする。** `tests/third_party_notices.rs` が「直接依存が Cargo.lock の version で
+  載っているか」「載っている crate が全部 Cargo.lock にあるか」を見るので、忘れると
+  `cargo test` が落ちる。Dependabot の PR も notices を更新しないので、マージ前に同じ
+  ブランチで再生成する。cargo-about (`cargo install cargo-about --locked --features cli`) と
+  python3 が要る。生成には数分かかる (clearlydefined への問い合わせ)。
+- **cargo-about は 2 回走らせてマージする。** リリースは macOS (aarch64、既定 feature = GUI 込み)
+  と Linux (x86_64、`--no-default-features`) で feature まで違い、cargo-about は 1 回の実行で
+  feature を 1 組しか取れない。両ターゲットを既定 feature で 1 回に流すと、どちらの配布物にも
+  入らない GTK / WebKit の crate が載る。release.yml の build matrix を変えたらスクリプトも揃える。
+- **自分の crate (runandlog / runandlog-core) はスクリプトで除外している。** crates.io に
+  公開しているので `publish = false` を付けられず、cargo-about の `[private] ignore` が効かない。
+- **`accepted` (about.toml) を勝手に広げない。** GPL / LGPL / AGPL 系が出たら配布条件が変わるので
+  人間に確認する。
+- **埋め込みは crate 内の symlink 経由** (`crates/runandlog-cli/LICENSE` と
+  `THIRD-PARTY-NOTICES.txt` はリポジトリ直下への symlink)。crates.io に出すのは crate の
+  ディレクトリだけなので、`include_str!("../../../...")` のようにパッケージの外を指すと
+  `cargo package` 後のビルドが通らない。cargo は symlink の中身を普通のファイルとして
+  パッケージに入れる (`cargo package --list` と .crate の中身で確認済み)。
+- ライセンスのウインドウ (`ui/licenses.html`) には capability を付けていない。呼ぶのは自前の
+  `third_party_notices` コマンドだけで、それは capability 無しで通る。
+- **FILE 引数は `Option<PathBuf>` + `required_unless_present = "license"`。** clap の
+  `exclusive = true` だけでは必須の位置引数の検査を外せず、`runandlog --license` が
+  「FILE が無い」で落ちた。`exclusive` は「`--license` と他の引数の同時指定を拒否する」ために
+  残している。
+
 ## 未実装 / 今後
 
 - GUI で完了したセルを色分けする (今のところ TUI だけの機能)。
