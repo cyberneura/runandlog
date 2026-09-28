@@ -1,6 +1,7 @@
 //! Holds a Markdown file together with its run state. Shared by the TUI and
 //! non-interactive runs.
 
+use std::any::Any;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,8 +14,22 @@ use runandlog_core::{
 
 /// Something a front end adds to the options of each run as it starts. The askpass
 /// helper's variables go in this way, because they name the run: a helper left
-/// behind by an earlier run is told apart by them.
-pub type RunHook = Arc<dyn Fn(&mut ExecOptions) + Send + Sync>;
+/// behind by an earlier run is told apart by them. What the hook returns is held
+/// in the [`Run`] and dropped when the command is over, which is how the front
+/// end's side learns that it is.
+pub type RunHook = Arc<dyn Fn(&mut ExecOptions) -> Box<dyn Any + Send> + Send + Sync>;
+
+/// A run about to start: the options to run with, and the run itself, held for as
+/// long as the command runs.
+///
+/// **Drop it when the command has ended, and before the result is written back.**
+/// The write-back is not part of the run, and what the [`RunHook`] returned is
+/// what ends the run for the front end's additions -- the askpass helper refuses
+/// prompts from a run that is over.
+pub struct Run {
+    pub options: ExecOptions,
+    _in_progress: Option<Box<dyn Any + Send>>,
+}
 
 /// State for a single Markdown file.
 pub struct Session {
@@ -75,18 +90,18 @@ impl Session {
         self.doc.cells[index].command.clone()
     }
 
-    /// The execution settings for a run about to start, taken out so the run can
-    /// happen on another thread.
+    /// Starts a run, taken out so the run can happen on another thread.
     ///
     /// **One call per run.** The [`RunHook`] runs here, and it counts: calling this
     /// for anything but the run it is going to be used for starts a run that never
     /// happens, and cuts off the one in progress.
-    pub fn exec_options(&self) -> ExecOptions {
+    pub fn start_run(&self) -> Run {
         let mut options = self.exec.clone();
-        if let Some(hook) = &self.run_hook {
-            hook(&mut options);
+        let in_progress = self.run_hook.as_ref().map(|hook| hook(&mut options));
+        Run {
+            options,
+            _in_progress: in_progress,
         }
-        options
     }
 
     /// Sets what every run's options get on top of the settings loaded with the
@@ -127,12 +142,15 @@ impl Session {
         canceller: &Canceller,
         on_output: impl FnMut(&str) + Send,
     ) -> io::Result<ExecOutcome> {
+        let run = self.start_run();
         let outcome = run_streaming(
             &self.doc.cells[index].command.clone(),
-            &self.exec_options(),
+            &run.options,
             canceller,
             on_output,
         )?;
+        // The command is over. The write-back is not part of the run.
+        drop(run);
         self.apply_outcome(index, &outcome)?;
         Ok(outcome)
     }

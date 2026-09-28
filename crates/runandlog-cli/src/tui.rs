@@ -527,7 +527,7 @@ impl App {
     /// The return value tells a "run all" batch whether it may continue.
     fn execute(&mut self, index: usize, terminal: &mut DefaultTerminal) -> io::Result<Batch> {
         let command = self.session.command_of(index);
-        let options = self.session.exec_options();
+        let run = self.session.start_run();
         // One per run: a cancelled cell must not leave the next one unable to start.
         let canceller = Canceller::new();
         let worker_canceller = canceller.clone();
@@ -537,16 +537,16 @@ impl App {
         // from ever waiting on it.
         let (output_tx, output_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(runandlog_core::run_streaming(
-                &command,
-                &options,
-                &worker_canceller,
-                |chunk| {
+            let outcome =
+                runandlog_core::run_streaming(&command, &run.options, &worker_canceller, |chunk| {
                     // A closed channel means the front end has stopped listening,
                     // which is not the command's problem.
                     let _ = output_tx.send(chunk.to_string());
-                },
-            ));
+                });
+            // Ended here, on the worker: the run must not outlive the command by
+            // the write-back that follows on the drawing thread.
+            drop(run);
+            let _ = tx.send(outcome);
         });
 
         self.live.clear();

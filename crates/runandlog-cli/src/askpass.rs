@@ -16,11 +16,12 @@
 //! is never written anywhere else: not to the captured output, not to the Markdown.
 //!
 //! Each run of a command is numbered, and its helper sends the number with the
-//! prompt ([`RUN_VAR`]). Only the current run's helpers are answered: a process a
-//! previous cell left behind in the background, still holding that cell's
-//! environment, cannot put a question up while the next cell is running and have
-//! it taken for the next cell's. What the user types goes to the command they were
-//! shown.
+//! prompt ([`RUN_VAR`]). Only the helpers of the run in progress are answered --
+//! there is one at most, and none between runs. A process a previous cell left
+//! behind in the background, still holding that cell's environment, cannot put a
+//! question up while the next cell is running and have it taken for the next
+//! cell's, nor between cells or after the last one. What the user types goes to
+//! the command they were shown.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -35,6 +36,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use runandlog_core::ExecOptions;
+
+use crate::session::RunHook;
 
 /// File name the helper is started under. `main` checks for it before parsing
 /// arguments, since the helper is called with a prompt, not with a Markdown file.
@@ -91,14 +94,39 @@ struct Shared {
     socket: PathBuf,
     helper: PathBuf,
     closing: AtomicBool,
-    /// The run whose helpers are answered. Zero until the first run starts, so
-    /// that nothing is answered before then.
+    /// The run whose helpers are answered. Zero while no run is in progress --
+    /// before the first, between runs, after the last -- and then nothing is
+    /// answered.
     current_run: AtomicU64,
+    /// Number for the next run. Never reused, so a helper of an old run can never
+    /// match a new one.
+    next_run: AtomicU64,
 }
 
-/// What a front end gives the [`crate::session::Session`] so that every run picks
-/// up the helper's variables -- with its own run number -- as it starts.
-pub type RunHook = Arc<dyn Fn(&mut ExecOptions) + Send + Sync>;
+/// A run in progress, as far as the helper is concerned. Its helpers are answered
+/// until it is dropped, and refused from then on.
+///
+/// Dropped when the command has ended -- by the [`crate::session::Run`] that holds
+/// it, before the write-back. A process the command left behind is then a process
+/// of no run.
+#[must_use = "dropping this ends the run: the helper refuses its prompts from then on"]
+pub struct RunInProgress {
+    shared: Arc<Shared>,
+    run: u64,
+}
+
+impl Drop for RunInProgress {
+    fn drop(&mut self) {
+        // Only while it is still this run. A newer one may have started already,
+        // and an old token dropping late must not end it.
+        let _ = self.shared.current_run.compare_exchange(
+            self.run,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+}
 
 impl Askpass {
     /// Creates the socket and starts answering on it with `prompter`.
@@ -129,6 +157,7 @@ impl Askpass {
             helper,
             closing: AtomicBool::new(false),
             current_run: AtomicU64::new(0),
+            next_run: AtomicU64::new(1),
         });
         let listener = {
             let shared = Arc::clone(&shared);
@@ -141,29 +170,35 @@ impl Askpass {
         })
     }
 
-    /// Adds the variables that point commands at the helper, for one run.
+    /// Starts a run: adds the variables that point commands at the helper, with
+    /// the run's number, to `options`. The run lasts as long as the returned
+    /// [`RunInProgress`] does.
     ///
-    /// **Once per run, as it starts.** Each call begins a new run: helpers started
-    /// with the variables of an earlier call are no longer answered. Front ends
-    /// hand this to the session as a [`RunHook`] (see [`Askpass::hook`]) rather
-    /// than calling it themselves.
-    pub fn apply(&self, options: &mut ExecOptions) {
-        apply(&self.shared, options);
+    /// **Once per run, as it starts.** Each call begins a new run, which ends the
+    /// one before it. Front ends hand this to the session as a [`RunHook`] (see
+    /// [`Askpass::hook`]) rather than calling it themselves.
+    pub fn apply(&self, options: &mut ExecOptions) -> RunInProgress {
+        apply(&self.shared, options)
     }
 
     /// [`Askpass::apply`] as something a session can call for every run.
     pub fn hook(&self) -> RunHook {
         let shared = Arc::clone(&self.shared);
-        Arc::new(move |options| apply(&shared, options))
+        Arc::new(move |options| Box::new(apply(&shared, options)))
     }
 }
 
 /// Starts a new run and adds its variables to `options`.
-fn apply(shared: &Shared, options: &mut ExecOptions) {
-    let run = shared.current_run.fetch_add(1, Ordering::SeqCst) + 1;
+fn apply(shared: &Arc<Shared>, options: &mut ExecOptions) -> RunInProgress {
+    let run = shared.next_run.fetch_add(1, Ordering::SeqCst);
+    shared.current_run.store(run, Ordering::SeqCst);
     options
         .env
         .extend(environment(shared, run, |name| std::env::var_os(name)));
+    RunInProgress {
+        shared: Arc::clone(shared),
+        run,
+    }
 }
 
 /// The variables to add, given what the environment already has.
@@ -249,9 +284,10 @@ fn answer(mut stream: UnixStream, prompter: &Prompter, shared: &Shared) -> io::R
     let Some(message) = read_prompt(&mut stream)? else {
         return stream.write_all(REPLY_CANCEL);
     };
-    // A helper of another run -- one a finished cell left running in the
-    // background -- is refused without a word to the user. Answering it would put
-    // the question up under the cell that is running now, and send what the user
+    // A helper of any run but the one in progress -- one a finished cell left
+    // running in the background, asking during the next cell or between cells --
+    // is refused without a word to the user. Answering it would put the question
+    // up as the running cell's, or with no cell at all, and send what the user
     // types to a process they were not shown.
     let Some((run, prompt)) = split_run(&message) else {
         return stream.write_all(REPLY_CANCEL);
@@ -517,11 +553,11 @@ mod tests {
     use std::sync::mpsc;
 
     /// Starts a run, as a front end's session does before each command, and
-    /// returns its number.
-    fn start_run(askpass: &Askpass) -> u64 {
+    /// returns its number and the token that keeps it going.
+    fn start_run(askpass: &Askpass) -> (u64, RunInProgress) {
         let mut options = ExecOptions::new(std::env::temp_dir());
-        askpass.apply(&mut options);
-        askpass.shared.current_run.load(Ordering::SeqCst)
+        let run = askpass.apply(&mut options);
+        (run.run, run)
     }
 
     /// What the helper sends: the run, a newline, the prompt, the terminator.
@@ -555,7 +591,7 @@ mod tests {
         }))
         .unwrap();
 
-        let run = start_run(&askpass);
+        let (run, _run) = start_run(&askpass);
         let mut stream = helper(&askpass, run, "[sudo] password for me: ");
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).unwrap();
@@ -567,7 +603,7 @@ mod tests {
     #[test]
     fn a_declined_prompt_is_told_apart_from_an_empty_password() {
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
-        let run = start_run(&askpass);
+        let (run, _run) = start_run(&askpass);
         assert_eq!(reply_of(helper(&askpass, run, "Password:")), REPLY_CANCEL);
     }
 
@@ -592,16 +628,21 @@ mod tests {
         assert_eq!(reply_of(stream), REPLY_CANCEL);
         assert!(!asked.load(Ordering::SeqCst));
 
-        let first = start_run(&askpass);
+        let (first, first_run) = start_run(&askpass);
         assert_eq!(
             reply_of(helper(&askpass, first, "Password:")),
             b"OK\ns3cret"
         );
         asked.store(false, Ordering::SeqCst);
 
-        // The next cell starts. A process the first one left behind still has the
-        // first run's number, and is not the one the user is looking at.
-        let second = start_run(&askpass);
+        // The first cell's command ends. A process it left behind still has its
+        // number, and there is no cell to show a question under.
+        drop(first_run);
+        assert_eq!(reply_of(helper(&askpass, first, "Password:")), REPLY_CANCEL);
+        assert!(!asked.load(Ordering::SeqCst));
+
+        // The next cell starts. The leftover is not the one the user is looking at.
+        let (second, _second_run) = start_run(&askpass);
         assert_ne!(first, second);
         assert_eq!(reply_of(helper(&askpass, first, "Password:")), REPLY_CANCEL);
         assert!(!asked.load(Ordering::SeqCst));
@@ -612,10 +653,10 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_still_up_when_the_next_run_starts_is_given_up() {
+    fn a_prompt_still_up_when_its_run_ends_is_given_up() {
         // The run check on arrival cannot see a run that ends right after it. A
-        // question that is up when the next cell starts has to come down, or it
-        // is taken for the next cell's.
+        // question that is up when the run ends has to come down, or it is taken
+        // for the next cell's.
         let (asked_tx, asked_rx) = mpsc::channel();
         let asked_tx = Mutex::new(asked_tx);
         let askpass = Askpass::start(Box::new(move |_, gone| {
@@ -625,10 +666,10 @@ mod tests {
         }))
         .unwrap();
 
-        let run = start_run(&askpass);
+        let (run, in_progress) = start_run(&askpass);
         let stream = helper(&askpass, run, "Password:");
         asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        start_run(&askpass);
+        drop(in_progress);
         // The helper is still connected; only the run ending can have done this.
         assert_eq!(reply_of(stream), REPLY_CANCEL);
     }
@@ -649,10 +690,12 @@ mod tests {
         }))
         .unwrap();
 
-        let run = start_run(&askpass);
+        let (run, in_progress) = start_run(&askpass);
         let stream = helper(&askpass, run, "Password:");
         asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        start_run(&askpass);
+        // The next cell has started by the time the answer comes.
+        drop(in_progress);
+        let (_, _next) = start_run(&askpass);
         release_tx.send(()).unwrap();
         assert_eq!(reply_of(stream), REPLY_CANCEL);
     }
@@ -660,19 +703,28 @@ mod tests {
     #[test]
     fn the_hook_starts_a_run_like_apply_does() {
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
+        let current = || askpass.shared.current_run.load(Ordering::SeqCst);
         let hook = askpass.hook();
         let mut options = ExecOptions::new(std::env::temp_dir());
-        hook(&mut options);
-        let run = askpass.shared.current_run.load(Ordering::SeqCst);
-        assert_eq!(run, 1);
+        let first = hook(&mut options);
+        assert_eq!(current(), 1);
         let value = options
             .env
             .iter()
             .find(|(key, _)| key == RUN_VAR)
             .map(|(_, value)| value.to_string_lossy().into_owned());
         assert_eq!(value.as_deref(), Some("1"));
-        hook(&mut options);
-        assert_eq!(askpass.shared.current_run.load(Ordering::SeqCst), 2);
+        // Between runs there is no run.
+        drop(first);
+        assert_eq!(current(), 0);
+        // A token dropped late does not end the run that came after it.
+        let first = hook(&mut options);
+        let second = hook(&mut options);
+        assert_eq!(current(), 3);
+        drop(first);
+        assert_eq!(current(), 3);
+        drop(second);
+        assert_eq!(current(), 0);
     }
 
     #[test]
@@ -686,7 +738,7 @@ mod tests {
             })
         })
         .unwrap();
-        let run = start_run(&askpass);
+        let (run, _run) = start_run(&askpass);
         // The limit is on the whole message, run number included.
         let head = format!("{run}\n");
         let exchange = |length: usize| {
@@ -714,7 +766,7 @@ mod tests {
         })
         .unwrap();
         // No PROMPT_END: the helper died mid-sentence (or is not our helper).
-        let run = start_run(&askpass);
+        let (run, _run) = start_run(&askpass);
         let mut stream = UnixStream::connect(&askpass.shared.socket).unwrap();
         stream
             .write_all(format!("{run}\nPassword:").as_bytes())
@@ -800,7 +852,7 @@ mod tests {
         }))
         .unwrap();
 
-        let run = start_run(&askpass);
+        let (run, _run) = start_run(&askpass);
         let stream = helper(&askpass, run, "Password:");
         // Only once the question is up. A helper that closes before the listener
         // has accepted it is not a prompt that has to be given up; on macOS such
@@ -823,7 +875,7 @@ mod tests {
         .unwrap();
 
         // A helper that stays connected: only the drop can end the prompt.
-        let run = start_run(&askpass);
+        let (run, _run) = start_run(&askpass);
         let stream = helper(&askpass, run, "Password:");
         asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 

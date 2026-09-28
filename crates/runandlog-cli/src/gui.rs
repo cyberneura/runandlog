@@ -430,12 +430,12 @@ async fn execute(
     state: &State<'_, GuiState>,
     index: usize,
 ) -> Result<RunReport, String> {
-    let (command, options) = {
+    let (command, run) = {
         let session = state.session.lock().map_err(lock_error)?;
         if index >= session.len() {
             return Err(format!("There is no cell {}.", index + 1));
         }
-        (session.command_of(index), session.exec_options())
+        (session.command_of(index), session.start_run())
     };
 
     // One handle per run: a stopped cell must not leave the next one unable to start.
@@ -452,7 +452,7 @@ async fn execute(
     // window keeps reading the document while it does.
     let reporter = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        runandlog_core::run_streaming(&command, &options, &canceller, |chunk| {
+        let outcome = runandlog_core::run_streaming(&command, &run.options, &canceller, |chunk| {
             // Sent as the command prints rather than kept until it ends: a run that
             // takes minutes should show what it is doing while it does it.
             let _ = reporter.emit(
@@ -462,7 +462,10 @@ async fn execute(
                     text: crate::live::tail(chunk, MAX_OUTPUT_CHUNK_BYTES).to_string(),
                 },
             );
-        })
+        });
+        // The command is over; the write-back that follows is not part of the run.
+        drop(run);
+        outcome
     })
     .await
     .map_err(|error| format!("The worker thread died unexpectedly: {error}"))
