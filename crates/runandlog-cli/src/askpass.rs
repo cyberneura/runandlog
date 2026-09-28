@@ -260,15 +260,31 @@ impl Drop for Askpass {
 /// Creates a directory only this user can enter, for the socket and the helper.
 ///
 /// `create_dir` rather than `create_dir_all`, so that a directory someone else
-/// prepared under the same name is refused instead of adopted.
+/// prepared under the same name is refused instead of adopted. The name carries
+/// the process id, the clock and a serial number: the clock alone is not enough
+/// within one process (two [`Askpass`] started in the same tick -- the tests do
+/// that, and macOS ticks in microseconds), and a name that is taken all the same
+/// -- left by a process that had this id before -- is passed over for the next.
 fn private_dir() -> io::Result<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("runandlog-{}-{nanos:08x}", std::process::id()));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    Ok(dir)
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    const ATTEMPTS: u32 = 16;
+
+    let pid = std::process::id();
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+        let serial = SERIAL.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("runandlog-{pid}-{nanos:08x}-{serial}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("no free name for the askpass directory")))
 }
 
 /// Answers helpers one at a time until the [`Askpass`] is dropped.
@@ -808,6 +824,23 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         drop(askpass);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn askpasses_started_in_the_same_tick_get_directories_of_their_own() {
+        // The clock is not fine enough to tell them apart on every system: macOS
+        // ticks in microseconds, and this failed there once in CI.
+        let started: Vec<_> = (0..8)
+            .map(|_| thread::spawn(|| Askpass::start(Box::new(|_, _| None)).unwrap()))
+            .collect();
+        let askpasses: Vec<_> = started
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let mut dirs: Vec<_> = askpasses.iter().map(|a| a.dir.clone()).collect();
+        dirs.sort();
+        dirs.dedup();
+        assert_eq!(dirs.len(), askpasses.len());
     }
 
     #[test]
