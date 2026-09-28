@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -40,15 +40,17 @@ const LIVE_LIMIT: usize = 16 * 1024;
 /// Opens the TUI.
 pub fn run(mut session: Session) -> io::Result<()> {
     let (password_tx, password_rx) = mpsc::channel();
+    let password_queue = Arc::new(Mutex::new(PasswordQueue {
+        accepting: false,
+        requests: password_tx,
+    }));
     // Kept alive until the TUI closes: dropping it takes the socket away. A failure
     // to start leaves commands where they were before there was a helper -- asking
     // for a password fails at once -- which is no reason to refuse to open.
     #[cfg(unix)]
-    let _askpass = start_askpass(&mut session, password_tx);
-    #[cfg(not(unix))]
-    drop(password_tx);
+    let _askpass = start_askpass(&mut session, Arc::clone(&password_queue));
     let terminal = ratatui::init();
-    let result = App::new(session, password_rx).run(terminal);
+    let result = App::new(session, password_rx, password_queue).run(terminal);
     ratatui::restore();
     result
 }
@@ -74,20 +76,62 @@ impl PasswordPrompt {
     }
 }
 
-/// Starts the askpass helper, forwarding its prompts to the TUI over `requests`.
+/// Where the helper's requests go, and whether a run is taking them.
+///
+/// One lock for both, so that a request cannot land in the queue between the end
+/// of a run declining what is queued and the next run opening the queue again.
+/// The listener checks the run before it calls the prompter and lets go of its
+/// lock to do so; a request that passed that check just as the run ended would
+/// otherwise arrive after the drain and be shown under the next cell. (The GUI's
+/// `Passwords` has the same shape, for the same reason.)
+struct PasswordQueue {
+    accepting: bool,
+    requests: mpsc::Sender<PasswordRequest>,
+}
+
+impl PasswordQueue {
+    fn lock(queue: &Mutex<PasswordQueue>) -> MutexGuard<'_, PasswordQueue> {
+        // A poisoned lock holds a usable queue all the same.
+        queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hands a request to the TUI. `None` when no run is taking requests, when
+    /// the request's own run is over (`gone`), or when the TUI has closed.
+    ///
+    /// `gone` is asked under the lock. Being open is not enough: the queue may
+    /// have been closed for the request's run and opened again for the next one
+    /// while the request was on its way, and then it is the next run's queue that
+    /// is open. `gone` tells the runs apart -- it is true once the request's run
+    /// has ended -- and nothing can end or start a run's queue while it is asked.
+    fn submit(
+        queue: &Mutex<PasswordQueue>,
+        request: PasswordRequest,
+        gone: &dyn Fn() -> bool,
+    ) -> Option<()> {
+        let queue = Self::lock(queue);
+        if !queue.accepting || gone() {
+            return None;
+        }
+        queue.requests.send(request).ok()
+    }
+}
+
+/// Starts the askpass helper, forwarding its prompts to the TUI through `queue`.
 #[cfg(unix)]
 fn start_askpass(
     session: &mut Session,
-    requests: mpsc::Sender<PasswordRequest>,
+    queue: Arc<Mutex<PasswordQueue>>,
 ) -> Option<crate::askpass::Askpass> {
     let askpass = crate::askpass::Askpass::start(Box::new(move |prompt, gone| {
         let (reply, answer) = mpsc::channel();
-        requests
-            .send(PasswordRequest {
+        PasswordQueue::submit(
+            &queue,
+            PasswordRequest {
                 prompt: prompt.to_string(),
                 reply,
-            })
-            .ok()?;
+            },
+            gone,
+        )?;
         // A dropped sender -- the TUI closed, or the run ended with the prompt up --
         // is a decline.
         crate::askpass::wait_for_answer(&answer, gone)
@@ -99,13 +143,12 @@ fn start_askpass(
 
 /// Declines the prompt on screen and every request still queued behind it.
 ///
-/// For the end of a run. They all belong to the run that has just ended -- the
-/// listener stopped taking its requests when the run token was dropped, so none
-/// arrive after this -- but a request that arrived before the last tick is still
-/// in the queue, and the next tick would put it up under the next cell as though
-/// that cell had asked (in a "run all", the next cell starts at once). The run
-/// token keeps the answer from reaching the old helper; this keeps the question
-/// from being shown.
+/// For the end of a run, **with the [`PasswordQueue`] locked and closed**: they all
+/// belong to the run that has just ended, but a request that arrived after the
+/// last tick is still in the queue, and the next tick would put it up under the
+/// next cell as though that cell had asked (in a "run all", the next cell starts
+/// at once). The run token keeps the answer from reaching the old helper; this
+/// keeps the question from being shown.
 fn decline_prompts(shown: &mut Option<PasswordPrompt>, queued: &mpsc::Receiver<PasswordRequest>) {
     if let Some(prompt) = shown.take() {
         prompt.answer(None);
@@ -254,6 +297,9 @@ struct App {
     live: LiveOutput,
     /// Prompts for a password from the askpass helper.
     password_requests: mpsc::Receiver<PasswordRequest>,
+    /// The helper's way in to `password_requests`, opened for each run and closed
+    /// after it.
+    password_queue: Arc<Mutex<PasswordQueue>>,
     /// The password prompt on screen, if a command is asking for one.
     password: Option<PasswordPrompt>,
     /// Cells run since the file was opened, and whether each one succeeded.
@@ -265,7 +311,11 @@ struct App {
 }
 
 impl App {
-    fn new(session: Session, password_requests: mpsc::Receiver<PasswordRequest>) -> App {
+    fn new(
+        session: Session,
+        password_requests: mpsc::Receiver<PasswordRequest>,
+        password_queue: Arc<Mutex<PasswordQueue>>,
+    ) -> App {
         let status = if session.is_empty() {
             "No runnable cells. Press q to quit.".to_string()
         } else {
@@ -280,6 +330,7 @@ impl App {
             running: None,
             live: LiveOutput::new(LIVE_LIMIT),
             password_requests,
+            password_queue,
             password: None,
             finished: HashMap::new(),
             quit: false,
@@ -546,6 +597,9 @@ impl App {
     /// The return value tells a "run all" batch whether it may continue.
     fn execute(&mut self, index: usize, terminal: &mut DefaultTerminal) -> io::Result<Batch> {
         let command = self.session.command_of(index);
+        // Open before the run starts: the helper's first request can come as soon as
+        // the command does.
+        PasswordQueue::lock(&self.password_queue).accepting = true;
         let run = self.session.start_run();
         // One per run: a cancelled cell must not leave the next one unable to start.
         let canceller = Canceller::new();
@@ -573,7 +627,13 @@ impl App {
         // one being run rather than looking untouched until the first tick.
         self.running = Some((index, 0));
         let outcome = self.wait_for(index, rx, output_rx, terminal, &canceller);
-        decline_prompts(&mut self.password, &self.password_requests);
+        {
+            // Closed and drained under the one lock, so that nothing of this run
+            // can be queued after the drain.
+            let mut queue = PasswordQueue::lock(&self.password_queue);
+            queue.accepting = false;
+            decline_prompts(&mut self.password, &self.password_requests);
+        }
         self.running = None;
         self.live.clear();
         match outcome {
@@ -732,6 +792,38 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn requests_are_taken_only_while_a_run_is() {
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let queue = Mutex::new(PasswordQueue {
+            accepting: false,
+            requests: requests_tx,
+        });
+        let ask = || {
+            let (reply, _answer) = mpsc::channel();
+            PasswordRequest {
+                prompt: "Password:".to_string(),
+                reply,
+            }
+        };
+        let alive = || false;
+        // Between runs: refused, and nothing queued.
+        assert_eq!(PasswordQueue::submit(&queue, ask(), &alive), None);
+        assert!(requests_rx.try_recv().is_err());
+        // During a run: queued.
+        PasswordQueue::lock(&queue).accepting = true;
+        assert_eq!(PasswordQueue::submit(&queue, ask(), &alive), Some(()));
+        assert!(requests_rx.try_recv().is_ok());
+        // Still during a run, but the request's own run is over: it was on its
+        // way while the queue was closed for its run and opened for the next.
+        assert_eq!(PasswordQueue::submit(&queue, ask(), &|| true), None);
+        assert!(requests_rx.try_recv().is_err());
+        // After the run: refused again.
+        PasswordQueue::lock(&queue).accepting = false;
+        assert_eq!(PasswordQueue::submit(&queue, ask(), &alive), None);
+        assert!(requests_rx.try_recv().is_err());
     }
 
     #[test]

@@ -207,11 +207,19 @@ impl GuiState {
     }
 
     /// Registers a request for a password, returning its id and where the answer
-    /// will arrive. `None` when no command is running to have asked, or the window
-    /// cannot show the question.
-    fn request_password(&self) -> Option<(u64, mpsc::Receiver<Option<String>>)> {
+    /// will arrive. `None` when no command is running to have asked, when the
+    /// request's own run is over (`gone`), or when the window cannot show the
+    /// question.
+    ///
+    /// `gone` is asked under the lock: `accepting` may have been cleared for the
+    /// request's run and set again for the next one while the request was on its
+    /// way, and it is `gone` that tells the two runs apart.
+    fn request_password(
+        &self,
+        gone: &dyn Fn() -> bool,
+    ) -> Option<(u64, mpsc::Receiver<Option<String>>)> {
         let mut passwords = self.passwords();
-        if !passwords.window_listens || !passwords.accepting {
+        if !passwords.window_listens || !passwords.accepting || gone() {
             // Outside a run it is a leftover from a command already written back -- a
             // background process it started, say -- with no cell to show it against.
             return None;
@@ -221,6 +229,25 @@ impl GuiState {
         let (reply, answer) = mpsc::channel();
         passwords.pending.insert(id, reply);
         Some((id, answer))
+    }
+
+    /// Puts a registered request to the window with `show`, unless the request
+    /// has been abandoned since it was registered. Reports whether it was shown.
+    ///
+    /// Under the lock, so that abandoning a run's requests and showing one of them
+    /// cannot cross: a request registered just before its run ended would
+    /// otherwise come up under the next cell. A `show` that fails drops the
+    /// request, which the helper reads as a decline.
+    fn show_password_request(&self, id: u64, show: impl FnOnce() -> bool) -> bool {
+        let mut passwords = self.passwords();
+        if !passwords.pending.contains_key(&id) {
+            return false;
+        }
+        if show() {
+            return true;
+        }
+        passwords.pending.remove(&id);
+        false
     }
 
     /// Answers a request. Reports whether it was still waiting.
@@ -573,14 +600,14 @@ fn start_askpass(app: &AppHandle) {
     let handle = app.clone();
     let prompter = Box::new(move |prompt: &str, gone: &dyn Fn() -> bool| {
         let state = handle.state::<GuiState>();
-        let (id, answer) = state.request_password()?;
+        let (id, answer) = state.request_password(gone)?;
         let request = PasswordRequest {
             id,
             prompt: prompt.to_string(),
         };
-        if handle.emit(EVENT_PASSWORD, request).is_err() {
-            state.answer_password(id, None);
-        }
+        // Not shown when the run ended in between; the wait below then finds the
+        // sender dropped and declines at once.
+        state.show_password_request(id, || handle.emit(EVENT_PASSWORD, request).is_ok());
         // A dropped sender -- the run ended with the prompt up -- is a decline.
         crate::askpass::wait_for_answer(&answer, gone)
     });
@@ -723,10 +750,14 @@ mod tests {
         let state = state(&dir);
         state.passwords().window_listens = true;
         // Nothing is running: there is no cell to show the prompt against.
-        assert!(state.request_password().is_none());
+        assert!(state.request_password(&|| false).is_none());
 
         state.accept_passwords();
-        let (id, answer) = state.request_password().unwrap();
+        // A request whose own run is over is refused even while requests are
+        // being taken: the run it belongs to is not the one they are taken for.
+        assert!(state.request_password(&|| true).is_none());
+        let (id, answer) = state.request_password(&|| false).unwrap();
+        assert!(state.show_password_request(id, || true));
         assert!(state.answer_password(id, Some("s3cret".to_string())));
         assert_eq!(answer.recv().unwrap(), Some("s3cret".to_string()));
         // Answered once; a second answer has nowhere to go.
@@ -739,14 +770,30 @@ mod tests {
         let state = state(&dir);
         state.passwords().window_listens = true;
         state.accept_passwords();
-        let (id, answer) = state.request_password().unwrap();
+        let (id, answer) = state.request_password(&|| false).unwrap();
         state.abandon_passwords();
+        // Registered just before the run ended: not shown, since nobody is running
+        // to have asked, and the window must not put it under the next cell.
+        assert!(!state.show_password_request(id, || unreachable!("shown after abandon")));
         // The helper sees the dropped sender and tells its command "no password".
         assert!(answer.recv().is_err());
         // And an answer typed after that goes nowhere.
         assert!(!state.answer_password(id, Some("late".to_string())));
         // Nor can anything ask again until the next command starts.
-        assert!(state.request_password().is_none());
+        assert!(state.request_password(&|| false).is_none());
+    }
+
+    #[test]
+    fn a_request_the_window_cannot_be_shown_is_declined() {
+        // A window that cannot be reached is a decline, not a wait.
+        let dir = TempDir::new();
+        let state = state(&dir);
+        state.passwords().window_listens = true;
+        state.accept_passwords();
+        let (id, answer) = state.request_password(&|| false).unwrap();
+        assert!(!state.show_password_request(id, || false));
+        assert!(answer.recv().is_err());
+        assert!(!state.answer_password(id, Some("late".to_string())));
     }
 
     #[test]
@@ -756,7 +803,7 @@ mod tests {
         let dir = TempDir::new();
         let state = state(&dir);
         state.accept_passwords();
-        assert!(state.request_password().is_none());
+        assert!(state.request_password(&|| false).is_none());
     }
 
     #[test]

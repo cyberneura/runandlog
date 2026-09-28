@@ -152,7 +152,17 @@ public リポジトリなので、**README・コードコメント・UI 文字�
     **TUI は表示中のプロンプトだけでなく `password_requests` のキューに残った要求も断る**
     (Codex レビュー指摘)。最後の tick の後に届いた要求はキューに残り、run all では次のセルが
     即座に始まるので、次の tick がそれを次のセルの質問として表示してしまう
-    (トークンのおかげで入力は古いヘルパーに届かないが、表示が嘘になる)。GUI の
+    (トークンのおかげで入力は古いヘルパーに届かないが、表示が嘘になる)。
+    **TUI も GUI と同じく受付可否 (`PasswordQueue::accepting`) を送信と同じロックで持つ**
+    (Codex レビュー指摘)。listener は実行の照合をしてからロックを離して prompter を呼ぶので、
+    照合の直後に実行が終わるとドレインの後にキューへ積まれうる。実行の終了は「ロックを取って
+    閉じてからドレイン」、開始は `start_run()` の前に開く。
+    **登録時にはそのロックの下で `gone()` も見る** (TUI の `PasswordQueue::submit`、GUI の
+    `request_password`。Codex CLI 指摘)。「開いている」だけでは足りない — 要求が届く間に
+    自分の実行のキューが閉じられ次の実行のために開き直されていることがあり、開いているのは
+    次の実行のキュー。`gone()` は自分の実行が終わっていれば真になるので、それで区別する。
+    GUI はさらに **`emit` も同じロックの下で行う** (`show_password_request`)。登録と表示の間に
+    `abandon_passwords` が走ると、登録は消えているのにダイアログだけ次のセルの下に出るため。GUI の
     フロントは `finished` と `runCell` / `runAll` の finally でダイアログを閉じる。
     GUI は要求に id を振り、終わった要求への遅れた答えが次の要求に当たらないようにしている。
   - **要求には実行番号が付き、進行中の実行のものしか答えない** (Codex レビュー指摘 2 件)。
@@ -471,7 +481,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 155 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 157 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
