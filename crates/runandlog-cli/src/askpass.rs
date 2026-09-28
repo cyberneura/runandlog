@@ -39,17 +39,19 @@ const SOCKET_VAR: &str = "RUNANDLOG_ASKPASS_SOCKET";
 /// One the user has already set is left alone: an askpass they chose -- a graphical
 /// one, say -- is a better answer than ours.
 const HELPER_VARS: [&str; 3] = ["SUDO_ASKPASS", "SSH_ASKPASS", "GIT_ASKPASS"];
-/// Longest prompt accepted from the helper. Prompts are a line of text; anything
-/// longer is not one.
+/// Longest prompt accepted from the helper. Prompts are a few lines of text at
+/// most; anything longer is not one.
 const MAX_PROMPT_BYTES: usize = 4096;
 /// How long the helper may take to send its prompt once connected.
 const PROMPT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ends the prompt on the wire. The helper keeps its side of the connection open
+/// after it -- that is how the listener knows it is still there (see `answer`) --
+/// so something other than end-of-file has to say where the prompt stops. Prompts
+/// are text, which never contains a NUL.
+const PROMPT_END: u8 = 0;
 /// Reply prefixes. The answer follows `OK` on the same connection.
 const REPLY_OK: &[u8] = b"OK\n";
 const REPLY_CANCEL: &[u8] = b"CANCEL\n";
-/// Written to the helper while the user is being asked, to find out whether it is
-/// still there. The helper skips these before reading the reply.
-const HEARTBEAT: u8 = 0;
 /// How often a prompter checks whether its answer is still wanted.
 pub const PROMPT_POLL: Duration = Duration::from_millis(100);
 
@@ -128,14 +130,16 @@ impl Askpass {
                 continue;
             }
             env.push((name.into(), self.helper.clone().into_os_string()));
-            if name == "SSH_ASKPASS" && current("SSH_ASKPASS_REQUIRE").is_none() {
-                // Left to itself, ssh only turns to the helper when it also sees a
-                // display, which macOS and an SSH session do not have -- and `prefer`
-                // keeps that condition (readpass.c). `force` drops it. The command has
-                // no terminal for ssh to use instead, so nothing else changes.
-                env.push(("SSH_ASKPASS_REQUIRE".into(), "force".into()));
-            }
         }
+        // Whichever askpass ssh ends up with -- ours or the user's -- it is only
+        // ever going to be used if ssh is told to. Left to itself, or with `prefer`,
+        // ssh turns to the askpass only when it also sees a display (readpass.c),
+        // which macOS and an SSH session do not have; `never` rules it out. The
+        // command has no terminal for ssh to fall back on, so with anything but
+        // `force` nobody gets asked at all. Set regardless of what was inherited:
+        // a value set for interactive shells, where a terminal exists, does not
+        // carry the same meaning here.
+        env.push(("SSH_ASKPASS_REQUIRE".into(), "force".into()));
         env
     }
 }
@@ -190,19 +194,17 @@ fn serve(listener: UnixListener, closing: &AtomicBool, prompter: Prompter) {
 /// Reads one prompt and writes back the user's answer.
 fn answer(mut stream: UnixStream, prompter: &Prompter, closing: &AtomicBool) -> io::Result<()> {
     stream.set_read_timeout(Some(PROMPT_READ_TIMEOUT))?;
-    // A helper that stopped reading must not be able to hold the prompt up.
+    // A helper that stopped reading must not be able to hold the reply up.
     stream.set_write_timeout(Some(PROMPT_POLL))?;
-    let mut prompt = Vec::new();
-    (&mut stream)
-        .take(MAX_PROMPT_BYTES as u64 + 1)
-        .read_to_end(&mut prompt)?;
-    if prompt.len() > MAX_PROMPT_BYTES {
+    let Some(prompt) = read_prompt(&mut stream)? else {
         return stream.write_all(REPLY_CANCEL);
-    }
+    };
     let prompt = String::from_utf8_lossy(&prompt);
-    // Writing is the portable way to learn that the other end has gone: it fails
-    // with EPIPE once the helper is dead (SIGPIPE is ignored in Rust programs).
-    let gone = || closing.load(Ordering::SeqCst) || (&stream).write_all(&[HEARTBEAT]).is_err();
+    // The helper sends nothing after the prompt and keeps the connection open, so
+    // end-of-file on it means the helper has gone. Reading is the check that works
+    // the same everywhere: a write to a dead peer fails with EPIPE on Linux, but
+    // macOS lets it succeed while there is buffer space, which it always is.
+    let gone = || closing.load(Ordering::SeqCst) || peer_has_gone(&stream);
     match prompter(prompt.trim_end(), &gone) {
         Some(secret) => {
             stream.write_all(REPLY_OK)?;
@@ -210,6 +212,47 @@ fn answer(mut stream: UnixStream, prompter: &Prompter, closing: &AtomicBool) -> 
         }
         None => stream.write_all(REPLY_CANCEL),
     }
+}
+
+/// Reads up to the [`PROMPT_END`]. `None` when the helper went away first, or sent
+/// more than a prompt.
+fn read_prompt(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+    let mut prompt = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let end = chunk[..read].iter().position(|&byte| byte == PROMPT_END);
+        prompt.extend_from_slice(&chunk[..end.unwrap_or(read)]);
+        if prompt.len() > MAX_PROMPT_BYTES {
+            return Ok(None);
+        }
+        if end.is_some() {
+            return Ok(Some(prompt));
+        }
+    }
+}
+
+/// Whether the helper on the other end of `stream` has closed it, without waiting
+/// for it to say anything (it never does, once the prompt is sent).
+fn peer_has_gone(stream: &UnixStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    let gone = match (&*stream).read(&mut byte) {
+        // End-of-file: the helper closed or died.
+        Ok(0) => true,
+        // Nothing to read is what a live helper looks like; a stray byte is odd but
+        // not a departure.
+        Ok(_) => false,
+        Err(error) => error.kind() != io::ErrorKind::WouldBlock,
+    };
+    // Put back, or the reply write below would fail with WouldBlock instead of
+    // waiting its allotted time.
+    gone || stream.set_nonblocking(false).is_err()
 }
 
 /// A prompter that asks on the terminal runandlog was started from, with the
@@ -373,14 +416,13 @@ fn ask(prompt: &str) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other(format!("{SOCKET_VAR} is not set")))?;
     let mut stream = UnixStream::connect(socket)?;
     stream.write_all(prompt.as_bytes())?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    stream.write_all(&[PROMPT_END])?;
+    // The write side stays open on purpose: the listener reads end-of-file on it
+    // as "the helper has gone" and drops the prompt. The listener closes its end
+    // once it has answered, which is what ends the read below.
     let mut reply = Vec::new();
     stream.read_to_end(&mut reply)?;
-    let start = reply
-        .iter()
-        .position(|&byte| byte != HEARTBEAT)
-        .unwrap_or(reply.len());
-    match reply[start..].strip_prefix(REPLY_OK) {
+    match reply.strip_prefix(REPLY_OK) {
         Some(secret) => Ok(Some(String::from_utf8_lossy(secret).into_owned())),
         None => Ok(None),
     }
@@ -403,8 +445,7 @@ mod tests {
         .unwrap();
 
         let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"[sudo] password for me: ").unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        stream.write_all(b"[sudo] password for me: \0").unwrap();
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).unwrap();
 
@@ -416,10 +457,59 @@ mod tests {
     fn a_declined_prompt_is_told_apart_from_an_empty_password() {
         let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
         let mut stream = UnixStream::connect(&askpass.socket).unwrap();
+        stream.write_all(b"Password:\0").unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).unwrap();
+        assert_eq!(reply, REPLY_CANCEL);
+    }
+
+    #[test]
+    fn a_prompt_longer_than_a_prompt_can_be_is_refused() {
+        let asked = Arc::new(AtomicBool::new(false));
+        let askpass = Askpass::start({
+            let asked = Arc::clone(&asked);
+            Box::new(move |_, _| {
+                asked.store(true, Ordering::SeqCst);
+                Some("never sent".to_string())
+            })
+        })
+        .unwrap();
+        let exchange = |length: usize| {
+            let mut stream = UnixStream::connect(&askpass.socket).unwrap();
+            stream.write_all(&vec![b'x'; length]).unwrap();
+            stream.write_all(&[PROMPT_END]).unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).unwrap();
+            reply
+        };
+        // The longest prompt allowed, and one byte more. The limit has to hold
+        // wherever the reads happen to split, so the extra byte arrives in the
+        // same chunk as the terminator.
+        assert_eq!(exchange(MAX_PROMPT_BYTES), b"OK\nnever sent");
+        asked.store(false, Ordering::SeqCst);
+        assert_eq!(exchange(MAX_PROMPT_BYTES + 1), REPLY_CANCEL);
+        assert!(!asked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_helper_that_leaves_before_finishing_its_prompt_is_not_asked_for() {
+        let asked = Arc::new(AtomicBool::new(false));
+        let askpass = Askpass::start({
+            let asked = Arc::clone(&asked);
+            Box::new(move |_, _| {
+                asked.store(true, Ordering::SeqCst);
+                None
+            })
+        })
+        .unwrap();
+        // No PROMPT_END: the helper died mid-sentence (or is not our helper).
+        let mut stream = UnixStream::connect(&askpass.socket).unwrap();
+        stream.write_all(b"Password:").unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).unwrap();
         assert_eq!(reply, REPLY_CANCEL);
+        assert!(!asked.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -452,6 +542,25 @@ mod tests {
     }
 
     #[test]
+    fn ssh_is_made_to_use_the_askpass_whichever_one_it_is() {
+        // The user's own SSH_ASKPASS is kept, but without `force` ssh would not
+        // call it either: there is no display here, and no terminal.
+        let askpass = Askpass::start(Box::new(|_, _| None)).unwrap();
+        let env = askpass.environment(|name| match name {
+            "SSH_ASKPASS" => Some(OsString::from("/usr/bin/my-askpass")),
+            "SSH_ASKPASS_REQUIRE" => Some(OsString::from("prefer")),
+            _ => None,
+        });
+        let value = |wanted: &str| {
+            env.iter()
+                .find(|(key, _)| key == wanted)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(value("SSH_ASKPASS"), None);
+        assert_eq!(value("SSH_ASKPASS_REQUIRE").as_deref(), Some("force"));
+    }
+
+    #[test]
     fn a_prompt_is_given_up_once_the_helper_has_gone() {
         // The command that asked can end with the question still up -- a timeout
         // kills it, say. The prompt has to notice, or the terminal prompt keeps the
@@ -472,8 +581,7 @@ mod tests {
         .unwrap();
 
         let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"Password:").unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        stream.write_all(b"Password:\0").unwrap();
         drop(stream);
 
         assert!(gave_up_rx.recv_timeout(Duration::from_secs(5)).is_ok());
@@ -492,8 +600,7 @@ mod tests {
 
         // A helper that stays connected: only the drop can end the prompt.
         let mut stream = UnixStream::connect(&askpass.socket).unwrap();
-        stream.write_all(b"Password:").unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        stream.write_all(b"Password:\0").unwrap();
         asked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let started = std::time::Instant::now();
@@ -501,8 +608,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).unwrap();
-        let start = reply.iter().position(|&byte| byte != HEARTBEAT).unwrap();
-        assert_eq!(&reply[start..], REPLY_CANCEL);
+        assert_eq!(reply, REPLY_CANCEL);
     }
 
     #[test]

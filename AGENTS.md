@@ -122,11 +122,13 @@ public リポジトリなので、**README・コードコメント・UI 文字�
   argv[0] のファイル名を見て振り分ける (ヘルパーに渡るのはプロンプトで Markdown ではない)。
   ヘルパーは同じディレクトリの Unix ソケットへプロンプトを送り、起動元の runandlog が
   フロント (非対話 = `/dev/tty` に echo off で、TUI = ステータス行、GUI = ダイアログ) で聞いて返す。
-  - 設定する変数は `SUDO_ASKPASS` / `SSH_ASKPASS` (+ `SSH_ASKPASS_REQUIRE=force`) /
-    `GIT_ASKPASS` と、ソケットの場所の `RUNANDLOG_ASKPASS_SOCKET`。**利用者が既に
-    設定している askpass は上書きしない。**
-    **ssh は `force` でなければならない** (Codex レビュー指摘、`readpass.c` で確認)。
-    `prefer` は「ディスプレイがあれば」の条件を残すので、macOS と SSH 越しでは効かない。
+  - 設定する変数は `SUDO_ASKPASS` / `SSH_ASKPASS` / `GIT_ASKPASS` と、ソケットの場所の
+    `RUNANDLOG_ASKPASS_SOCKET`。**利用者が既に設定している askpass は上書きしない。**
+    **`SSH_ASKPASS_REQUIRE=force` だけは利用者の askpass の有無・既存の値に関わらず常に
+    付ける** (Codex レビュー指摘 2 件、`readpass.c` で確認)。`prefer` は「ディスプレイが
+    あれば」の条件を残すので macOS と SSH 越しでは効かず、`never` は端末の無いコマンドでは
+    「誰にも聞けない」にしかならない。利用者の askpass を残す時も `force` が無ければ
+    ssh はそれを呼ばない。
   - **sudo は `DISPLAY` / `WAYLAND_DISPLAY` が無いと `-A` 無しではヘルパーを使わない**
     (sudo の `tgetpass.c`)。macOS と SSH 越しでは `sudo -A` と書いてもらうしかない。
     `DISPLAY` を偽装すると X に繋ぎに行くプログラムを壊すのでやらない。
@@ -134,8 +136,10 @@ public リポジトリなので、**README・コードコメント・UI 文字�
     「askpass が失敗した」になり、本当の原因 (端末も askpass も無い) が読めなくなる。
   - **プロンプトは `gone` を `PROMPT_POLL` (100ms) ごとに見て、真になったら諦める**
     (`Prompter` の第 2 引数)。`gone` は「ヘルパーが消えた (コマンドの終了・タイムアウト・
-    Stop)」か「`Askpass` の drop 中」。ヘルパーの生死はソケットへ心拍 (NUL 1 バイト) を
-    書いて EPIPE で知る (ヘルパーは応答の先頭の NUL を読み飛ばす)。非対話実行はこれに
+    Stop)」か「`Askpass` の drop 中」。ヘルパーの生死は**ソケットの読み取りで EOF になるか**で
+    知る。そのためヘルパーはプロンプトを NUL で終端して送り、**書き込み側を閉じずに**答えを
+    待つ (listener は NUL まで読む)。心拍を書いて EPIPE を見る方式は macOS で効かない
+    (相手が閉じた後も write が成功し続け、CI の macOS 脚だけ落ちた)。非対話実行はこれに
     `interrupt_requested` (Ctrl-C) を足す。
   - **`Askpass` の drop はプロンプトの終了を待つ** (Codex レビュー指摘)。端末プロンプトは
     戻るまで echo を切っているので、待たずにプロセスが終わると利用者の端末が echo off の
@@ -441,7 +445,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 146 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 149 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
