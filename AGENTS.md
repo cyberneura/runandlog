@@ -147,8 +147,12 @@ public リポジトリなので、**README・コードコメント・UI 文字�
     既知の穴: プロンプト中に Ctrl-C を 100ms 以内に 2 回押すと、2 回目の `_exit` が
     復元より先に走りうる (シグナルハンドラで termios を戻す仕組みは入れていない)。
   - **プロンプトは 1 度に 1 つ** (ソケットの accept を直列に処理する)。フロントは 1 つしか出せない。
-  - **コマンドが終わったら出ているプロンプトは捨てる** (TUI は `password.take()`、GUI は
-    `abandon_passwords`)。sender を drop すると helper 側は「断られた」になる。GUI の
+  - **コマンドが終わったら出ているプロンプトは捨てる** (TUI は `decline_prompts`、GUI は
+    `abandon_passwords`)。sender を drop すると helper 側は「断られた」になる。
+    **TUI は表示中のプロンプトだけでなく `password_requests` のキューに残った要求も断る**
+    (Codex レビュー指摘)。最後の tick の後に届いた要求はキューに残り、run all では次のセルが
+    即座に始まるので、次の tick がそれを次のセルの質問として表示してしまう
+    (トークンのおかげで入力は古いヘルパーに届かないが、表示が嘘になる)。GUI の
     フロントは `finished` と `runCell` / `runAll` の finally でダイアログを閉じる。
     GUI は要求に id を振り、終わった要求への遅れた答えが次の要求に当たらないようにしている。
   - **要求には実行番号が付き、進行中の実行のものしか答えない** (Codex レビュー指摘 2 件)。
@@ -467,7 +471,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 154 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 155 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check

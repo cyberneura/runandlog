@@ -97,6 +97,25 @@ fn start_askpass(
     Some(askpass)
 }
 
+/// Declines the prompt on screen and every request still queued behind it.
+///
+/// For the end of a run. They all belong to the run that has just ended -- the
+/// listener stopped taking its requests when the run token was dropped, so none
+/// arrive after this -- but a request that arrived before the last tick is still
+/// in the queue, and the next tick would put it up under the next cell as though
+/// that cell had asked (in a "run all", the next cell starts at once). The run
+/// token keeps the answer from reaching the old helper; this keeps the question
+/// from being shown.
+fn decline_prompts(shown: &mut Option<PasswordPrompt>, queued: &mpsc::Receiver<PasswordRequest>) {
+    if let Some(prompt) = shown.take() {
+        prompt.answer(None);
+    }
+    while let Ok(request) = queued.try_recv() {
+        // The helper may be gone already; then there is nobody left to tell.
+        let _ = request.reply.send(None);
+    }
+}
+
 /// What a key does to the password prompt.
 #[derive(Debug, PartialEq, Eq)]
 enum PromptKey {
@@ -554,11 +573,7 @@ impl App {
         // one being run rather than looking untouched until the first tick.
         self.running = Some((index, 0));
         let outcome = self.wait_for(index, rx, output_rx, terminal, &canceller);
-        // A prompt still up belongs to a command that has ended: its helper is gone
-        // with it.
-        if let Some(prompt) = self.password.take() {
-            prompt.answer(None);
-        }
+        decline_prompts(&mut self.password, &self.password_requests);
         self.running = None;
         self.live.clear();
         match outcome {
@@ -717,6 +732,39 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn the_end_of_a_run_declines_the_prompt_shown_and_the_ones_still_queued() {
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let ask = |prompt: &str| {
+            let (reply, answer) = mpsc::channel();
+            (
+                PasswordRequest {
+                    prompt: prompt.to_string(),
+                    reply,
+                },
+                answer,
+            )
+        };
+        let (shown, shown_answer) = ask("shown");
+        let mut shown = Some(PasswordPrompt {
+            request: shown,
+            typed: "half-typ".to_string(),
+        });
+        // Arrived after the last tick: never shown, still in the queue.
+        let (queued, queued_answer) = ask("queued");
+        requests_tx.send(queued).unwrap();
+        let (later, later_answer) = ask("later");
+        requests_tx.send(later).unwrap();
+
+        decline_prompts(&mut shown, &requests_rx);
+
+        assert!(shown.is_none());
+        assert_eq!(shown_answer.try_recv(), Ok(None));
+        assert_eq!(queued_answer.try_recv(), Ok(None));
+        assert_eq!(later_answer.try_recv(), Ok(None));
+        assert!(requests_rx.try_recv().is_err());
     }
 
     #[test]
