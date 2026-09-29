@@ -168,7 +168,8 @@ impl<'a> Lexer<'a> {
             match c {
                 '\n' => {
                     self.push(TokenKind::Plain, 1);
-                    self.command_expected = true;
+                    // A newline inside arithmetic is only whitespace.
+                    self.command_expected = !self.in_arithmetic();
                     self.redirect_target = false;
                     self.read_heredoc_bodies();
                 }
@@ -218,8 +219,9 @@ impl<'a> Lexer<'a> {
         let op = &self.rest()[..len];
         self.push(TokenKind::Operator, len);
         self.redirect_target = false;
-        if self.in_case_pattern() {
+        if self.in_case_pattern() && !matches!(op, "<(" | ">(") {
             // `a|b)` and the optional `(` of `(a)`: all part of the pattern.
+            // A process substitution opens as anywhere else, below.
             if op == ")" {
                 self.set_case_pattern(false);
                 self.command_expected = true;
@@ -235,9 +237,7 @@ impl<'a> Lexer<'a> {
             // Process substitution: a command inside, an argument outside.
             "<(" | ">(" => self.open(Closer::Paren, self.command_expected, false),
             // Grouping inside arithmetic stays arithmetic.
-            "(" if self.nesting.last().is_some_and(|n| n.arithmetic) => {
-                self.open(Closer::Paren, false, true)
-            }
+            "(" if self.in_arithmetic() => self.open(Closer::Paren, false, true),
             // `((`: an arithmetic command, closed by `))`.
             "(" if self.rest().starts_with('(') => {
                 self.push(TokenKind::Operator, 1);
@@ -249,13 +249,17 @@ impl<'a> Lexer<'a> {
             ")" => self.close(Closer::Paren),
             _ if op.contains(['<', '>']) => self.redirect_target = true,
             // `;` separates the clauses of `for ((i = 0; i < n; i++))`.
-            _ if self.nesting.last().is_some_and(|n| n.arithmetic) => {}
+            _ if self.in_arithmetic() => {}
             _ => {
                 // `|`, `&&`, `;` and the rest start a new command.
                 self.command_expected = true;
                 self.after_for_or_case = Stage::None;
             }
         }
+    }
+
+    fn in_arithmetic(&self) -> bool {
+        self.nesting.last().is_some_and(|n| n.arithmetic)
     }
 
     fn in_case_pattern(&self) -> bool {
@@ -1105,6 +1109,36 @@ mod tests {
                 (Command, "echo"),
                 (Operator, ";;"),
                 (Keyword, "esac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_process_substitution_in_a_case_pattern_does_not_end_it() {
+        assert_eq!(
+            coloured("case x in <(printf x)) echo yes;; esac"),
+            vec![
+                (Keyword, "case"),
+                (Keyword, "in"),
+                (Operator, "<("),
+                (Command, "printf"),
+                (Operator, "))"),
+                (Command, "echo"),
+                (Operator, ";;"),
+                (Keyword, "esac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newline_inside_arithmetic_is_not_a_new_command() {
+        assert_eq!(
+            coloured("echo $((1 +\n total)) x\nls"),
+            vec![
+                (Command, "echo"),
+                (Variable, "$(("),
+                (Operator, "))"),
+                (Command, "ls"),
             ]
         );
     }

@@ -503,7 +503,8 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   **`Nest` は外側の `for` / `case` の進行 (`stage` / `case_pending`) も退避・復元する**
   (`case $(printf y) in` の `in` に届かせるため)。**算術 (`$((` / `((`) の中は括弧・`;` を
   含めてコマンド位置にしない** (`Nest::arithmetic`。`$(( (total + 1) * 2 ))` の `total` や
-  `for ((i = 0; i < n; i++))` の `i` をコマンド色にしない)。いずれも Codex PR レビュー指摘。
+  `for ((i = 0; i < n; i++))` の `i` をコマンド色にしない。算術中の改行も同じ)。case パターン内の
+  `<(` もネストを開く。いずれも Codex PR レビュー指摘。
   **語の途中で閉じた置換の後ろは同じ語の続き** (`word_continues`。`PATH=$(pwd)/bin env` の
   `/bin` を新しい語として扱うとコマンド位置を食い、`env` が無色になる)。
   **関数定義 (`NAME()` / `function NAME`) は名前を変数色にし、本体をコマンド位置にする**
@@ -552,7 +553,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 194 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 196 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
