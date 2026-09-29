@@ -76,6 +76,8 @@ pub fn highlight(src: &str) -> Vec<Token> {
         heredocs: Vec::new(),
         redirect_target: false,
         nesting: Vec::new(),
+        case_pending: false,
+        cases: Vec::new(),
     };
     lexer.run();
     lexer.tokens
@@ -114,6 +116,11 @@ struct Lexer<'a> {
     /// Open command substitutions and subshells, innermost last, each with the
     /// `command_expected` to go back to once it closes (`A=$(date) env` runs `env`).
     nesting: Vec<Nest>,
+    /// Read `case`, and its `in` is still to come.
+    case_pending: bool,
+    /// Open `case` statements, innermost last: `true` while reading an arm's
+    /// pattern (after `in` or `;;`), `false` in its command list (after `)`).
+    cases: Vec<bool>,
 }
 
 /// Something opened that a later `)` or backquote closes.
@@ -185,6 +192,18 @@ impl<'a> Lexer<'a> {
         let op = &self.rest()[..len];
         self.push(TokenKind::Operator, len);
         self.redirect_target = false;
+        if self.in_case_pattern() {
+            // `a|b)` and the optional `(` of `(a)`: all part of the pattern.
+            if op == ")" {
+                self.set_case_pattern(false);
+                self.command_expected = true;
+            }
+            return;
+        }
+        if matches!(op, ";;" | ";&" | ";;&") && !self.cases.is_empty() {
+            self.set_case_pattern(true);
+            return;
+        }
         match op {
             "<<" | "<<-" => self.heredoc_delimiter(op == "<<-"),
             // Process substitution: a command inside, an argument outside.
@@ -198,6 +217,16 @@ impl<'a> Lexer<'a> {
                 self.command_expected = true;
                 self.after_for_or_case = Stage::None;
             }
+        }
+    }
+
+    fn in_case_pattern(&self) -> bool {
+        self.cases.last() == Some(&true)
+    }
+
+    fn set_case_pattern(&mut self, pattern: bool) {
+        if let Some(top) = self.cases.last_mut() {
+            *top = pattern;
         }
     }
 
@@ -296,11 +325,26 @@ impl<'a> Lexer<'a> {
             return;
         }
 
+        if self.in_case_pattern() && self.after_for_or_case == Stage::None {
+            if text == "esac" {
+                self.cases.pop();
+                self.command_expected = false;
+                self.push(TokenKind::Keyword, len);
+            } else {
+                self.word_body(start + len, TokenKind::Plain);
+            }
+            return;
+        }
+
         let in_command_position = self.command_expected;
         let mut kind = TokenKind::Plain;
         if self.after_for_or_case == Stage::In && text == "in" {
             kind = TokenKind::Keyword;
             self.after_for_or_case = Stage::None;
+            if self.case_pending {
+                self.case_pending = false;
+                self.cases.push(true);
+            }
         } else if self.after_for_or_case == Stage::Name {
             self.after_for_or_case = Stage::In;
         } else if in_command_position {
@@ -310,10 +354,14 @@ impl<'a> Lexer<'a> {
             } else if KEYWORDS_CLOSING.contains(&text) {
                 kind = TokenKind::Keyword;
                 self.command_expected = false;
+                if text == "esac" {
+                    self.cases.pop();
+                }
             } else if KEYWORDS_BEFORE_NAME.contains(&text) {
                 kind = TokenKind::Keyword;
                 self.command_expected = false;
                 self.after_for_or_case = Stage::Name;
+                self.case_pending = text == "case";
             } else if let Some(name_len) = assignment_name_len(text) {
                 // `NAME=value` before the command: the command is still to come.
                 self.push(TokenKind::Variable, name_len);
@@ -812,6 +860,46 @@ mod tests {
                 (Operator, ")"),
                 (Operator, "|"),
                 (Command, "wc"),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_patterns_are_not_commands_but_their_arms_are() {
+        assert_eq!(
+            coloured("case \"$x\" in a|b) echo one;; (c) printf two;; esac; ls"),
+            vec![
+                (Keyword, "case"),
+                (String, "\"$x\""),
+                (Keyword, "in"),
+                (Operator, "|"),
+                (Operator, ")"),
+                (Command, "echo"),
+                (Operator, ";;"),
+                (Operator, "("),
+                (Operator, ")"),
+                (Command, "printf"),
+                (Operator, ";;"),
+                (Keyword, "esac"),
+                (Operator, ";"),
+                (Command, "ls"),
+            ]
+        );
+        // Over several lines, and with the last arm left without `;;`.
+        assert_eq!(
+            coloured("case $1 in\n  start)\n    run -d\n    ;;\n  *) help\nesac\ndate"),
+            vec![
+                (Keyword, "case"),
+                (Variable, "$1"),
+                (Keyword, "in"),
+                (Operator, ")"),
+                (Command, "run"),
+                (Option, "-d"),
+                (Operator, ";;"),
+                (Operator, ")"),
+                (Command, "help"),
+                (Keyword, "esac"),
+                (Command, "date"),
             ]
         );
     }

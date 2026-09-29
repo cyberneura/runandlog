@@ -495,6 +495,9 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   **置換・サブシェルは `nesting` のスタックで開閉を追い、閉じたら開く前の状態に戻す**
   (`A=$(date) env` の `env` がコマンド、`echo $(date) x` の `x` は引数。Codex CLI 指摘)。
   here-document の本文は文字列扱い (本文の `rm -rf` をコマンド色にしないため)。
+  **`case` は `cases` のスタックで「パターン位置か分岐本体か」を追う** (`in` と `;;` の後が
+  パターン、`)` の後が本体。Codex PR レビュー指摘)。追わないと本体のコマンドが無色になり、
+  次のパターンがコマンド色になる。
 - **TUI は完了・失敗したセルでは色を付けない** (従来どおり単色の暗色)。色を戻すと、
   run all の進み具合を見せるための減光が効かなくなる。
 - GUI の色は明暗それぞれ `--card` に対して 4.5:1 以上 (CSS 変数 `--tok-*`)。
@@ -539,7 +542,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 187 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 188 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
