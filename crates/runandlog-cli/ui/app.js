@@ -245,7 +245,7 @@ function renderCell(cell) {
 
   const command = document.createElement('pre')
   command.className = 'command'
-  command.textContent = cell.command
+  fillCommand(command, cell)
 
   section.append(head, command)
 
@@ -282,6 +282,32 @@ function dressCopyButton(button, index) {
   const isCopied = copied === index
   button.textContent = isCopied ? '✓ Copied' : '❐ Copy'
   button.dataset.copied = String(isCopied)
+}
+
+/**
+ * Writes a cell's command into `pre`, one span per coloured piece.
+ *
+ * The backend does the lexing (the TUI colours from the same pieces); this only
+ * maps each kind onto a class. Built from text nodes like everything else here.
+ * Falls back to the bare text if the pieces do not add up to the command, so a
+ * mismatch can cost the colours but never the command itself.
+ */
+function fillCommand(pre, cell) {
+  const tokens = Array.isArray(cell.tokens) ? cell.tokens : []
+  if (tokens.map((t) => t.text).join('') !== cell.command) {
+    pre.textContent = cell.command
+    return
+  }
+  for (const token of tokens) {
+    if (token.kind === 'plain') {
+      pre.append(token.text)
+    } else {
+      const span = document.createElement('span')
+      span.className = `tok-${token.kind}`
+      span.textContent = token.text
+      pre.append(span)
+    }
+  }
 }
 
 /** Puts the command on the clipboard and shows the check on that cell. */

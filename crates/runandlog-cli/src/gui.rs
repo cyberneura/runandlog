@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError, mpsc};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use runandlog_core::Canceller;
+use runandlog_core::{Canceller, highlight};
 
 use crate::session::Session;
 
@@ -66,10 +66,21 @@ struct CellView {
     number: usize,
     lang: String,
     command: String,
+    /// `command` cut into coloured pieces, which put together give it back. The
+    /// window colours them rather than lexing the shell itself, so that it colours
+    /// the same way as the TUI.
+    tokens: Vec<TokenView>,
     /// Destination file for the result, when the cell designates one.
     out_file: Option<String>,
     /// Body of the result block from the last run, without the markers.
     result: Option<String>,
+}
+
+/// A piece of a command and what it is (`runandlog_core::TokenKind::as_str`).
+#[derive(Debug, Clone, Serialize)]
+struct TokenView {
+    kind: &'static str,
+    text: String,
 }
 
 /// The document as the window shows it.
@@ -324,6 +335,13 @@ fn document_view(session: &Session) -> DocumentView {
             number: cell.display_number(),
             lang: cell.lang.clone(),
             command: cell.command.clone(),
+            tokens: highlight(&cell.command)
+                .into_iter()
+                .map(|token| TokenView {
+                    kind: token.kind.as_str(),
+                    text: cell.command[token.start..token.end].to_string(),
+                })
+                .collect(),
             out_file: cell.out_file.clone(),
             result: doc.result_text(cell).map(str::to_string),
         })
@@ -1031,6 +1049,38 @@ mod tests {
         assert_eq!(view.cells[0].result, None);
         assert_eq!(view.cells[1].number, 2);
         assert_eq!(view.cells[1].out_file.as_deref(), Some("log.txt"));
+    }
+
+    #[test]
+    fn the_view_carries_the_command_cut_into_coloured_pieces() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "doc.md",
+            "```shell
+ls -l | wc
+```
+",
+        );
+        let view = document_view(&session(&path));
+
+        let tokens = &view.cells[0].tokens;
+        // Put together, the pieces are the command: the window draws nothing else.
+        let joined: String = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, view.cells[0].command);
+        let kinds: Vec<(&str, &str)> = tokens
+            .iter()
+            .filter(|t| t.kind != "plain")
+            .map(|t| (t.kind, t.text.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("command", "ls"),
+                ("option", "-l"),
+                ("operator", "|"),
+                ("command", "wc"),
+            ]
+        );
     }
 
     #[test]

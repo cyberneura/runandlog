@@ -22,6 +22,14 @@
   --accent-soft: rgba(31, 111, 235, 0.25);
   --ok: #1a7f37;
   --error: #cf222e;
+  /* Syntax colours for commands. Each keeps at least 4.5:1 against --card. */
+  --tok-command: #0550ae;
+  --tok-keyword: #8250df;
+  --tok-option: #0a6b74;
+  --tok-string: #116329;
+  --tok-variable: #953800;
+  --tok-comment: var(--muted);
+  --tok-operator: #cf222e;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -37,6 +45,13 @@
     --accent-soft: rgba(68, 147, 248, 0.28);
     --ok: #3fb950;
     --error: #f85149;
+    --tok-command: #79c0ff;
+    --tok-keyword: #d2a8ff;
+    --tok-option: #56d4dd;
+    --tok-string: #7ee787;
+    --tok-variable: #ffa657;
+    --tok-comment: var(--muted);
+    --tok-operator: #ff7b72;
   }
 }
 
@@ -237,6 +252,33 @@ pre {
   font-size: 12.5px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* The pieces of a command, coloured by what the shell makes of them. The kinds
+   come from the backend (runandlog_core::highlight). */
+.command .tok-command {
+  color: var(--tok-command);
+  font-weight: 600;
+}
+.command .tok-keyword {
+  color: var(--tok-keyword);
+  font-weight: 600;
+}
+.command .tok-option {
+  color: var(--tok-option);
+}
+.command .tok-string {
+  color: var(--tok-string);
+}
+.command .tok-variable {
+  color: var(--tok-variable);
+}
+.command .tok-comment {
+  color: var(--tok-comment);
+  font-style: italic;
+}
+.command .tok-operator {
+  color: var(--tok-operator);
 }
 
 .result {

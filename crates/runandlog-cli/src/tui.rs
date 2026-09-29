@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use runandlog_core::{Canceller, ExecOutcome};
+use runandlog_core::{Canceller, ExecOutcome, TokenKind, highlight};
 
 use crate::live::LiveOutput;
 use crate::session::Session;
@@ -277,6 +277,71 @@ fn command_style(state: CellState) -> Style {
     }
 }
 
+/// Colour of a piece of a command, by what the shell makes of it.
+fn token_style(kind: TokenKind) -> Style {
+    let style = Style::default();
+    match kind {
+        TokenKind::Plain => style,
+        TokenKind::Command => style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        TokenKind::Keyword => style.fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        TokenKind::Option => style.fg(Color::LightBlue),
+        TokenKind::String => style.fg(Color::Green),
+        TokenKind::Variable => style.fg(Color::Yellow),
+        TokenKind::Comment => style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        TokenKind::Operator => style.fg(Color::LightRed),
+    }
+}
+
+/// A cell's command as drawn: one line per line of the command, each behind a
+/// `>` gutter.
+///
+/// Highlighted while the cell is waiting or running. A finished cell keeps the
+/// single dim colour of `command_style` instead: the colours would bring back
+/// exactly the contrast the dimming takes away to show where a batch is up to.
+fn command_lines(command: &str, state: CellState) -> Vec<Line<'static>> {
+    let gutter = || Span::styled("   > ", Style::default().fg(Color::DarkGray));
+    let highlighted = !matches!(state, CellState::Done | CellState::Failed);
+    let tokens = if highlighted {
+        highlight(command)
+    } else {
+        Vec::new()
+    };
+
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    // Tokens are in order, so each line picks up where the previous one stopped
+    // rather than looking through all of them.
+    let mut next = 0;
+    // Same lines as `str::lines`: split on `\n`, drop a `\r` before it, and no
+    // empty line after a final newline.
+    for raw in command.split_inclusive('\n') {
+        let line_end = line_start + raw.trim_end_matches('\n').trim_end_matches('\r').len();
+        let mut spans = vec![gutter()];
+        if highlighted {
+            while tokens.get(next).is_some_and(|t| t.end <= line_start) {
+                next += 1;
+            }
+            for token in tokens[next..].iter().take_while(|t| t.start < line_end) {
+                let (start, end) = (token.start.max(line_start), token.end.min(line_end));
+                if start < end {
+                    spans.push(Span::styled(
+                        command[start..end].to_string(),
+                        token_style(token.kind),
+                    ));
+                }
+            }
+        } else {
+            spans.push(Span::styled(
+                command[line_start..line_end].to_string(),
+                command_style(state),
+            ));
+        }
+        lines.push(Line::from(spans));
+        line_start += raw.len();
+    }
+    lines
+}
+
 /// The lines to draw, plus the line range occupied by each cell.
 struct Rendered {
     lines: Vec<Line<'static>>,
@@ -444,12 +509,7 @@ impl App {
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
-            for command in cell.command.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled("   > ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(command.to_string(), command_style(state)),
-                ]));
-            }
+            lines.extend(command_lines(&cell.command, state));
             if state == CellState::Running {
                 // The live tail takes the place of the previous result rather than
                 // sitting under it: the two are the same cell's output from
@@ -913,6 +973,42 @@ mod tests {
         assert_eq!(command_style(CellState::Running), Style::default());
         assert_ne!(command_style(CellState::Done), Style::default());
         assert_ne!(command_style(CellState::Failed), Style::default());
+    }
+
+    /// The text of each drawn line, without the gutter.
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans[1..].iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_waiting_command_is_highlighted_line_by_line() {
+        let command = "echo 'a\r\nb' | wc -l\r\n\nls\n";
+        let lines = command_lines(command, CellState::Waiting);
+        // Same lines as `str::lines`, even with a string spanning two of them.
+        assert_eq!(texts(&lines), command.lines().collect::<Vec<_>>());
+        let first = &lines[0].spans;
+        assert_eq!(first[1].content, "echo");
+        assert_eq!(first[1].style, token_style(TokenKind::Command));
+        assert_eq!(first[3].content, "'a");
+        assert_eq!(first[3].style, token_style(TokenKind::String));
+        assert_eq!(lines[1].spans[1].content, "b'");
+        assert_eq!(lines[1].spans[1].style, token_style(TokenKind::String));
+        assert_eq!(lines[3].spans[1].style, token_style(TokenKind::Command));
+    }
+
+    #[test]
+    fn a_finished_command_stays_one_dim_colour() {
+        for state in [CellState::Done, CellState::Failed] {
+            let lines = command_lines("echo hi | wc -c\nls", state);
+            assert_eq!(texts(&lines), ["echo hi | wc -c", "ls"]);
+            for line in &lines {
+                assert_eq!(line.spans.len(), 2);
+                assert_eq!(line.spans[1].style, command_style(state));
+            }
+        }
     }
 
     #[test]

@@ -474,6 +474,31 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   判定は `App::finished` (このセッションで実行したセルの index → 成否) だけで行う。
 - **reload では `finished` を捨てる。** 再読み込み後の index は同じセルを指すとは限らない。
 
+## コマンドのシンタックスハイライト (CYBERNEURA-DEV-889)
+
+`runandlog_core::highlight` がコマンドをトークン (種類 + バイト範囲) に切り、TUI と GUI の
+両方がそれで色を付ける。
+
+- **字句解析はコアに 1 つだけ置く。** GUI は `CellView::tokens` (種類名 + テキスト) を受け取って
+  `tok-<kind>` の span を組むだけで、JS 側にシェルの知識を持たせない。GUI 専用のパースを
+  足さない方針 (上の GUI 節) と同じ理由。
+- **パーサーではなく字句解析器で、失敗しない。** 対象は編集途中の Markdown なので、閉じていない
+  引用符・`${`・here-document も含めて**トークンは常に全文を隙間なく覆う**。この不変条件を
+  疑似乱数入力で検査するテスト (`any_text_is_covered_without_panicking`) がある。
+  フロントは連結がコマンドと一致しない時は素のテキストに戻す (色を失っても本文は失わない)。
+- 依存 (syntect / tree-sitter 等) を足さなかったのは、配布バイナリと
+  THIRD-PARTY-NOTICES を大きくしてまで欲しい精度ではないため。色分けは「どれがプログラム名か・
+  どこまでが文字列か」を拾える程度で十分。
+- **コマンド位置の判定**: 行頭・`|` `&&` `;` `(` 等の後・`then` `do` 等の予約語の後・
+  `$(` `<(` `>(` と開きバッククォートの後・`NAME=value` の後。**リダイレクト先の語は
+  コマンド位置を消費しない** (`> out.txt echo hi` の `echo` がコマンド。Codex CLI 指摘)。
+  **置換・サブシェルは `nesting` のスタックで開閉を追い、閉じたら開く前の状態に戻す**
+  (`A=$(date) env` の `env` がコマンド、`echo $(date) x` の `x` は引数。Codex CLI 指摘)。
+  here-document の本文は文字列扱い (本文の `rm -rf` をコマンド色にしないため)。
+- **TUI は完了・失敗したセルでは色を付けない** (従来どおり単色の暗色)。色を戻すと、
+  run all の進み具合を見せるための減光が効かなくなる。
+- GUI の色は明暗それぞれ `--card` に対して 4.5:1 以上 (CSS 変数 `--tok-*`)。
+
 ## ライセンス表示 (CYBERNEURA-DEV-880)
 
 `LICENSE` (MIT、Cyberneura) と、配布バイナリに入る crate のライセンスを並べた
@@ -514,7 +539,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 158 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 187 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
