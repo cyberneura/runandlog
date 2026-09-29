@@ -148,6 +148,12 @@ struct Case {
 struct Nest {
     closer: Closer,
     command_expected_after: bool,
+    /// Arithmetic (`$((`, `((`): no commands inside, even within parentheses.
+    arithmetic: bool,
+    /// The `for` / `case` progress outside, which the inside must not disturb
+    /// (`case $(printf y) in` still reaches its `in`).
+    stage: Stage,
+    case_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,11 +233,23 @@ impl<'a> Lexer<'a> {
         match op {
             "<<" | "<<-" => self.heredoc_delimiter(op == "<<-"),
             // Process substitution: a command inside, an argument outside.
-            "<(" | ">(" => self.open(Closer::Paren, self.command_expected, true),
+            "<(" | ">(" => self.open(Closer::Paren, self.command_expected, false),
+            // Grouping inside arithmetic stays arithmetic.
+            "(" if self.nesting.last().is_some_and(|n| n.arithmetic) => {
+                self.open(Closer::Paren, false, true)
+            }
+            // `((`: an arithmetic command, closed by `))`.
+            "(" if self.rest().starts_with('(') => {
+                self.push(TokenKind::Operator, 1);
+                self.open(Closer::Paren, false, true);
+                self.open(Closer::Paren, false, true);
+            }
             // A subshell: whatever follows its `)` is an operator, not a command.
-            "(" => self.open(Closer::Paren, false, true),
+            "(" => self.open(Closer::Paren, false, false),
             ")" => self.close(Closer::Paren),
             _ if op.contains(['<', '>']) => self.redirect_target = true,
+            // `;` separates the clauses of `for ((i = 0; i < n; i++))`.
+            _ if self.nesting.last().is_some_and(|n| n.arithmetic) => {}
             _ => {
                 // `|`, `&&`, `;` and the rest start a new command.
                 self.command_expected = true;
@@ -252,21 +270,27 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Enters a substitution or subshell. `after` is `command_expected` once it closes.
-    fn open(&mut self, closer: Closer, after: bool, inside: bool) {
+    /// Enters a substitution, subshell or arithmetic. `after` is `command_expected`
+    /// once it closes; inside, a command is expected unless it is `arithmetic`.
+    fn open(&mut self, closer: Closer, after: bool, arithmetic: bool) {
         self.nesting.push(Nest {
             closer,
             command_expected_after: after,
+            arithmetic,
+            stage: std::mem::replace(&mut self.after_for_or_case, Stage::None),
+            case_pending: std::mem::take(&mut self.case_pending),
         });
-        self.command_expected = inside;
+        self.command_expected = !arithmetic;
     }
 
     /// Leaves the innermost substitution or subshell, if it is closed by `closer`.
     /// A stray closer (a `case` pattern's `)`, say) just ends command position.
     fn close(&mut self, closer: Closer) {
         match self.nesting.last() {
-            Some(nest) if nest.closer == closer => {
+            Some(&nest) if nest.closer == closer => {
                 self.command_expected = nest.command_expected_after;
+                self.after_for_or_case = nest.stage;
+                self.case_pending = nest.case_pending;
                 self.nesting.pop();
                 self.word_continues = self
                     .peek()
@@ -468,10 +492,10 @@ impl<'a> Lexer<'a> {
         let after = self.command_expected;
         if text.ends_with("$((") {
             // Closed by `))`, read as two `)`.
-            self.open(Closer::Paren, after, false);
-            self.open(Closer::Paren, after, false);
-        } else if text.ends_with("$(") {
             self.open(Closer::Paren, after, true);
+            self.open(Closer::Paren, after, true);
+        } else if text.ends_with("$(") {
+            self.open(Closer::Paren, after, false);
         } else if text.ends_with('`') && !text.ends_with("\\`") {
             if self
                 .nesting
@@ -480,7 +504,7 @@ impl<'a> Lexer<'a> {
             {
                 self.close(Closer::Backquote);
             } else {
-                self.open(Closer::Backquote, after, true);
+                self.open(Closer::Backquote, after, false);
             }
         }
     }
@@ -1081,6 +1105,65 @@ mod tests {
                 (Command, "echo"),
                 (Operator, ";;"),
                 (Keyword, "esac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_substitution_as_the_case_subject_still_reaches_in() {
+        assert_eq!(
+            coloured("case $(printf y) in y) echo yes;; esac"),
+            vec![
+                (Keyword, "case"),
+                (Variable, "$("),
+                (Command, "printf"),
+                (Operator, ")"),
+                (Keyword, "in"),
+                (Operator, ")"),
+                (Command, "echo"),
+                (Operator, ";;"),
+                (Keyword, "esac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouping_inside_arithmetic_is_not_a_command() {
+        assert_eq!(
+            coloured("echo $(( (total + 1) * 2 )) x"),
+            vec![
+                (Command, "echo"),
+                (Variable, "$(("),
+                (Operator, "("),
+                (Operator, ")"),
+                (Operator, "))"),
+            ]
+        );
+        assert_eq!(
+            coloured("for ((i = 0; i < 3; i++)); do date; done"),
+            vec![
+                (Keyword, "for"),
+                (Operator, "(("),
+                (Operator, ";"),
+                (Operator, "<"),
+                (Operator, ";"),
+                (Operator, "));"),
+                (Keyword, "do"),
+                (Command, "date"),
+                (Operator, ";"),
+                (Keyword, "done"),
+            ]
+        );
+        assert_eq!(
+            coloured("(( (n + 1) > 2 )) && echo big"),
+            vec![
+                (Operator, "(("),
+                (Operator, "("),
+                (Operator, ")"),
+                (Operator, ">"),
+                (Operator, "))"),
+                (Operator, "&&"),
+                (Command, "echo"),
             ]
         );
     }
