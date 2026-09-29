@@ -148,8 +148,10 @@ struct Case {
 struct Nest {
     closer: Closer,
     command_expected_after: bool,
-    /// Arithmetic (`$((`, `((`): no commands inside, even within parentheses.
-    arithmetic: bool,
+    /// An expression rather than commands -- arithmetic (`$((`, `((`), a
+    /// conditional (`[[`) or an array value (`=(`): nothing inside is a command,
+    /// not even after `(`, `&&`, `;` or a newline.
+    expression: bool,
     /// The `for` / `case` progress outside, which the inside must not disturb
     /// (`case $(printf y) in` still reaches its `in`).
     stage: Stage,
@@ -160,6 +162,8 @@ struct Nest {
 enum Closer {
     Paren,
     Backquote,
+    /// `]]`, closing `[[`.
+    Brackets,
 }
 
 impl<'a> Lexer<'a> {
@@ -168,8 +172,8 @@ impl<'a> Lexer<'a> {
             match c {
                 '\n' => {
                     self.push(TokenKind::Plain, 1);
-                    // A newline inside arithmetic is only whitespace.
-                    self.command_expected = !self.in_arithmetic();
+                    // A newline inside an expression is only whitespace.
+                    self.command_expected = !self.in_expression();
                     self.redirect_target = false;
                     self.read_heredoc_bodies();
                 }
@@ -217,6 +221,7 @@ impl<'a> Lexer<'a> {
 
     fn operator(&mut self, len: usize) {
         let op = &self.rest()[..len];
+        let array_value = self.src[..self.pos].ends_with('=');
         self.push(TokenKind::Operator, len);
         self.redirect_target = false;
         if self.in_case_pattern() && !matches!(op, "<(" | ">(") {
@@ -236,8 +241,10 @@ impl<'a> Lexer<'a> {
             "<<" | "<<-" => self.heredoc_delimiter(op == "<<-"),
             // Process substitution: a command inside, an argument outside.
             "<(" | ">(" => self.open(Closer::Paren, self.command_expected, false),
-            // Grouping inside arithmetic stays arithmetic.
-            "(" if self.in_arithmetic() => self.open(Closer::Paren, false, true),
+            // Grouping inside an expression stays an expression.
+            "(" if self.in_expression() => self.open(Closer::Paren, false, true),
+            // `name=(one two)`: an array's elements, not a subshell.
+            "(" if array_value => self.open(Closer::Paren, self.command_expected, true),
             // `((`: an arithmetic command, closed by `))`.
             "(" if self.rest().starts_with('(') => {
                 self.push(TokenKind::Operator, 1);
@@ -248,8 +255,9 @@ impl<'a> Lexer<'a> {
             "(" => self.open(Closer::Paren, false, false),
             ")" => self.close(Closer::Paren),
             _ if op.contains(['<', '>']) => self.redirect_target = true,
-            // `;` separates the clauses of `for ((i = 0; i < n; i++))`.
-            _ if self.in_arithmetic() => {}
+            // `;` separates the clauses of `for ((i = 0; i < n; i++))`, and `&&`
+            // joins the tests of `[[ -f a && -f b ]]`.
+            _ if self.in_expression() => {}
             _ => {
                 // `|`, `&&`, `;` and the rest start a new command.
                 self.command_expected = true;
@@ -258,8 +266,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn in_arithmetic(&self) -> bool {
-        self.nesting.last().is_some_and(|n| n.arithmetic)
+    fn in_expression(&self) -> bool {
+        self.nesting.last().is_some_and(|n| n.expression)
     }
 
     fn in_case_pattern(&self) -> bool {
@@ -274,17 +282,17 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Enters a substitution, subshell or arithmetic. `after` is `command_expected`
-    /// once it closes; inside, a command is expected unless it is `arithmetic`.
-    fn open(&mut self, closer: Closer, after: bool, arithmetic: bool) {
+    /// Enters a substitution, subshell or expression. `after` is `command_expected`
+    /// once it closes; inside, a command is expected unless it is an `expression`.
+    fn open(&mut self, closer: Closer, after: bool, expression: bool) {
         self.nesting.push(Nest {
             closer,
             command_expected_after: after,
-            arithmetic,
+            expression,
             stage: std::mem::replace(&mut self.after_for_or_case, Stage::None),
             case_pending: std::mem::take(&mut self.case_pending),
         });
-        self.command_expected = !arithmetic;
+        self.command_expected = !expression;
     }
 
     /// Leaves the innermost substitution or subshell, if it is closed by `closer`.
@@ -370,6 +378,17 @@ impl<'a> Lexer<'a> {
             return;
         }
 
+        if text == "]]"
+            && self
+                .nesting
+                .last()
+                .is_some_and(|n| n.closer == Closer::Brackets)
+        {
+            self.push(TokenKind::Keyword, len);
+            self.close(Closer::Brackets);
+            return;
+        }
+
         if std::mem::take(&mut self.word_continues) {
             // The rest of a word a substitution was in the middle of. It carries on
             // as whatever that word was, so command position stays as it is.
@@ -433,7 +452,12 @@ impl<'a> Lexer<'a> {
             return;
         } else if in_command_position {
             self.after_for_or_case = Stage::None;
-            if KEYWORDS_BEFORE_COMMAND.contains(&text) {
+            if text == "[[" {
+                // A conditional expression, up to its `]]`.
+                self.push(TokenKind::Keyword, len);
+                self.open(Closer::Brackets, false, true);
+                return;
+            } else if KEYWORDS_BEFORE_COMMAND.contains(&text) {
                 kind = TokenKind::Keyword;
                 self.after_time = text == "time";
             } else if KEYWORDS_CLOSING.contains(&text) {
@@ -1126,6 +1150,39 @@ mod tests {
                 (Command, "echo"),
                 (Operator, ";;"),
                 (Keyword, "esac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_conditional_expression_holds_no_commands() {
+        assert_eq!(
+            coloured("[[ \"$x\" == y && -f file ]] && echo ok"),
+            vec![
+                (Keyword, "[["),
+                (String, "\"$x\""),
+                (Operator, "&&"),
+                (Option, "-f"),
+                (Keyword, "]]"),
+                (Operator, "&&"),
+                (Command, "echo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_array_value_holds_no_commands() {
+        assert_eq!(
+            coloured("items=(one\n  two) ; declare -a more+=(three)"),
+            vec![
+                (Variable, "items"),
+                (Operator, "=("),
+                (Operator, ")"),
+                (Operator, ";"),
+                (Command, "declare"),
+                (Option, "-a"),
+                (Operator, "("),
+                (Operator, ")"),
             ]
         );
     }
