@@ -80,6 +80,7 @@ pub fn highlight(src: &str) -> Vec<Token> {
         function_pending: false,
         word_continues: false,
         cases: Vec::new(),
+        after_time: false,
     };
     lexer.run();
     lexer.tokens
@@ -125,9 +126,21 @@ struct Lexer<'a> {
     /// A substitution just closed in the middle of a word (`PATH=$(pwd)/bin`):
     /// what follows is the rest of that word, not a new one.
     word_continues: bool,
-    /// Open `case` statements, innermost last: `true` while reading an arm's
-    /// pattern (after `in` or `;;`), `false` in its command list (after `)`).
-    cases: Vec<bool>,
+    /// Open `case` statements, innermost last.
+    cases: Vec<Case>,
+    /// Read `time`: options (`-p`) may come before the command.
+    after_time: bool,
+}
+
+/// An open `case` statement.
+#[derive(Debug, Clone, Copy)]
+struct Case {
+    /// Reading an arm's pattern (after `in` or `;;`) rather than its command list
+    /// (after `)`).
+    pattern: bool,
+    /// `nesting` depth the statement sits at. A substitution inside a pattern
+    /// (`$(printf x))`) is deeper, and its `)` is not the one that ends the pattern.
+    depth: usize,
 }
 
 /// Something opened that a later `)` or backquote closes.
@@ -228,12 +241,14 @@ impl<'a> Lexer<'a> {
     }
 
     fn in_case_pattern(&self) -> bool {
-        self.cases.last() == Some(&true)
+        self.cases
+            .last()
+            .is_some_and(|case| case.pattern && case.depth == self.nesting.len())
     }
 
     fn set_case_pattern(&mut self, pattern: bool) {
         if let Some(top) = self.cases.last_mut() {
-            *top = pattern;
+            top.pattern = pattern;
         }
     }
 
@@ -350,18 +365,28 @@ impl<'a> Lexer<'a> {
                 self.push(TokenKind::Keyword, len);
             } else {
                 self.word_body(start + len, TokenKind::Plain);
+                self.after_opener(text);
             }
             return;
         }
 
         let in_command_position = self.command_expected;
+        if std::mem::take(&mut self.after_time) && in_command_position && text.starts_with('-') {
+            // `time -p pipeline`: the option belongs to `time`; the command is still to come.
+            self.after_time = true;
+            self.word_body(start + len, TokenKind::Option);
+            return;
+        }
         let mut kind = TokenKind::Plain;
         if self.after_for_or_case == Stage::In && text == "in" {
             kind = TokenKind::Keyword;
             self.after_for_or_case = Stage::None;
             if self.case_pending {
                 self.case_pending = false;
-                self.cases.push(true);
+                self.cases.push(Case {
+                    pattern: true,
+                    depth: self.nesting.len(),
+                });
             }
         } else if self.after_for_or_case == Stage::Name && self.function_pending {
             // `function NAME [()]`: the body comes next, and it holds commands.
@@ -382,6 +407,7 @@ impl<'a> Lexer<'a> {
             self.after_for_or_case = Stage::None;
             if KEYWORDS_BEFORE_COMMAND.contains(&text) {
                 kind = TokenKind::Keyword;
+                self.after_time = text == "time";
             } else if KEYWORDS_CLOSING.contains(&text) {
                 kind = TokenKind::Keyword;
                 self.command_expected = false;
@@ -1030,6 +1056,31 @@ mod tests {
                 (Operator, "("),
                 (Command, "x"),
                 (Operator, ")")
+            ]
+        );
+    }
+
+    #[test]
+    fn options_of_time_come_before_the_command() {
+        assert_eq!(
+            coloured("time -p sleep 1"),
+            vec![(Keyword, "time"), (Option, "-p"), (Command, "sleep")]
+        );
+    }
+
+    #[test]
+    fn a_substitution_in_a_case_pattern_does_not_end_it() {
+        assert_eq!(
+            coloured("case x in $(printf x)) echo yes;; esac"),
+            vec![
+                (Keyword, "case"),
+                (Keyword, "in"),
+                (Variable, "$("),
+                (Command, "printf"),
+                (Operator, "))"),
+                (Command, "echo"),
+                (Operator, ";;"),
+                (Keyword, "esac"),
             ]
         );
     }

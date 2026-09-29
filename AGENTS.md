@@ -497,7 +497,9 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   here-document の本文は文字列扱い (本文の `rm -rf` をコマンド色にしないため)。
   **`case` は `cases` のスタックで「パターン位置か分岐本体か」を追う** (`in` と `;;` の後が
   パターン、`)` の後が本体。Codex PR レビュー指摘)。追わないと本体のコマンドが無色になり、
-  次のパターンがコマンド色になる。
+  次のパターンがコマンド色になる。**パターン中の置換 (`$(printf x))`) の `)` でパターンを
+  終わらせないよう、`Case::depth` に case を開いた時の `nesting` の深さを持つ。**
+  `time -p cmd` の `-p` は `time` のオプションで、コマンド位置を消費しない (`after_time`)。
   **語の途中で閉じた置換の後ろは同じ語の続き** (`word_continues`。`PATH=$(pwd)/bin env` の
   `/bin` を新しい語として扱うとコマンド位置を食い、`env` が無色になる)。
   **関数定義 (`NAME()` / `function NAME`) は名前を変数色にし、本体をコマンド位置にする**
@@ -546,7 +548,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 190 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 192 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
