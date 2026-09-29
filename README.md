@@ -120,7 +120,9 @@ place of the result of the previous run, and are replaced by the new result once
 the command finishes. The marker beside each cell carries how far this session has
 got: green for a cell that has not been run since the file was opened, yellow for
 the one running now, blue for one that finished, red for one that failed, timed
-out or was stopped. A finished cell's command is dimmed. Reloading the file clears
+out or was stopped. Commands are syntax-highlighted as shell -- the program run,
+options, strings, variables, comments and operators each in their own colour --
+and a finished cell's command is dimmed to one colour instead. Reloading the file clears
 all of that -- after a reload, the cell at a given position need not be the one
 that ran.
 
@@ -136,6 +138,9 @@ editor.
 Each cell also has a `❐ Copy` button at the end of its header, which puts that
 cell's command on the clipboard and shows a check for three seconds. It stays
 available while a command is running, since copying changes nothing.
+
+Commands are syntax-highlighted as shell, with the same colouring rules as the
+TUI, in colours that follow the system's light or dark appearance.
 
 The cell being run shows what the command is printing, scrolled to the newest
 line, and the finished result takes its place when the command ends. Only the tail
@@ -264,7 +269,7 @@ bare Markdown link target cannot contain them.
 
 | Crate | Role |
 |---|---|
-| `crates/runandlog-core` | Markdown parsing, command execution, result formatting. A pure core with no file IO |
+| `crates/runandlog-core` | Markdown parsing, command execution, result formatting, shell syntax highlighting. A pure core with no file IO |
 | `crates/runandlog-cli` | The `runandlog` binary: CLI, TUI, GUI, and file IO |
 
 All three front ends sit on the same `runandlog-core` and the same `session`
