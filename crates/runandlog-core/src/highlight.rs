@@ -77,6 +77,8 @@ pub fn highlight(src: &str) -> Vec<Token> {
         redirect_target: false,
         nesting: Vec::new(),
         case_pending: false,
+        function_pending: false,
+        word_continues: false,
         cases: Vec::new(),
     };
     lexer.run();
@@ -118,6 +120,11 @@ struct Lexer<'a> {
     nesting: Vec<Nest>,
     /// Read `case`, and its `in` is still to come.
     case_pending: bool,
+    /// Read `function`: the next word is the name being defined.
+    function_pending: bool,
+    /// A substitution just closed in the middle of a word (`PATH=$(pwd)/bin`):
+    /// what follows is the rest of that word, not a new one.
+    word_continues: bool,
     /// Open `case` statements, innermost last: `true` while reading an arm's
     /// pattern (after `in` or `;;`), `false` in its command list (after `)`).
     cases: Vec<bool>,
@@ -151,7 +158,7 @@ impl<'a> Lexer<'a> {
                     // A line continuation: the command goes on, so the state stays.
                     self.push(TokenKind::Plain, 2);
                 }
-                '#' => {
+                '#' if !self.word_continues => {
                     let len = self.rest().find('\n').unwrap_or(self.rest().len());
                     self.push(TokenKind::Comment, len);
                 }
@@ -246,6 +253,9 @@ impl<'a> Lexer<'a> {
             Some(nest) if nest.closer == closer => {
                 self.command_expected = nest.command_expected_after;
                 self.nesting.pop();
+                self.word_continues = self
+                    .peek()
+                    .is_some_and(|c| !c.is_whitespace() && operator_len(self.rest()).is_none());
             }
             _ => self.command_expected = false,
         }
@@ -317,6 +327,14 @@ impl<'a> Lexer<'a> {
             return;
         }
 
+        if std::mem::take(&mut self.word_continues) {
+            // The rest of a word a substitution was in the middle of. It carries on
+            // as whatever that word was, so command position stays as it is.
+            self.word_body(start + len, TokenKind::Plain);
+            self.after_opener(text);
+            return;
+        }
+
         if self.redirect_target {
             // The file a redirection reads or writes. Command position is untouched.
             self.redirect_target = false;
@@ -345,8 +363,21 @@ impl<'a> Lexer<'a> {
                 self.case_pending = false;
                 self.cases.push(true);
             }
+        } else if self.after_for_or_case == Stage::Name && self.function_pending {
+            // `function NAME [()]`: the body comes next, and it holds commands.
+            self.after_for_or_case = Stage::None;
+            self.function_pending = false;
+            self.push(TokenKind::Variable, len);
+            self.function_parens();
+            return;
         } else if self.after_for_or_case == Stage::Name {
             self.after_for_or_case = Stage::In;
+        } else if in_command_position && is_function_definition(text, &src[start + len..]) {
+            // `NAME()`: a definition, not a run of NAME.
+            self.after_for_or_case = Stage::None;
+            self.push(TokenKind::Variable, len);
+            self.function_parens();
+            return;
         } else if in_command_position {
             self.after_for_or_case = Stage::None;
             if KEYWORDS_BEFORE_COMMAND.contains(&text) {
@@ -362,6 +393,7 @@ impl<'a> Lexer<'a> {
                 self.command_expected = false;
                 self.after_for_or_case = Stage::Name;
                 self.case_pending = text == "case";
+                self.function_pending = text == "function";
             } else if let Some(name_len) = assignment_name_len(text) {
                 // `NAME=value` before the command: the command is still to come.
                 self.push(TokenKind::Variable, name_len);
@@ -383,6 +415,24 @@ impl<'a> Lexer<'a> {
             self.word_body(start + len, kind);
         }
         self.after_opener(text);
+    }
+
+    /// Reads the optional `()` after a function's name. What follows is the body,
+    /// so the next word (`{`, usually) is in command position.
+    fn function_parens(&mut self) {
+        let rest = self.rest();
+        let blanks = |s: &str| s.len() - s.trim_start_matches([' ', '\t']).len();
+        let open = blanks(rest);
+        if rest[open..].starts_with('(') {
+            let inner = blanks(&rest[open + 1..]);
+            if rest[open + 1 + inner..].starts_with(')') {
+                self.push(TokenKind::Plain, open);
+                self.push(TokenKind::Operator, 1);
+                self.push(TokenKind::Plain, inner);
+                self.push(TokenKind::Operator, 1);
+            }
+        }
+        self.command_expected = true;
     }
 
     /// A word ends right after `$(`, `$((` or a backquote (see `word_len`). What
@@ -530,6 +580,19 @@ fn expansion_len(s: &str) -> usize {
 
 fn is_name_byte(b: Option<&u8>) -> bool {
     b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Whether `word`, followed by `rest`, starts a function definition `NAME()`.
+fn is_function_definition(word: &str, rest: &str) -> bool {
+    let is_name = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
+    let rest = rest.trim_start_matches([' ', '\t']);
+    is_name
+        && rest
+            .strip_prefix('(')
+            .is_some_and(|r| r.trim_start_matches([' ', '\t']).starts_with(')'))
 }
 
 /// Length of `NAME` when `word` is an assignment `NAME=...` (or `NAME+=...`, whose
@@ -900,6 +963,73 @@ mod tests {
                 (Command, "help"),
                 (Keyword, "esac"),
                 (Command, "date"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_word_goes_on_after_a_substitution_inside_it() {
+        assert_eq!(
+            coloured("PATH=$(pwd)/bin:`pwd`/x env -i"),
+            vec![
+                (Variable, "PATH"),
+                (Operator, "="),
+                (Variable, "$("),
+                (Command, "pwd"),
+                (Operator, ")"),
+                (Variable, "`"),
+                (Command, "pwd"),
+                (Variable, "`"),
+                (Command, "env"),
+                (Option, "-i"),
+            ]
+        );
+        assert_eq!(
+            coloured("echo $(date)#x"),
+            vec![
+                (Command, "echo"),
+                (Variable, "$("),
+                (Command, "date"),
+                (Operator, ")"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_function_definition_is_not_a_run() {
+        let body = [
+            (Keyword, "{"),
+            (Command, "echo"),
+            (Operator, ";"),
+            (Keyword, "}"),
+        ];
+        let with = |head: &[(TokenKind, &'static str)]| {
+            head.iter().copied().chain(body).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            coloured("greet() { echo hi; }"),
+            with(&[(Variable, "greet"), (Operator, "()")])
+        );
+        assert_eq!(
+            coloured("greet ( ) { echo hi; }"),
+            with(&[(Variable, "greet"), (Operator, "("), (Operator, ")")])
+        );
+        assert_eq!(
+            coloured("function greet { echo hi; }"),
+            with(&[(Keyword, "function"), (Variable, "greet")])
+        );
+        assert_eq!(
+            coloured("function greet() { echo hi; }"),
+            with(&[(Keyword, "function"), (Variable, "greet"), (Operator, "()")])
+        );
+        // A subshell straight after a command name is still a subshell.
+        assert_eq!(
+            coloured("echo (x)"),
+            vec![
+                (Command, "echo"),
+                (Operator, "("),
+                (Command, "x"),
+                (Operator, ")")
             ]
         );
     }
