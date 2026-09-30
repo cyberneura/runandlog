@@ -20,6 +20,12 @@
      its own variable because a colour cannot be given an alpha in a place that
      only takes `var()`. */
   --accent-soft: rgba(31, 111, 235, 0.25);
+  /* Heads of a running cell and of one already run. The running one is the
+     accent washed out to a tint; the finished one is a grey darker than the other
+     heads, keeping only a trace of the accent's hue like the other neutrals, so
+     that it reads as set aside rather than as disabled. */
+  --head-running: #dce8fd;
+  --head-done: #e2e4ea;
   --ok: #1a7f37;
   --error: #cf222e;
   /* Syntax colours for commands. Each keeps at least 4.5:1 against --card. */
@@ -43,6 +49,8 @@
     --surface: #151b2a;
     --accent: #4493f8;
     --accent-soft: rgba(68, 147, 248, 0.28);
+    --head-running: #142a4d;
+    --head-done: #181a21;
     --ok: #3fb950;
     --error: #f85149;
     --tok-command: #79c0ff;
@@ -187,6 +195,33 @@ button:disabled {
   padding: 8px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+}
+
+/* The head says where a cell stands, so that a run-all can be followed down the
+   window by colour: waiting cells keep the plain head, the running one is tinted
+   with the accent, and those already run are greyed and drawn with less contrast.
+   Waiting is the state the reader still has to act on, so it is the one left as
+   it was. */
+.cell.running .cell-head {
+  background: var(--head-running);
+}
+
+.cell.done .cell-head {
+  background: var(--head-done);
+}
+
+.cell.done .number {
+  opacity: 0.6;
+}
+
+/* The command of a cell already run is faded, not recoloured: the syntax colours
+   stay, only quieter, so it is still readable when the reader goes back to it.
+   This deliberately takes the text below the 4.5:1 the colours keep elsewhere --
+   low contrast is the point, asked for in CYBERNEURA-DEV-895 -- and it applies
+   only to cells that are finished; waiting and running commands keep full
+   contrast. */
+.cell.done .command {
+  opacity: 0.5;
 }
 
 .number {

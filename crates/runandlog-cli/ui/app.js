@@ -185,8 +185,14 @@ function renderCell(cell) {
   const section = document.createElement('section')
   section.className = 'cell'
   section.dataset.index = String(cell.index)
+  // A cell holding a result has been run, whether in this window or before the
+  // file was opened: the result is in the document either way, and it is the same
+  // thing the Run button goes by when it says Re-run.
+  const hasResult = cell.result !== null && cell.result !== undefined
   if (running === cell.index) {
     section.classList.add('running')
+  } else if (hasResult) {
+    section.classList.add('done')
   }
 
   const head = document.createElement('div')
@@ -213,7 +219,6 @@ function renderCell(cell) {
   // The label is a glyph plus a word, so the button reads the same way whether or
   // not the glyph renders. A cell holding a result says Re-run, since pressing it
   // replaces that result rather than adding one.
-  const hasResult = cell.result !== null && cell.result !== undefined
   button.textContent =
     running === cell.index ? '▶ Running…' : hasResult ? '↻ Re-run' : '▶ Run'
   button.disabled = busy
