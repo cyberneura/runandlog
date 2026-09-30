@@ -142,6 +142,11 @@ available while a command is running, since copying changes nothing.
 Commands are syntax-highlighted as shell, with the same colouring rules as the
 TUI, in colours that follow the system's light or dark appearance.
 
+A cell's header shows where it stands: a cell not yet run keeps the plain header,
+the one running now has a light blue header, and a cell that already holds a
+result has a grey one with its command faded, so that the cells still to come
+stand out during a run-all.
+
 The cell being run shows what the command is printing, scrolled to the newest
 line, and the finished result takes its place when the command ends. Only the tail
 is kept: a command that prints without stopping fills neither the window nor its
