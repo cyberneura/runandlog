@@ -16,6 +16,21 @@
       </div>
     </header>
 
+    <div class="find" id="find" role="search" hidden>
+      <input
+        id="find-input"
+        type="text"
+        placeholder="Find"
+        aria-label="Find in the document"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <span class="find-count" id="find-count" aria-live="polite"></span>
+      <button id="find-prev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match">↑</button>
+      <button id="find-next" type="button" title="Next match (Enter)" aria-label="Next match">↓</button>
+      <button id="find-close" type="button" title="Close (Esc)" aria-label="Close">✕</button>
+    </div>
+
     <main id="cells" class="cells"></main>
 
     <footer class="status" id="status">Ready.</footer>

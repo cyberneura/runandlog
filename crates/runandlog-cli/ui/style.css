@@ -36,6 +36,11 @@
   --tok-variable: #953800;
   --tok-comment: var(--muted);
   --tok-operator: #cf222e;
+  /* Find: every match gets a pale wash that leaves the syntax colours readable,
+     and the current one a stronger colour with its own text colour on top. */
+  --find-match: #fff1a8;
+  --find-current: #ffb347;
+  --find-current-fg: #1f2328;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -60,6 +65,9 @@
     --tok-variable: #ffa657;
     --tok-comment: var(--muted);
     --tok-operator: #ff7b72;
+    --find-match: #5c4a00;
+    --find-current: #f0a030;
+    --find-current-fg: #0d1220;
   }
 }
 
@@ -124,6 +132,69 @@ button:hover:not(:disabled) {
 button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* The find bar (Cmd+F / Ctrl+F). The webview has no find of its own -- WKWebView
+   offers none to an app that does not build it -- so this is the window's. */
+.find {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+/* `display: flex` above would otherwise beat the `hidden` attribute, which only
+   sets `display: none` at the user-agent level. */
+.find[hidden] {
+  display: none;
+}
+
+.find input {
+  flex: 0 1 320px;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--fg);
+  font: inherit;
+}
+
+.find input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.find-count {
+  min-width: 6em;
+  font-size: 12.5px;
+  color: var(--muted);
+  /* Digits of equal width, so the count does not jiggle while stepping through. */
+  font-variant-numeric: tabular-nums;
+}
+
+/* "No matches" in the error colour, so a query that found nothing is seen at a
+   glance rather than read. */
+.find-count[data-empty='true'] {
+  color: var(--error);
+}
+
+.find button {
+  padding: 2px 8px;
+}
+
+/* Painted with the CSS Custom Highlight API rather than by wrapping the text in
+   elements: the commands are built from coloured spans and the live output is
+   rewritten on every chunk, and neither has to know a search is open. */
+::highlight(find-match) {
+  background-color: var(--find-match);
+}
+
+::highlight(find-current) {
+  background-color: var(--find-current);
+  color: var(--find-current-fg);
 }
 
 .cells {

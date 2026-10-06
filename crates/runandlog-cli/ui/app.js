@@ -22,6 +22,12 @@ const passwordForm = document.getElementById('password-form')
 const passwordPrompt = document.getElementById('password-prompt')
 const passwordInput = document.getElementById('password-input')
 const passwordDecline = document.getElementById('password-decline')
+const findBar = document.getElementById('find')
+const findInput = document.getElementById('find-input')
+const findCount = document.getElementById('find-count')
+const findPrevButton = document.getElementById('find-prev')
+const findNextButton = document.getElementById('find-next')
+const findCloseButton = document.getElementById('find-close')
 
 /** Index of the cell being run, or null when idle. */
 let running = null
@@ -33,6 +39,12 @@ let running = null
  * command that prints without stopping, for text nobody is reading.
  */
 let live = ''
+/**
+ * How much has been cut off the front of `live` during this run. Lets find name
+ * a match in the live output by where it is in everything the command printed,
+ * which does not move when older text is dropped; its offset in `live` does.
+ */
+let liveDropped = 0
 /** How much of a running command's output the window keeps. */
 const LIVE_MAX_CHARS = 20000
 /** Buttons are disabled while a run is in flight. */
@@ -164,6 +176,7 @@ function render(doc) {
     empty.className = 'empty'
     empty.textContent = 'No shell / sh / bash / zsh code block found.'
     cellsEl.append(empty)
+    scheduleFind(null)
     return
   }
 
@@ -179,6 +192,9 @@ function render(doc) {
   // built: a detached element has no height, so the scroll would have gone
   // nowhere.
   scrollToEnd(liveElement(running))
+  // Every cell is new, so the matches found in the old ones point at text that is
+  // no longer on screen.
+  scheduleFind(null)
 }
 
 function renderCell(cell) {
@@ -433,6 +449,7 @@ function appendLive(index, text) {
     if (isLowSurrogate(live.charCodeAt(start))) {
       start += 1
     }
+    liveDropped += start
     live = live.slice(start)
   }
   // Written straight into the existing element rather than by redrawing: a command
@@ -440,7 +457,13 @@ function appendLive(index, text) {
   const element = liveElement(index)
   if (element) {
     element.textContent = live
-    scrollToEnd(element)
+    // Except while find is showing a match in it: following the newest line
+    // would carry the match the reader stepped to out of sight on the next chunk.
+    if (!holdsCurrentMatch(element)) {
+      scrollToEnd(element)
+    }
+    // Only this block changed, so only it is searched again.
+    scheduleFind(element)
   }
 }
 
@@ -492,6 +515,7 @@ async function runCell(index) {
   } finally {
     running = null
     live = ''
+    liveDropped = 0
     dismissPassword()
     setBusy(false)
     await refresh()
@@ -520,6 +544,7 @@ async function runAll() {
   } finally {
     running = null
     live = ''
+    liveDropped = 0
     dismissPassword()
     setBusy(false)
     await refresh()
@@ -561,6 +586,437 @@ async function reload(quiet) {
   }
 }
 
+// Find (Cmd+F on macOS, Ctrl+F elsewhere).
+//
+// The webview has no find of its own -- WKWebView gives an app none unless the
+// app builds it -- so the window carries a small one. It searches what is on
+// screen: each cell's command and its result, or the live output of the cell
+// that is running.
+//
+// Matches are painted with the CSS Custom Highlight API, which colours ranges of
+// text without touching the DOM. Wrapping them in elements would have to be
+// undone and redone around every redraw, cut through the spans a command is
+// coloured with, and fight `appendLive`, which rewrites the live block on every
+// chunk. A webview without the API still finds, counts and scrolls to each
+// match; it just cannot colour them.
+
+/** Whether the webview can paint ranges of text (the Custom Highlight API). */
+const canHighlight =
+  typeof CSS !== 'undefined' &&
+  CSS.highlights !== undefined &&
+  typeof Highlight === 'function'
+/**
+ * Most matches kept at once. A one-letter query over a long log can match
+ * hundreds of thousands of times, and every match is a Range the webview has to
+ * keep up to date and paint. The count says when it stopped.
+ */
+const FIND_MAX_MATCHES = 5000
+/** macOS uses Cmd for the shortcuts, where Ctrl+F is a caret movement. */
+const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+
+/**
+ * The matches, in document order. Each is `{ cell, part, start, pre, range }`:
+ * `cell` is the cell's index, `part` 0 for the command and 1 for the output,
+ * and `start` the offset of the match in that block's text (in the live output,
+ * in everything the command has printed this run). The first three are
+ * what orders matches and what picks the same match out again after a redraw.
+ */
+let matches = []
+/** Index into `matches` of the current match, or -1. */
+let currentMatch = -1
+/** Whether `matches` stopped at `FIND_MAX_MATCHES`. */
+let matchesCapped = false
+/** The query compiled, or null when there is nothing to search for. */
+let findPattern = null
+/**
+ * Work waiting for the next frame: `true` to search everything again, or the
+ * blocks whose text changed. Batched because live output can arrive many times
+ * between two frames, and searching once per frame is all anyone can see.
+ */
+let findPending = null
+let findFrame = null
+
+/** Whether a key press is the platform's Cmd/Ctrl plus `letter`. */
+function isShortcut(event, letter) {
+  if (event.altKey || typeof event.key !== 'string') {
+    return false
+  }
+  if (event.key.toLowerCase() !== letter) {
+    return false
+  }
+  return isMac
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Compiles the query. Matched as plain text and case-insensitively, the way a
+ * browser's find does. A regular expression rather than comparing lowercased
+ * copies, because lowercasing can change a string's length (`İ` becomes two code
+ * units) and the offsets would no longer line up with the text on screen.
+ */
+function compileQuery(query) {
+  return query === '' ? null : new RegExp(escapeRegExp(query), 'giu')
+}
+
+/** Orders two matches (or keys) by where they are in the document. */
+function compareKeys(a, b) {
+  return a.cell - b.cell || a.part - b.part || a.start - b.start
+}
+
+/** The key of the current match, or null. */
+function currentKey() {
+  if (currentMatch < 0 || currentMatch >= matches.length) {
+    return null
+  }
+  const { cell, part, start } = matches[currentMatch]
+  return { cell, part, start }
+}
+
+/** The blocks of text find looks through, in document order. */
+function searchableBlocks() {
+  return cellsEl.querySelectorAll('section.cell pre.command, section.cell pre.result')
+}
+
+/**
+ * Finds the query in one block, appending to `out`. Stops once `out` holds
+ * `limit` matches and reports whether it had to.
+ *
+ * The text of a block is spread over several text nodes -- a command is one span
+ * per coloured piece -- so the nodes are joined to search across those seams and
+ * each match is mapped back onto the nodes it spans.
+ */
+function findInBlock(pre, out, limit) {
+  const cell = Number(pre.closest('section.cell').dataset.index)
+  const part = pre.classList.contains('command') ? 0 : 1
+  // Live output is numbered from the start of everything the command printed,
+  // not from the start of the tail kept, so that a match keeps its key when the
+  // front of the tail is cut away.
+  const base = pre.classList.contains('live') ? liveDropped : 0
+  const nodes = []
+  const starts = []
+  let text = ''
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT)
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    nodes.push(node)
+    starts.push(text.length)
+    text += node.data
+  }
+  findPattern.lastIndex = 0
+  let match
+  while ((match = findPattern.exec(text)) !== null) {
+    if (out.length >= limit) {
+      return true
+    }
+    const start = match.index
+    const end = start + match[0].length
+    const range = document.createRange()
+    const first = nodeAt(starts, start)
+    // The node holding the last character, not the one at `end`: a match that
+    // ends where a span ends belongs to that span.
+    const last = nodeAt(starts, end - 1)
+    range.setStart(nodes[first], start - starts[first])
+    range.setEnd(nodes[last], end - starts[last])
+    out.push({ cell, part, start: base + start, pre, range })
+  }
+  return false
+}
+
+/**
+ * Index of the text node holding `offset`: the last one starting at or before
+ * it. The last rather than the first, so that an empty node sharing a start with
+ * the node after it is skipped.
+ */
+function nodeAt(starts, offset) {
+  let low = 0
+  let high = starts.length - 1
+  while (low < high) {
+    const middle = (low + high + 1) >> 1
+    if (starts[middle] <= offset) {
+      low = middle
+    } else {
+      high = middle - 1
+    }
+  }
+  return low
+}
+
+/** Searches every block again. */
+function findEverywhere() {
+  const found = []
+  matchesCapped = false
+  if (findPattern !== null) {
+    for (const pre of searchableBlocks()) {
+      if (findInBlock(pre, found, FIND_MAX_MATCHES)) {
+        matchesCapped = true
+        break
+      }
+    }
+  }
+  matches = found
+}
+
+/**
+ * Searches one block again and puts its matches in place of its old ones. Falls
+ * back to searching everything when the block is gone or the cap is in play,
+ * where splicing could not say which matches the cap should keep.
+ */
+function findAgainIn(pre) {
+  if (!pre.isConnected || matchesCapped) {
+    findEverywhere()
+    return
+  }
+  const fresh = []
+  if (findInBlock(pre, fresh, FIND_MAX_MATCHES + 1)) {
+    findEverywhere()
+    return
+  }
+  const key = {
+    cell: Number(pre.closest('section.cell').dataset.index),
+    part: pre.classList.contains('command') ? 0 : 1,
+    start: 0,
+  }
+  let from = 0
+  while (from < matches.length && compareKeys(matches[from], key) < 0) {
+    from += 1
+  }
+  let to = from
+  while (to < matches.length && matches[to].pre === pre) {
+    to += 1
+  }
+  if (matches.length - (to - from) + fresh.length > FIND_MAX_MATCHES) {
+    findEverywhere()
+    return
+  }
+  matches.splice(from, to - from, ...fresh)
+}
+
+/** Index of the first match at or after `key`, wrapping round to the first. */
+function matchAtOrAfter(key) {
+  if (matches.length === 0) {
+    return -1
+  }
+  const index = matches.findIndex((match) => compareKeys(match, key) >= 0)
+  return index === -1 ? 0 : index
+}
+
+/**
+ * Index of the first match not above the top of the list's view, so that a new
+ * search starts from what the reader is looking at rather than from the top of
+ * the file.
+ */
+function firstMatchInView() {
+  const top = cellsEl.getBoundingClientRect().top
+  const index = matches.findIndex(
+    (match) => match.range.getBoundingClientRect().bottom >= top,
+  )
+  return index === -1 ? (matches.length > 0 ? 0 : -1) : index
+}
+
+/** Paints the matches and writes the count. */
+function paintMatches() {
+  if (canHighlight) {
+    if (matches.length === 0) {
+      CSS.highlights.delete('find-match')
+      CSS.highlights.delete('find-current')
+    } else {
+      CSS.highlights.set(
+        'find-match',
+        new Highlight(...matches.map((match) => match.range)),
+      )
+      if (currentMatch >= 0) {
+        const current = new Highlight(matches[currentMatch].range)
+        // Drawn over the plain match it also is.
+        current.priority = 1
+        CSS.highlights.set('find-current', current)
+      } else {
+        CSS.highlights.delete('find-current')
+      }
+    }
+  }
+  const more = matchesCapped ? '+' : ''
+  findCount.textContent =
+    findPattern === null
+      ? ''
+      : matches.length === 0
+        ? 'No matches'
+        : `${currentMatch + 1} / ${matches.length}${more}`
+  findCount.dataset.empty = String(findPattern !== null && matches.length === 0)
+  findPrevButton.disabled = matches.length === 0
+  findNextButton.disabled = matches.length === 0
+}
+
+/** Whether find's current match is in `pre`. */
+function holdsCurrentMatch(pre) {
+  return (
+    !findBar.hidden &&
+    currentMatch >= 0 &&
+    currentMatch < matches.length &&
+    matches[currentMatch].pre === pre
+  )
+}
+
+/**
+ * Brings the current match into view: first inside its block, if the block
+ * scrolls on its own (the live output does), then in the list of cells. Left
+ * alone when it is already visible, so stepping through matches on one screen
+ * does not keep moving the page.
+ */
+function revealCurrentMatch(withinBlockOnly = false) {
+  if (currentMatch < 0) {
+    return
+  }
+  const { pre, range } = matches[currentMatch]
+  for (const box of withinBlockOnly ? [pre] : [pre, cellsEl]) {
+    if (box.scrollHeight <= box.clientHeight) {
+      continue
+    }
+    const target = range.getBoundingClientRect()
+    const frame = box.getBoundingClientRect()
+    if (target.top < frame.top || target.bottom > frame.bottom) {
+      box.scrollTop += target.top - frame.top - (box.clientHeight - target.height) / 2
+    }
+  }
+}
+
+/**
+ * Searches again after the document changed under an open search: a redraw
+ * (`pre` null) or new live output in one block. The current match is kept by its
+ * position in the document, and the list does not scroll -- a command printing
+ * must not pull the reader around while they read something else.
+ */
+function scheduleFind(pre) {
+  if (findBar.hidden || findPattern === null) {
+    return
+  }
+  if (pre === null || findPending === true) {
+    findPending = true
+  } else {
+    findPending = findPending || new Set()
+    findPending.add(pre)
+  }
+  if (findFrame === null) {
+    findFrame = requestAnimationFrame(runPendingFind)
+  }
+}
+
+function runPendingFind() {
+  findFrame = null
+  const pending = findPending
+  findPending = null
+  if (pending === null || findBar.hidden || findPattern === null) {
+    return
+  }
+  const key = currentKey()
+  if (pending === true) {
+    findEverywhere()
+  } else {
+    for (const pre of pending) {
+      findAgainIn(pre)
+    }
+  }
+  currentMatch = key === null ? (matches.length > 0 ? 0 : -1) : matchAtOrAfter(key)
+  paintMatches()
+  // A live block holding the current match no longer follows its end (see
+  // `appendLive`), and cutting the front of its tail moves the text up under it.
+  // Kept in view inside that block only: the list itself stays where the reader
+  // put it.
+  if (pending !== true && currentMatch >= 0 && pending.has(matches[currentMatch].pre)) {
+    revealCurrentMatch(true)
+  }
+}
+
+/** Searches for what is in the field now, after it was edited. */
+function findQuery() {
+  const key = currentKey()
+  findPattern = compileQuery(findInput.value)
+  findEverywhere()
+  // Typing more of a word keeps to the match already shown, as long as it still
+  // matches; a fresh search starts from what is in view.
+  currentMatch = key === null ? firstMatchInView() : matchAtOrAfter(key)
+  paintMatches()
+  revealCurrentMatch()
+}
+
+/** Moves to the next (`step` 1) or previous (`step` -1) match. */
+function stepMatch(step) {
+  if (matches.length === 0) {
+    return
+  }
+  currentMatch =
+    currentMatch < 0
+      ? step > 0
+        ? 0
+        : matches.length - 1
+      : (currentMatch + step + matches.length) % matches.length
+  paintMatches()
+  revealCurrentMatch()
+}
+
+function openFind() {
+  const wasHidden = findBar.hidden
+  findBar.hidden = false
+  findInput.focus()
+  findInput.select()
+  // Opened again with the last query still in the field: show its matches again,
+  // since closing took them away.
+  if (wasHidden && findInput.value !== '') {
+    currentMatch = -1
+    findQuery()
+  }
+}
+
+function closeFind() {
+  findBar.hidden = true
+  findPattern = null
+  matches = []
+  currentMatch = -1
+  matchesCapped = false
+  findPending = null
+  paintMatches()
+  findInput.blur()
+}
+
+findInput.addEventListener('input', findQuery)
+findInput.addEventListener('keydown', (event) => {
+  // Enter while an input method is composing (Japanese, say) confirms the
+  // composition; it is not a request for the next match.
+  if (event.isComposing || event.keyCode === 229) {
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    stepMatch(event.shiftKey ? -1 : 1)
+  }
+})
+findPrevButton.addEventListener('click', () => stepMatch(-1))
+findNextButton.addEventListener('click', () => stepMatch(1))
+findCloseButton.addEventListener('click', closeFind)
+
+// On the document, so that the shortcut works wherever the focus is. Nothing in
+// the app menu holds these keys, so they reach the page.
+document.addEventListener('keydown', (event) => {
+  // The password prompt is modal; find opens behind it with nowhere to type.
+  if (passwordDialog.open || event.isComposing) {
+    return
+  }
+  if (isShortcut(event, 'f') && !event.shiftKey) {
+    event.preventDefault()
+    openFind()
+  } else if (isShortcut(event, 'g') && !findBar.hidden) {
+    // Cmd+G / Shift+Cmd+G, the other way every Mac app steps through matches.
+    event.preventDefault()
+    stepMatch(event.shiftKey ? -1 : 1)
+  } else if (event.key === 'Escape' && !findBar.hidden) {
+    event.preventDefault()
+    closeFind()
+  }
+})
+
 runAllButton.addEventListener('click', runAll)
 stopButton.addEventListener('click', stop)
 reloadButton.addEventListener('click', () => reload(false))
@@ -593,11 +1049,13 @@ async function start() {
       // redraw.
       running = null
       live = ''
+      liveDropped = 0
       render(event.payload)
     }),
     listen('runandlog://started', (event) => {
       running = event.payload
       live = ''
+      liveDropped = 0
       stopButton.disabled = false
       setStatus(`Running cell ${event.payload + 1}…`, 'info')
       // Redraw so the cell being run shows its spinner label and its live output.
