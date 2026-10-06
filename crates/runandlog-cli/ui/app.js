@@ -277,6 +277,7 @@ function renderCell(cell) {
     const output = document.createElement('pre')
     output.className = 'result live'
     output.textContent = live
+    output.dataset.dropped = String(liveDropped)
     section.append(output)
   } else if (hasResult) {
     const result = document.createElement('pre')
@@ -457,6 +458,8 @@ function appendLive(index, text) {
   const element = liveElement(index)
   if (element) {
     element.textContent = live
+    // Kept with the text it describes; see `liveBase`.
+    element.dataset.dropped = String(liveDropped)
     // Except while find is showing a match in it: following the newest line
     // would carry the match the reader stepped to out of sight on the next chunk.
     if (!holdsCurrentMatch(element)) {
@@ -616,12 +619,11 @@ const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 
 /**
  * The matches, in document order. Each is
- * `{ cell, part, start, offset, pre, range }`: `cell` is the cell's index,
- * `part` 0 for the command and 1 for the output, `offset` where the match starts
- * in the block's text, and `start` the same but, in the live output, counted
- * from the start of everything the command has printed this run. `cell`, `part`
- * and `start` are what order matches and what pick the same match out again
- * after a redraw.
+ * `{ cell, part, start, pre, range }`: `cell` is the cell's index, `part` 0 for
+ * the command and 1 for the output, and `start` where the match starts in the
+ * block's text -- in the live output, counted from the start of everything the
+ * command has printed this run. The first three are what order matches and what
+ * pick the same match out again after a redraw.
  */
 let matches = []
 /** Index into `matches` of the current match, or -1. */
@@ -689,17 +691,20 @@ function currentKey() {
   if (currentMatch < 0 || currentMatch >= matches.length) {
     return null
   }
-  const { cell, part, start, offset, pre } = matches[currentMatch]
+  const { cell, part, start, pre } = matches[currentMatch]
   if (!pre.classList.contains('live')) {
     return { cell, part, start }
   }
+  // Everything printed so far, as the block now holds it: the text it shows plus
+  // what was cut from in front of that text. Read from the block rather than from
+  // `liveDropped`, which a finished run resets before its redraw is searched
+  // again on the next frame; and as it is now rather than as it was when the
+  // match was found, since more output may have come and trimmed the front in
+  // between (Codex review). A block the redraw has replaced keeps its text.
   // Trailing newlines are not counted: the written-back result drops them
-  // (`render::normalize`). Worked out from the match's own offset in the block,
-  // not from `liveDropped`: by the time a finished run's redraw is searched again
-  // on the next frame, that has already been reset for the next run (Codex
-  // review). The detached block still holds the text it had.
-  const outputLength = pre.textContent.replace(/\n+$/, '').length
-  return { cell, part, start, fromEnd: outputLength - offset }
+  // (`render::normalize`).
+  const printed = liveBase(pre) + pre.textContent.replace(/\n+$/, '').length
+  return { cell, part, start, fromEnd: printed - start }
 }
 
 /**
@@ -748,6 +753,15 @@ function restoreCurrent(key) {
   return matchAtOrAfter(key)
 }
 
+/**
+ * How much of the run's output had been cut away in front of the text a block
+ * shows: 0 for anything but live output. Stored on the block each time its text
+ * is written, so that the two always describe the same moment.
+ */
+function liveBase(pre) {
+  return pre.classList.contains('live') ? Number(pre.dataset.dropped || 0) : 0
+}
+
 /** The blocks of text find looks through, in document order. */
 function searchableBlocks() {
   return cellsEl.querySelectorAll('section.cell pre.command, section.cell pre.result')
@@ -767,7 +781,7 @@ function findInBlock(pre, out, limit) {
   // Live output is numbered from the start of everything the command printed,
   // not from the start of the tail kept, so that a match keeps its key when the
   // front of the tail is cut away.
-  const base = pre.classList.contains('live') ? liveDropped : 0
+  const base = liveBase(pre)
   const nodes = []
   const starts = []
   let text = ''
@@ -792,7 +806,7 @@ function findInBlock(pre, out, limit) {
     const last = nodeAt(starts, end - 1)
     range.setStart(nodes[first], start - starts[first])
     range.setEnd(nodes[last], end - starts[last])
-    out.push({ cell, part, start: base + start, offset: start, pre, range })
+    out.push({ cell, part, start: base + start, pre, range })
   }
   return false
 }
