@@ -668,13 +668,60 @@ function compareKeys(a, b) {
   return a.cell - b.cell || a.part - b.part || a.start - b.start
 }
 
-/** The key of the current match, or null. */
+/**
+ * The key of the current match, or null. A match in live output also says how
+ * many matches follow it in that block (`fromEnd`); see `restoreCurrent`.
+ */
 function currentKey() {
   if (currentMatch < 0 || currentMatch >= matches.length) {
     return null
   }
-  const { cell, part, start } = matches[currentMatch]
-  return { cell, part, start }
+  const { cell, part, start, pre } = matches[currentMatch]
+  if (!pre.classList.contains('live')) {
+    return { cell, part, start }
+  }
+  let fromEnd = 0
+  for (let i = currentMatch + 1; i < matches.length && matches[i].pre === pre; i++) {
+    fromEnd += 1
+  }
+  return { cell, part, start, fromEnd }
+}
+
+/**
+ * Index of the match to make current again after the matches were found anew.
+ *
+ * Usually the first match at or after the old one's place. The exception is a
+ * match in live output whose command has since finished: its block is now the
+ * written-back result, which puts a summary line and a fence before the output
+ * (or holds only a link, when the output went to a file), so an offset into the
+ * live output points at the wrong text in it. The output is the end of the result
+ * just as it was the end of the live block, so the match is found again by how
+ * many matches came after it (Codex review).
+ */
+function restoreCurrent(key) {
+  if (key === null) {
+    return matches.length > 0 ? 0 : -1
+  }
+  if (key.fromEnd !== undefined) {
+    const stillLive = matches.some(
+      (match) => match.cell === key.cell && match.pre.classList.contains('live'),
+    )
+    if (!stillLive) {
+      const inResult = []
+      matches.forEach((match, index) => {
+        if (match.cell === key.cell && match.part === key.part) {
+          inResult.push(index)
+        }
+      })
+      if (inResult.length > key.fromEnd) {
+        return inResult[inResult.length - 1 - key.fromEnd]
+      }
+      if (inResult.length > 0) {
+        return inResult[0]
+      }
+    }
+  }
+  return matchAtOrAfter(key)
 }
 
 /** The blocks of text find looks through, in document order. */
@@ -919,7 +966,7 @@ function runPendingFind() {
       findAgainIn(pre)
     }
   }
-  currentMatch = key === null ? (matches.length > 0 ? 0 : -1) : matchAtOrAfter(key)
+  currentMatch = restoreCurrent(key)
   paintMatches()
   // A live block holding the current match no longer follows its end (see
   // `appendLive`), and cutting the front of its tail moves the text up under it.
