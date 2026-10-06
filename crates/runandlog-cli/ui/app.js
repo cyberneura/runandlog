@@ -615,11 +615,13 @@ const FIND_MAX_MATCHES = 5000
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 
 /**
- * The matches, in document order. Each is `{ cell, part, start, pre, range }`:
- * `cell` is the cell's index, `part` 0 for the command and 1 for the output,
- * and `start` the offset of the match in that block's text (in the live output,
- * in everything the command has printed this run). The first three are
- * what orders matches and what picks the same match out again after a redraw.
+ * The matches, in document order. Each is
+ * `{ cell, part, start, offset, pre, range }`: `cell` is the cell's index,
+ * `part` 0 for the command and 1 for the output, `offset` where the match starts
+ * in the block's text, and `start` the same but, in the live output, counted
+ * from the start of everything the command has printed this run. `cell`, `part`
+ * and `start` are what order matches and what pick the same match out again
+ * after a redraw.
  */
 let matches = []
 /** Index into `matches` of the current match, or -1. */
@@ -687,14 +689,17 @@ function currentKey() {
   if (currentMatch < 0 || currentMatch >= matches.length) {
     return null
   }
-  const { cell, part, start, pre } = matches[currentMatch]
+  const { cell, part, start, offset, pre } = matches[currentMatch]
   if (!pre.classList.contains('live')) {
     return { cell, part, start }
   }
   // Trailing newlines are not counted: the written-back result drops them
-  // (`render::normalize`).
+  // (`render::normalize`). Worked out from the match's own offset in the block,
+  // not from `liveDropped`: by the time a finished run's redraw is searched again
+  // on the next frame, that has already been reset for the next run (Codex
+  // review). The detached block still holds the text it had.
   const outputLength = pre.textContent.replace(/\n+$/, '').length
-  return { cell, part, start, fromEnd: outputLength - (start - liveDropped) }
+  return { cell, part, start, fromEnd: outputLength - offset }
 }
 
 /**
@@ -787,7 +792,7 @@ function findInBlock(pre, out, limit) {
     const last = nodeAt(starts, end - 1)
     range.setStart(nodes[first], start - starts[first])
     range.setEnd(nodes[last], end - starts[last])
-    out.push({ cell, part, start: base + start, pre, range })
+    out.push({ cell, part, start: base + start, offset: start, pre, range })
   }
   return false
 }
