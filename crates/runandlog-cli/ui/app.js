@@ -847,16 +847,11 @@ function findEverywhere() {
 
 /**
  * Searches one block again and puts its matches in place of its old ones. Falls
- * back to searching everything when the block is gone or the cap is in play,
- * where splicing could not say which matches the cap should keep.
+ * back to searching everything when the block is gone or the cap cuts through
+ * it, where splicing could not say which matches the cap should keep.
  */
 function findAgainIn(pre) {
-  if (!pre.isConnected || matchesCapped) {
-    findEverywhere()
-    return
-  }
-  const fresh = []
-  if (findInBlock(pre, fresh, FIND_MAX_MATCHES + 1)) {
+  if (!pre.isConnected) {
     findEverywhere()
     return
   }
@@ -865,10 +860,30 @@ function findAgainIn(pre) {
     part: pre.classList.contains('command') ? 0 : 1,
     start: 0,
   }
-  let from = 0
-  while (from < matches.length && compareKeys(matches[from], key) < 0) {
-    from += 1
+  if (matchesCapped) {
+    // The cap was reached before this block: nothing in it is kept, so new
+    // output there changes nothing. Searching everything again would rebuild
+    // every kept match on each frame a command prints (Codex review).
+    if (compareKeys(matches[matches.length - 1], key) < 0) {
+      return
+    }
+    // The cap falls in this block (or after it): the matches before it stand,
+    // and this block is searched again up to the cap. Only if it now falls short
+    // of the cap do the blocks after it come into play.
+    const kept = matches.slice(0, firstMatchFrom(key))
+    if (findInBlock(pre, kept, FIND_MAX_MATCHES)) {
+      matches = kept
+      return
+    }
+    findEverywhere()
+    return
   }
+  const fresh = []
+  if (findInBlock(pre, fresh, FIND_MAX_MATCHES + 1)) {
+    findEverywhere()
+    return
+  }
+  const from = firstMatchFrom(key)
   let to = from
   while (to < matches.length && matches[to].pre === pre) {
     to += 1
@@ -878,6 +893,15 @@ function findAgainIn(pre) {
     return
   }
   matches.splice(from, to - from, ...fresh)
+}
+
+/** Index of the first match at or after `key`, or the length if there is none. */
+function firstMatchFrom(key) {
+  let index = 0
+  while (index < matches.length && compareKeys(matches[index], key) < 0) {
+    index += 1
+  }
+  return index
 }
 
 /** Index of the first match at or after `key`, wrapping round to the first. */
