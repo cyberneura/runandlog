@@ -147,6 +147,15 @@ the one running now has a light blue header, and a cell that already holds a
 result has a grey one with its command faded, so that the cells still to come
 stand out during a run-all.
 
+`Cmd+F` (`Ctrl+F` on Linux and Windows) opens a find bar. It searches the
+commands and results on screen as you type, case-insensitively, highlights every
+match and shows which one you are on (`3 / 12`). `Enter` / `Shift+Enter` (or the
+arrow buttons, or `Cmd+G` / `Shift+Cmd+G`) step to the next and previous match and
+scroll it into view, and `Esc` closes the bar and clears the highlights. The search
+follows the output of a running command as it arrives. Highlighting needs a webview
+with the CSS Custom Highlight API (macOS 14.2 / Safari 17.2 or later); an older one
+still finds, counts and scrolls to each match without colouring it.
+
 The cell being run shows what the command is printing, scrolled to the newest
 line, and the finished result takes its place when the command ends. Only the tail
 is kept: a command that prints without stopping fills neither the window nor its
