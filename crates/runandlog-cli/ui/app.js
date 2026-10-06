@@ -615,7 +615,7 @@ const FIND_MAX_MATCHES = 5000
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 
 /**
- * The matches, in document order. Each is `{ cell, part, start, end, pre, range }`:
+ * The matches, in document order. Each is `{ cell, part, start, pre, range }`:
  * `cell` is the cell's index, `part` 0 for the command and 1 for the output,
  * and `start` the offset of the match in that block's text (in the live output,
  * in everything the command has printed this run). The first three are
@@ -681,7 +681,7 @@ function compareKeys(a, b) {
 
 /**
  * The key of the current match, or null. A match in live output also says how
- * many matches follow it in that block (`fromEnd`); see `restoreCurrent`.
+ * far it starts from the end of the output (`fromEnd`); see `restoreCurrent`.
  */
 function currentKey() {
   if (currentMatch < 0 || currentMatch >= matches.length) {
@@ -691,11 +691,10 @@ function currentKey() {
   if (!pre.classList.contains('live')) {
     return { cell, part, start }
   }
-  let fromEnd = 0
-  for (let i = currentMatch + 1; i < matches.length && matches[i].pre === pre; i++) {
-    fromEnd += 1
-  }
-  return { cell, part, start, fromEnd }
+  // Trailing newlines are not counted: the written-back result drops them
+  // (`render::normalize`).
+  const outputLength = pre.textContent.replace(/\n+$/, '').length
+  return { cell, part, start, fromEnd: outputLength - (start - liveDropped) }
 }
 
 /**
@@ -705,10 +704,11 @@ function currentKey() {
  * match in live output whose command has since finished: its block is now the
  * written-back result, which puts a summary line and a fence before the output
  * (or holds only a link, when the output went to a file), so an offset into the
- * live output points at the wrong text in it. The output is the end of the result
- * just as it was the end of the live block, so the match is found again by how
- * many matches came after it (Codex review). Matches running into the closing
- * fence are left out of that count: the live output had no fence after it.
+ * live output points at the wrong text in it. The output ends the result -- up to
+ * the closing fence -- just as it ended the live block, so the match is found
+ * again by its distance from that end (Codex review). Counted in characters
+ * rather than in matches: the list of matches can be cut off at
+ * `FIND_MAX_MATCHES`, and the result has matches the live block did not.
  */
 function restoreCurrent(key) {
   if (key === null) {
@@ -719,23 +719,24 @@ function restoreCurrent(key) {
       (match) => match.cell === key.cell && match.pre.classList.contains('live'),
     )
     if (!stillLive) {
-      const inResult = []
-      let end = null
-      matches.forEach((match, index) => {
+      let target = null
+      let firstInResult = -1
+      for (let index = 0; index < matches.length; index++) {
+        const match = matches[index]
         if (match.cell !== key.cell || match.part !== key.part) {
-          return
+          continue
         }
-        // One result block per cell, so its end is read once.
-        end = end ?? outputEnd(match.pre)
-        if (match.end <= end) {
-          inResult.push(index)
+        // One result block per cell, so where its output ends is read once.
+        target = target ?? outputEnd(match.pre) - key.fromEnd
+        if (firstInResult === -1) {
+          firstInResult = index
         }
-      })
-      if (inResult.length > key.fromEnd) {
-        return inResult[inResult.length - 1 - key.fromEnd]
+        if (match.start >= target) {
+          return index
+        }
       }
-      if (inResult.length > 0) {
-        return inResult[0]
+      if (firstInResult !== -1) {
+        return firstInResult
       }
     }
   }
@@ -786,7 +787,7 @@ function findInBlock(pre, out, limit) {
     const last = nodeAt(starts, end - 1)
     range.setStart(nodes[first], start - starts[first])
     range.setEnd(nodes[last], end - starts[last])
-    out.push({ cell, part, start: base + start, end: base + end, pre, range })
+    out.push({ cell, part, start: base + start, pre, range })
   }
   return false
 }
