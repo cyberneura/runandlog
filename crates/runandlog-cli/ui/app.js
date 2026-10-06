@@ -615,7 +615,7 @@ const FIND_MAX_MATCHES = 5000
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 
 /**
- * The matches, in document order. Each is `{ cell, part, start, pre, range }`:
+ * The matches, in document order. Each is `{ cell, part, start, end, pre, range }`:
  * `cell` is the cell's index, `part` 0 for the command and 1 for the output,
  * and `start` the offset of the match in that block's text (in the live output,
  * in everything the command has printed this run). The first three are
@@ -663,6 +663,17 @@ function compileQuery(query) {
   return query === '' ? null : new RegExp(escapeRegExp(query), 'giu')
 }
 
+/**
+ * Where the command's output ends in a written-back result: before the closing
+ * fence `render::fenced` puts on its own last line (three or more backticks), or
+ * the end of the text when there is none.
+ */
+function outputEnd(pre) {
+  const text = pre.textContent
+  const fence = /\n`{3,}$/.exec(text)
+  return fence === null ? text.length : fence.index
+}
+
 /** Orders two matches (or keys) by where they are in the document. */
 function compareKeys(a, b) {
   return a.cell - b.cell || a.part - b.part || a.start - b.start
@@ -696,7 +707,8 @@ function currentKey() {
  * (or holds only a link, when the output went to a file), so an offset into the
  * live output points at the wrong text in it. The output is the end of the result
  * just as it was the end of the live block, so the match is found again by how
- * many matches came after it (Codex review).
+ * many matches came after it (Codex review). Matches running into the closing
+ * fence are left out of that count: the live output had no fence after it.
  */
 function restoreCurrent(key) {
   if (key === null) {
@@ -708,8 +720,14 @@ function restoreCurrent(key) {
     )
     if (!stillLive) {
       const inResult = []
+      let end = null
       matches.forEach((match, index) => {
-        if (match.cell === key.cell && match.part === key.part) {
+        if (match.cell !== key.cell || match.part !== key.part) {
+          return
+        }
+        // One result block per cell, so its end is read once.
+        end = end ?? outputEnd(match.pre)
+        if (match.end <= end) {
           inResult.push(index)
         }
       })
@@ -768,7 +786,7 @@ function findInBlock(pre, out, limit) {
     const last = nodeAt(starts, end - 1)
     range.setStart(nodes[first], start - starts[first])
     range.setEnd(nodes[last], end - starts[last])
-    out.push({ cell, part, start: base + start, pre, range })
+    out.push({ cell, part, start: base + start, end: base + end, pre, range })
   }
   return false
 }
