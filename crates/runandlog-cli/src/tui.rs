@@ -395,6 +395,10 @@ struct App {
     scroll: usize,
     /// Height of the body area. Used to adjust the scroll position.
     viewport: usize,
+    /// Whether the view follows the selected cell. Paging turns it off, so that
+    /// the view can be moved past the cell -- down to the text after the last
+    /// cell, which belongs to no cell -- and any other key turns it back on.
+    follow_selection: bool,
     status: String,
     /// The cell being run (0-based) and the spinner phase.
     running: Option<(usize, usize)>,
@@ -431,6 +435,7 @@ impl App {
             selected: 0,
             scroll: 0,
             viewport: 1,
+            follow_selection: true,
             status,
             running: None,
             live: LiveOutput::new(LIVE_LIMIT),
@@ -620,9 +625,12 @@ impl App {
         lines
     }
 
-    /// Nudges the scroll position so the selected cell stays on screen.
+    /// Nudges the scroll position so the selected cell stays on screen, unless
+    /// the reader has paged away from it.
     fn adjust_scroll(&mut self, rendered: &Rendered) {
-        if let Some(&(start, end)) = rendered.spans.get(self.selected) {
+        if self.follow_selection
+            && let Some(&(start, end)) = rendered.spans.get(self.selected)
+        {
             if start < self.scroll {
                 self.scroll = start;
             } else if end > self.scroll + self.viewport {
@@ -656,6 +664,7 @@ impl App {
             self.quit = true;
             return Ok(());
         }
+        self.follow_selection = !matches!(key.code, KeyCode::PageDown | KeyCode::PageUp);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.select(1),
             KeyCode::Char('k') | KeyCode::Up => self.select(-1),
@@ -1094,6 +1103,19 @@ mod tests {
         );
         // The cell starts at its title, so selecting it brings the title on screen.
         assert_eq!(rendered.spans, vec![(0, 7)]);
+
+        // The text after the last cell belongs to no cell, so paging has to be
+        // able to leave the selected cell behind to reach it (Codex review).
+        let mut app = app;
+        app.viewport = 2;
+        app.follow_selection = false;
+        app.scroll = 7;
+        app.adjust_scroll(&rendered);
+        assert_eq!(app.scroll, 7);
+        // Any other key brings the selected cell back.
+        app.follow_selection = true;
+        app.adjust_scroll(&rendered);
+        assert_eq!(app.scroll, 0);
     }
 
     #[test]

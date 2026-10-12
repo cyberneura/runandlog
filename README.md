@@ -106,7 +106,7 @@ editor) cannot be answered; give them their input on the command line instead
 | `Enter` / `r` | Run the selected cell |
 | `a` | Run every cell in order (stops if a result cannot be written back) |
 | `g` / `G` | Jump to the first / last cell |
-| `PageUp` / `PageDown` | Scroll |
+| `PageUp` / `PageDown` | Scroll (any other key brings the selected cell back into view) |
 | `R` | Reload the file |
 | `q` / `Esc` | Quit (while a command is running, quitting waits for it to finish) |
 | `Ctrl-C` | Quit at once, stopping the running command and keeping the output it produced |

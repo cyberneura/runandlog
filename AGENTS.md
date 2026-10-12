@@ -378,6 +378,9 @@ GUI は `CellView::heading` / `context` / `notes` と `DocumentView::epilogue` �
   レンダリングせずそのまま出す (GUI は `textContent`)。
 - GUI の検索 (Cmd+F) の対象には入れていない (検索のキーが `section.cell` 内の `pre` 前提のため)。
 - TUI は文章を折り返さない (コマンド・結果と同じく画面幅で切れる)。
+- **TUI の PageUp / PageDown は選択中のセルから離れてスクロールできる** (`App::follow_selection`、
+  Codex PR レビュー指摘)。以前は `adjust_scroll` が毎回選択中のセルの先頭へ引き戻していたので、
+  どのセルにも属さない最後の文章 (`epilogue`) に届かなかった。他のキーを押すと追従に戻る。
 
 ## アプリアイコン
 
