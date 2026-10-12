@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError, mpsc};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use runandlog_core::{Canceller, highlight};
+use runandlog_core::{Canceller, Prose, highlight};
 
 use crate::session::Session;
 
@@ -74,6 +74,37 @@ struct CellView {
     out_file: Option<String>,
     /// Body of the result block from the last run, without the markers.
     result: Option<String>,
+    /// The section heading above the cell, shown in its head (`Cell::heading`).
+    heading: Option<String>,
+    /// The text before that heading, shown above the cell (`Cell::context`).
+    context: Vec<ProseView>,
+    /// The paragraphs right above the command, shown under the head
+    /// (`Cell::notes`).
+    notes: Vec<String>,
+}
+
+/// A heading or paragraph of the text between cells (`runandlog_core::Prose`).
+///
+/// `level` is 0 for a paragraph and 1 to 6 for a heading.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ProseView {
+    level: u8,
+    text: String,
+}
+
+impl From<&Prose> for ProseView {
+    fn from(block: &Prose) -> ProseView {
+        match block {
+            Prose::Heading { level, text } => ProseView {
+                level: *level,
+                text: text.clone(),
+            },
+            Prose::Paragraph(text) => ProseView {
+                level: 0,
+                text: text.clone(),
+            },
+        }
+    }
 }
 
 /// A piece of a command and what it is (`runandlog_core::TokenKind::as_str`).
@@ -88,6 +119,8 @@ struct TokenView {
 struct DocumentView {
     path: String,
     cells: Vec<CellView>,
+    /// The text after the last cell, shown below the cells.
+    epilogue: Vec<ProseView>,
 }
 
 /// A piece of what a running command has printed.
@@ -344,11 +377,15 @@ fn document_view(session: &Session) -> DocumentView {
                 .collect(),
             out_file: cell.out_file.clone(),
             result: doc.result_text(cell).map(str::to_string),
+            heading: cell.heading.clone(),
+            context: cell.context.iter().map(ProseView::from).collect(),
+            notes: cell.notes.clone(),
         })
         .collect();
     DocumentView {
         path: session.path().display().to_string(),
         cells,
+        epilogue: doc.epilogue.iter().map(ProseView::from).collect(),
     }
 }
 
@@ -1049,6 +1086,40 @@ mod tests {
         assert_eq!(view.cells[0].result, None);
         assert_eq!(view.cells[1].number, 2);
         assert_eq!(view.cells[1].out_file.as_deref(), Some("log.txt"));
+    }
+
+    #[test]
+    fn the_view_carries_the_text_around_the_cells() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "doc.md",
+            "# Deploy\n\nIntro\n\n## Commit\n\nRecords it.\n\n```shell\ndate\n```\n\nDone.\n",
+        );
+        let view = document_view(&session(&path));
+
+        let cell = &view.cells[0];
+        assert_eq!(cell.heading.as_deref(), Some("Commit"));
+        assert_eq!(
+            cell.context,
+            vec![
+                ProseView {
+                    level: 1,
+                    text: "Deploy".to_string(),
+                },
+                ProseView {
+                    level: 0,
+                    text: "Intro".to_string(),
+                },
+            ]
+        );
+        assert_eq!(cell.notes, vec!["Records it.".to_string()]);
+        assert_eq!(
+            view.epilogue,
+            vec![ProseView {
+                level: 0,
+                text: "Done.".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -414,8 +414,14 @@ fn print_list(session: &Session) {
             Some(path) => format!(" -> {path}"),
             None => String::new(),
         };
+        // The section the cell sits in, put after the command like a shell
+        // comment so that the command still comes right after the number.
+        let heading = match &cell.heading {
+            Some(heading) => format!("  # {heading}"),
+            None => String::new(),
+        };
         println!(
-            "[{}] {}{out}",
+            "[{}] {}{out}{heading}",
             cell.display_number(),
             first_line(&cell.command)
         );

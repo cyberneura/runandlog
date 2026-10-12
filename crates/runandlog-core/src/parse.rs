@@ -4,6 +4,10 @@
 //! To keep the original text intact when writing results back, the parse result
 //! records positions as byte offsets into the source string, and edits are
 //! applied as plain range replacements.
+//!
+//! The text around the cells -- headings and paragraphs -- is also picked up
+//! (`Cell::heading` and friends), for display only. It plays no part in running
+//! or writing back.
 
 /// Opening marker of a result block.
 ///
@@ -44,6 +48,31 @@ pub struct Cell {
     pub result_span: Option<(usize, usize)>,
     /// Position to insert at when there is no result block yet.
     pub insert_at: usize,
+    /// The last heading written between the previous cell and this one: the name
+    /// of the section the cell belongs to, shown in the cell's head.
+    pub heading: Option<String>,
+    /// What comes before that heading -- the document's title and introduction for
+    /// the first cell, say. Shown above the cell, outside it.
+    ///
+    /// Empty when there is no heading between the previous cell and this one: the
+    /// text there is then in `notes`, since text right above a cell with no
+    /// heading in between is about that cell.
+    pub context: Vec<Prose>,
+    /// Paragraphs after `heading` (or after the previous cell, when there is no
+    /// heading), up to this cell's fence: the explanation of the command.
+    pub notes: Vec<String>,
+}
+
+/// A block of the text between cells, as shown alongside them.
+///
+/// The text is kept as written, inline Markdown and all; only the block structure
+/// is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prose {
+    /// A heading, `level` 1 to 6, with the `#` marks taken off.
+    Heading { level: u8, text: String },
+    /// A paragraph, its lines joined with `\n`.
+    Paragraph(String),
 }
 
 impl Cell {
@@ -60,6 +89,9 @@ pub struct Document {
     pub text: String,
     /// The command cells that were found.
     pub cells: Vec<Cell>,
+    /// The text after the last cell (or the whole text, when there are no cells).
+    /// Shown below the cells.
+    pub epilogue: Vec<Prose>,
 }
 
 /// An edit that replaces a slice of the text.
@@ -104,14 +136,30 @@ impl Document {
                     fence_end: block_end,
                     result_span: trailer.result_span,
                     insert_at: trailer.insert_at.unwrap_or(block_end),
+                    heading: None,
+                    context: Vec::new(),
+                    notes: Vec::new(),
                 });
             }
             i = next;
         }
 
+        // The text between one cell (with its result) and the next belongs to the
+        // next one.
+        let mut from = 0;
+        for cell in &mut cells {
+            let blocks = read_prose(&lines, from, cell.fence_start);
+            (cell.context, cell.heading, cell.notes) = split_prose(blocks);
+            from = cell
+                .result_span
+                .map_or(cell.insert_at, |(_, end)| end.max(cell.insert_at));
+        }
+        let epilogue = read_prose(&lines, from, text.len());
+
         Document {
             text: text.to_string(),
             cells,
+            epilogue,
         }
     }
 
@@ -487,6 +535,190 @@ fn unescape(target: &str, escapable: impl Fn(char) -> bool) -> String {
     out
 }
 
+/// Reads the headings and paragraphs in `from..to` (byte offsets on line starts).
+///
+/// Not a Markdown parser either: code fences, HTML comments (the result markers
+/// among them), thematic breaks and YAML front matter are skipped, ATX and setext
+/// headings are told apart from paragraphs, and everything else is paragraph text
+/// kept as written.
+fn read_prose(lines: &[Line<'_>], from: usize, to: usize) -> Vec<Prose> {
+    let mut blocks = Vec::new();
+    let mut paragraph: Vec<String> = Vec::new();
+    let flush = |paragraph: &mut Vec<String>, blocks: &mut Vec<Prose>| {
+        if !paragraph.is_empty() {
+            blocks.push(Prose::Paragraph(paragraph.join("\n")));
+            paragraph.clear();
+        }
+    };
+
+    let mut i = lines.partition_point(|line| line.start < from);
+    // Front matter is metadata, not something written for the reader.
+    if i == 0
+        && lines.first().is_some_and(|line| line.text == "---")
+        && let Some(close) = (1..lines.len()).find(|&j| matches!(lines[j].text, "---" | "..."))
+    {
+        i = close + 1;
+    }
+
+    let mut in_comment = false;
+    while i < lines.len() && lines[i].end <= to {
+        let raw = lines[i].text;
+        i += 1;
+        // Comments can start or end in the middle of a line, and what is inside
+        // one -- a `## heading` included -- is not shown.
+        let (visible, had_comment) = strip_comments(raw, &mut in_comment);
+        let line = visible.as_str();
+        let trimmed = line.trim();
+        if had_comment && trimmed.is_empty() {
+            // A comment of its own (an HTML block) ends the paragraph above it;
+            // the inside of one that opened mid-paragraph does not.
+            if raw.trim_start().starts_with("<!--") {
+                flush(&mut paragraph, &mut blocks);
+            }
+            continue;
+        }
+        if let Some(fence) = open_fence(line) {
+            flush(&mut paragraph, &mut blocks);
+            i = (i..lines.len())
+                .find(|&j| closes_fence(lines[j].text, &fence))
+                .map_or(lines.len(), |j| j + 1);
+            continue;
+        }
+        if let Some(level) = setext_level(trimmed)
+            && !paragraph.is_empty()
+            && line.len() - line.trim_start().len() <= 3
+        {
+            let text = paragraph
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            paragraph.clear();
+            blocks.push(Prose::Heading { level, text });
+            continue;
+        }
+        if trimmed.is_empty() || is_thematic_break(trimmed) {
+            flush(&mut paragraph, &mut blocks);
+            continue;
+        }
+        if let Some((level, text)) = atx_heading(line) {
+            flush(&mut paragraph, &mut blocks);
+            if !text.is_empty() {
+                blocks.push(Prose::Heading {
+                    level,
+                    text: text.to_string(),
+                });
+            }
+            continue;
+        }
+        paragraph.push(line.trim_end().to_string());
+    }
+    flush(&mut paragraph, &mut blocks);
+    blocks
+}
+
+/// Takes the HTML comments out of a line: (what is left, whether there was any
+/// comment on the line). `in_comment` carries a comment left open at the end of
+/// one line over to the next.
+fn strip_comments(line: &str, in_comment: &mut bool) -> (String, bool) {
+    let mut visible = String::new();
+    let mut had_comment = *in_comment;
+    let mut rest = line;
+    loop {
+        if *in_comment {
+            match rest.find("-->") {
+                Some(end) => {
+                    rest = &rest[end + 3..];
+                    *in_comment = false;
+                }
+                None => return (visible, true),
+            }
+        }
+        match rest.find("<!--") {
+            Some(start) => {
+                visible.push_str(&rest[..start]);
+                rest = &rest[start + 4..];
+                *in_comment = true;
+                had_comment = true;
+            }
+            None => {
+                visible.push_str(rest);
+                return (visible, had_comment);
+            }
+        }
+    }
+}
+
+/// Splits the text above a cell at its last heading: (what comes before the
+/// heading, the heading, the paragraphs after it).
+fn split_prose(mut blocks: Vec<Prose>) -> (Vec<Prose>, Option<String>, Vec<String>) {
+    let last_heading = blocks
+        .iter()
+        .rposition(|block| matches!(block, Prose::Heading { .. }));
+    let (heading, after) = match last_heading {
+        Some(at) => {
+            let after = blocks.split_off(at + 1);
+            let Some(Prose::Heading { text, .. }) = blocks.pop() else {
+                unreachable!("rposition found a heading here");
+            };
+            (Some(text), after)
+        }
+        None => (None, std::mem::take(&mut blocks)),
+    };
+    // After the last heading there are only paragraphs.
+    let notes = after
+        .into_iter()
+        .filter_map(|block| match block {
+            Prose::Paragraph(text) => Some(text),
+            Prose::Heading { .. } => None,
+        })
+        .collect();
+    (blocks, heading, notes)
+}
+
+/// Reads an ATX heading (`## Title`, optionally closed with `#` marks).
+fn atx_heading(line: &str) -> Option<(u8, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let level = rest.chars().take_while(|&c| c == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &rest[level..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let mut text = rest.trim();
+    // A closing sequence counts only when set apart by a space (`# C#` keeps it).
+    let without_closing = text.trim_end_matches('#');
+    if without_closing.is_empty() {
+        text = "";
+    } else if without_closing.ends_with([' ', '\t']) {
+        text = without_closing.trim_end();
+    }
+    Some((level as u8, text))
+}
+
+/// The level of a setext underline (`===` is 1, `---` is 2), if `trimmed` is one.
+fn setext_level(trimmed: &str) -> Option<u8> {
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c == '=') {
+        Some(1)
+    } else if !trimmed.is_empty() && trimmed.chars().all(|c| c == '-') {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// `---`, `***`, `___` (spaces allowed between the marks).
+fn is_thematic_break(trimmed: &str) -> bool {
+    let marks: Vec<char> = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    marks.len() >= 3 && matches!(marks[0], '-' | '*' | '_') && marks.iter().all(|&c| c == marks[0])
+}
+
 /// Removes as much leading indentation from a fence body as the fence itself has.
 fn dedent(body: &str, indent: usize) -> String {
     if indent == 0 {
@@ -707,6 +939,113 @@ mod tests {
         let md = "  ```shell\n  date\n  ```\n";
         let doc = Document::parse(md);
         assert_eq!(doc.cells[0].command, "date");
+    }
+
+    fn heading(level: u8, text: &str) -> Prose {
+        Prose::Heading {
+            level,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn picks_up_the_text_around_each_cell() {
+        // The shape of a typical handover document: a title and an introduction,
+        // then one section per command, each with its result already written back.
+        let md = "# Deploy\n\nRun from the top.\nStop on failure.\n\n## Commit\n\n```shell\ngit commit\n```\n\n<!-- runandlog:begin -->\nRan result: cell 1\n\n```text\n## not a heading\n```\n<!-- runandlog:end -->\n\n## Migrate\n\nApplies to production.\n\n```shell\npnpm migrate\n```\n\nAll done.\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells.len(), 2);
+
+        let first = &doc.cells[0];
+        assert_eq!(first.heading.as_deref(), Some("Commit"));
+        assert_eq!(
+            first.context,
+            vec![
+                heading(1, "Deploy"),
+                Prose::Paragraph("Run from the top.\nStop on failure.".to_string()),
+            ]
+        );
+        assert!(first.notes.is_empty());
+
+        // The previous cell's result -- markers, fence and all -- is not text.
+        let second = &doc.cells[1];
+        assert_eq!(second.heading.as_deref(), Some("Migrate"));
+        assert!(second.context.is_empty());
+        assert_eq!(second.notes, vec!["Applies to production.".to_string()]);
+
+        assert_eq!(
+            doc.epilogue,
+            vec![Prose::Paragraph("All done.".to_string())]
+        );
+    }
+
+    #[test]
+    fn text_without_a_heading_belongs_to_the_cell_below_it() {
+        let md = "```shell\na\n```\n\nThen check it:\n\n```shell\nb\n```\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[1].heading, None);
+        assert!(doc.cells[1].context.is_empty());
+        assert_eq!(doc.cells[1].notes, vec!["Then check it:".to_string()]);
+    }
+
+    #[test]
+    fn a_cell_with_nothing_above_it_has_no_text() {
+        let doc = Document::parse("```shell\na\n```\n```shell\nb\n```\n");
+        for cell in &doc.cells {
+            assert_eq!(cell.heading, None);
+            assert!(cell.context.is_empty());
+            assert!(cell.notes.is_empty());
+        }
+        assert!(doc.epilogue.is_empty());
+    }
+
+    #[test]
+    fn a_designated_output_file_is_not_text_of_the_next_cell() {
+        let md = "```shell\na\n```\n\nResult:\n[out.txt](out.txt)\n\n## Next\n\n```shell\nb\n```\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].out_file.as_deref(), Some("out.txt"));
+        assert_eq!(doc.cells[1].heading.as_deref(), Some("Next"));
+        assert!(doc.cells[1].context.is_empty());
+        assert!(doc.cells[1].notes.is_empty());
+    }
+
+    #[test]
+    fn skips_other_code_blocks_comments_rules_and_front_matter() {
+        let md = "---\ntitle: x\n---\n\nIntro\n\n```python\n# a comment\n```\n\n<!--\nhidden\n-->\n\n***\n\n## Step\n\n```shell\na\n```\n";
+        let doc = Document::parse(md);
+        let cell = &doc.cells[0];
+        assert_eq!(cell.heading.as_deref(), Some("Step"));
+        assert_eq!(cell.context, vec![Prose::Paragraph("Intro".to_string())]);
+        assert!(cell.notes.is_empty());
+    }
+
+    #[test]
+    fn leaves_out_comments_that_start_or_end_mid_line() {
+        let md = "## Step\n\nRun it <!-- not yet\n## hidden\nstill hidden --> now.\nNext <!-- x --> line.\n\n```shell\na\n```\n";
+        let doc = Document::parse(md);
+        let cell = &doc.cells[0];
+        // The `## hidden` inside the comment is not taken for the cell's heading.
+        assert_eq!(cell.heading.as_deref(), Some("Step"));
+        assert_eq!(cell.notes, vec!["Run it\n now.\nNext  line.".to_string()]);
+    }
+
+    #[test]
+    fn reads_atx_and_setext_headings() {
+        let md = "Title\n=====\n\nSection\n---\n\n### Closed ###\n\n# C#\n\n#hashtag\n\n```shell\na\n```\n";
+        let doc = Document::parse(md);
+        let cell = &doc.cells[0];
+        assert_eq!(
+            cell.context,
+            vec![
+                heading(1, "Title"),
+                heading(2, "Section"),
+                heading(3, "Closed"),
+            ]
+        );
+        // A trailing `#` is part of the text unless set apart by a space.
+        assert_eq!(cell.heading.as_deref(), Some("C#"));
+        // `#hashtag` has no space after the marks, so it is a paragraph.
+        assert_eq!(cell.notes, vec!["#hashtag".to_string()]);
     }
 
     #[test]

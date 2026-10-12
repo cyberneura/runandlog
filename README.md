@@ -216,6 +216,22 @@ ls /tmp
 ```
 ````
 
+### The text around the cells
+
+The TUI and the desktop app show the rest of the document alongside the cells,
+so that a cell can be read with the explanation written for it:
+
+- The last heading above a cell (since the previous cell) is shown in the cell's
+  head, next to its number. `--list` prints it after the command, as `# heading`.
+- Paragraphs between that heading and the cell are shown in the cell, above the
+  command.
+- Anything before that heading -- the document's title and introduction, say --
+  is shown above the cell, and the text after the last cell below it.
+
+Only headings and paragraphs are shown, as written (inline Markdown is not
+rendered). Other code blocks, HTML comments, result blocks and front matter are
+left out. This is for display only; it plays no part in running or writing back.
+
 ### Results
 
 Running a cell writes a result block directly after it.
