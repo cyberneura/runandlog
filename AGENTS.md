@@ -373,7 +373,7 @@ GUI は `CellView::heading` / `context` / `notes` と `DocumentView::epilogue` �
   最後のセルより後ろは `Document::epilogue`。
 - **見出しは「直前の範囲にあるもの」だけ。** 同じ見出しの下に 2 つ目のセルがあっても、
   2 つ目には見出しを出さない (文書上もそのセルの直前に見出しは無いので)。
-- 読み飛ばすもの: コードフェンス (結果ブロック内のフェンスも)、HTML コメント (マーカー含む。行の途中から始まる・終わるものも `strip_comments` で外す。Codex CLI 指摘)、
+- 読み飛ばすもの: コードフェンス (結果ブロック内のフェンスも)、HTML コメント (マーカー含む。行の途中から始まる・終わるものも `strip_comments` で外す。Codex CLI 指摘。ただしコードスパン内とエスケープされた `<!--` はコメントの開始と見なさない (`comment_open`、Codex PR レビュー指摘。文章中で区切りを引用しただけで以降が消えるため。複数行にまたがるコードスパンは追わない))、
   区切り線、先頭の YAML front matter。見出しは ATX と setext。インライン Markdown は
   レンダリングせずそのまま出す (GUI は `textContent`)。
 - GUI の検索 (Cmd+F) の対象には入れていない (検索のキーが `section.cell` 内の `pre` 前提のため)。
@@ -617,7 +617,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 207 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 209 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check

@@ -634,7 +634,7 @@ fn strip_comments(line: &str, in_comment: &mut bool) -> (String, bool) {
                 None => return (visible, true),
             }
         }
-        match rest.find("<!--") {
+        match comment_open(rest) {
             Some(start) => {
                 visible.push_str(&rest[..start]);
                 rest = &rest[start + 4..];
@@ -647,6 +647,41 @@ fn strip_comments(line: &str, in_comment: &mut bool) -> (String, bool) {
             }
         }
     }
+}
+
+/// Finds where an HTML comment opens in `text`: a `<!--` that is neither inside a
+/// code span nor escaped (`\<!--`). Text is shown as written, so a delimiter
+/// quoted in prose -- ``Use `<!--` to open a comment`` -- must not hide the rest
+/// of it (Codex review). Code spans are matched within the line only.
+fn comment_open(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'`' => {
+                let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                let fence = &text[i..i + run];
+                // The span closes at the next run of exactly as many backticks;
+                // without one the backticks are literal.
+                let mut search = i + run;
+                let mut close = None;
+                while let Some(offset) = text[search..].find(fence) {
+                    let at = search + offset;
+                    let len = bytes[at..].iter().take_while(|&&b| b == b'`').count();
+                    if len == run {
+                        close = Some(at + run);
+                        break;
+                    }
+                    search = at + len;
+                }
+                i = close.unwrap_or(i + run);
+            }
+            b'<' if text[i..].starts_with("<!--") => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Splits the text above a cell at its last heading: (what comes before the
@@ -1017,6 +1052,26 @@ mod tests {
         assert_eq!(cell.heading.as_deref(), Some("Step"));
         assert_eq!(cell.context, vec![Prose::Paragraph("Intro".to_string())]);
         assert!(cell.notes.is_empty());
+    }
+
+    #[test]
+    fn a_comment_delimiter_quoted_in_prose_is_kept() {
+        let md = "## Step\n\nUse `<!--` to open one, ``a `<!--` b`` too, and \\<!-- as well.\nStill shown.\n\n```shell\na\n```\n";
+        let doc = Document::parse(md);
+        assert_eq!(
+            doc.cells[0].notes,
+            vec![
+                "Use `<!--` to open one, ``a `<!--` b`` too, and \\<!-- as well.\nStill shown."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_escape_before_a_multibyte_character_does_not_split_it() {
+        let md = "Caf\\\u{e9} <!-- hidden --> ok\n\n```shell\na\n```\n";
+        let doc = Document::parse(md);
+        assert_eq!(doc.cells[0].notes, vec!["Caf\\\u{e9}  ok".to_string()]);
     }
 
     #[test]
