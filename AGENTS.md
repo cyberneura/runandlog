@@ -361,6 +361,27 @@ public リポジトリなので、**README・コードコメント・UI 文字�
 Rust 側の検証 (ビルドと `cargo test`) はそれとは別に必要。実機 (macOS) で開く確認だけは
 動作確認できる環境で行うこと。
 
+## セルの周りの文章の表示 (CYBERNEURA-DEV-1047)
+
+見出しや段落を TUI / GUI / `--list` に出す。**解析はコアの `parse::read_prose` だけで行い**、
+GUI は `CellView::heading` / `context` / `notes` と `DocumentView::epilogue` を受け取って
+組むだけ (GUI 専用のパースを足さない方針どおり)。
+
+- **区切りは「前のセル (結果ブロック・`Result:` 段落を含む) の直後から、このセルのフェンスまで」**。
+  その範囲の最後の見出しを `heading` (セル頭に出す)、それより前を `context` (セルの外、上に出す)、
+  後ろの段落を `notes` (セルの中、コマンドの上に出す) に分ける。範囲に見出しが無ければ全部 `notes`。
+  最後のセルより後ろは `Document::epilogue`。
+- **見出しは「直前の範囲にあるもの」だけ。** 同じ見出しの下に 2 つ目のセルがあっても、
+  2 つ目には見出しを出さない (文書上もそのセルの直前に見出しは無いので)。
+- 読み飛ばすもの: コードフェンス (結果ブロック内のフェンスも)、HTML コメント (マーカー含む。行の途中から始まる・終わるものも `strip_comments` で外す。Codex CLI 指摘。ただしコードスパン内とエスケープされた `<!--` はコメントの開始と見なさない (`comment_open`、Codex PR レビュー指摘。文章中で区切りを引用しただけで以降が消えるため。複数行にまたがるコードスパンは追わない))、
+  区切り線、先頭の YAML front matter。見出しは ATX と setext。インライン Markdown は
+  レンダリングせずそのまま出す (GUI は `textContent`)。
+- GUI の検索 (Cmd+F) の対象には入れていない (検索のキーが `section.cell` 内の `pre` 前提のため)。
+- TUI は文章を折り返さない (コマンド・結果と同じく画面幅で切れる)。
+- **TUI の PageUp / PageDown は選択中のセルから離れてスクロールできる** (`App::follow_selection`、
+  Codex PR レビュー指摘)。以前は `adjust_scroll` が毎回選択中のセルの先頭へ引き戻していたので、
+  どのセルにも属さない最後の文章 (`epilogue`) に届かなかった。他のキーを押すと追従に戻る。
+
 ## アプリアイコン
 
 `crates/runandlog-cli/icons/icon.png` (`tauri.conf.json` の `bundle.icon`)。
@@ -599,7 +620,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 198 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 210 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check

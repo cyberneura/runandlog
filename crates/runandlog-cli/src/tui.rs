@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use runandlog_core::{Canceller, ExecOutcome, TokenKind, highlight};
+use runandlog_core::{Canceller, ExecOutcome, Prose, TokenKind, highlight};
 
 use crate::live::LiveOutput;
 use crate::session::Session;
@@ -292,6 +292,57 @@ fn token_style(kind: TokenKind) -> Style {
     }
 }
 
+/// The text between cells (headings and paragraphs), drawn above the cell it
+/// leads into, or below the last cell.
+///
+/// Headings keep their `#` marks so that their level reads the same way as in the
+/// file; paragraphs are drawn as written, one screen line per line of text, with
+/// a blank line between two paragraphs so that they do not read as one.
+fn prose_lines(blocks: &[Prose]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0
+            && matches!(block, Prose::Paragraph(_))
+            && matches!(blocks[index - 1], Prose::Paragraph(_))
+        {
+            lines.push(Line::from(""));
+        }
+        match block {
+            Prose::Heading { level, text } => lines.push(Line::from(Span::styled(
+                format!("{} {text}", "#".repeat(usize::from(*level))),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))),
+            Prose::Paragraph(text) => lines.extend(text.lines().map(|line| {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Gray),
+                ))
+            })),
+        }
+    }
+    lines
+}
+
+/// The paragraphs written right above a cell's command, drawn under its marker,
+/// a blank line between two of them.
+fn note_lines(notes: &[String]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, note) in notes.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.extend(note.lines().map(|line| {
+            Line::from(Span::styled(
+                format!("   {line}"),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        }));
+    }
+    lines
+}
+
 /// A cell's command as drawn: one line per line of the command, each behind a
 /// `>` gutter.
 ///
@@ -355,6 +406,10 @@ struct App {
     scroll: usize,
     /// Height of the body area. Used to adjust the scroll position.
     viewport: usize,
+    /// Whether the view follows the selected cell. Paging turns it off, so that
+    /// the view can be moved past the cell -- down to the text after the last
+    /// cell, which belongs to no cell -- and any other key turns it back on.
+    follow_selection: bool,
     status: String,
     /// The cell being run (0-based) and the spinner phase.
     running: Option<(usize, usize)>,
@@ -391,6 +446,7 @@ impl App {
             selected: 0,
             scroll: 0,
             viewport: 1,
+            follow_selection: true,
             status,
             running: None,
             live: LiveOutput::new(LIVE_LIMIT),
@@ -480,7 +536,13 @@ impl App {
 
         let running = self.running.map(|(index, _)| index);
         for cell in &doc.cells {
+            // The text above the cell counts as part of it, so that moving to a cell
+            // scrolls its section title into view along with it.
             let start = lines.len();
+            if !cell.context.is_empty() {
+                lines.extend(prose_lines(&cell.context));
+                lines.push(Line::from(""));
+            }
             let selected = cell.index == self.selected;
             let state = cell_state(cell.index, running, self.finished.get(&cell.index).copied());
             let color = marker_color(state);
@@ -501,6 +563,15 @@ impl App {
                     ),
                     marker_style,
                 ),
+                // The section the cell sits in, the way the GUI shows it in the
+                // cell's head.
+                Span::styled(
+                    match &cell.heading {
+                        Some(heading) => format!(" {heading}"),
+                        None => String::new(),
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     match &cell.out_file {
                         Some(path) => format!("  -> {path}"),
@@ -509,6 +580,7 @@ impl App {
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
+            lines.extend(note_lines(&cell.notes));
             lines.extend(command_lines(&cell.command, state));
             if state == CellState::Running {
                 // The live tail takes the place of the previous result rather than
@@ -527,13 +599,18 @@ impl App {
             lines.push(Line::from(""));
             spans.push((start, lines.len()));
         }
-
-        if lines.is_empty() {
+        // Said first rather than under the text: in a long document with no
+        // cells, the bottom of the text is off screen.
+        if doc.cells.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No shell / sh / bash / zsh code block found.",
                 Style::default().fg(Color::DarkGray),
             )));
+            if !doc.epilogue.is_empty() {
+                lines.push(Line::from(""));
+            }
         }
+        lines.extend(prose_lines(&doc.epilogue));
         Rendered { lines, spans }
     }
 
@@ -559,9 +636,12 @@ impl App {
         lines
     }
 
-    /// Nudges the scroll position so the selected cell stays on screen.
+    /// Nudges the scroll position so the selected cell stays on screen, unless
+    /// the reader has paged away from it.
     fn adjust_scroll(&mut self, rendered: &Rendered) {
-        if let Some(&(start, end)) = rendered.spans.get(self.selected) {
+        if self.follow_selection
+            && let Some(&(start, end)) = rendered.spans.get(self.selected)
+        {
             if start < self.scroll {
                 self.scroll = start;
             } else if end > self.scroll + self.viewport {
@@ -595,6 +675,7 @@ impl App {
             self.quit = true;
             return Ok(());
         }
+        self.follow_selection = !matches!(key.code, KeyCode::PageDown | KeyCode::PageUp);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.select(1),
             KeyCode::Char('k') | KeyCode::Up => self.select(-1),
@@ -981,6 +1062,92 @@ mod tests {
             .iter()
             .map(|line| line.spans[1..].iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    /// Every drawn line as plain text.
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn paragraphs_stay_apart() {
+        let blocks = vec![
+            Prose::Heading {
+                level: 2,
+                text: "Step".to_string(),
+            },
+            Prose::Paragraph("First.".to_string()),
+            Prose::Paragraph("Second,\ntwo lines.".to_string()),
+        ];
+        assert_eq!(
+            plain(&prose_lines(&blocks)),
+            vec!["## Step", "First.", "", "Second,", "two lines."]
+        );
+        let notes = vec!["First.".to_string(), "Second.".to_string()];
+        assert_eq!(
+            plain(&note_lines(&notes)),
+            vec!["   First.", "", "   Second."]
+        );
+    }
+
+    #[test]
+    fn the_text_around_the_cells_is_drawn_with_them() {
+        let path = std::env::temp_dir().join(format!(
+            "runandlog-tui-test-{}-prose.md",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "# Deploy\n\nRun from the top.\n\n## Commit\n\nRecords the change.\n\n```shell\ngit commit\n```\n\nAll done.\n",
+        )
+        .unwrap();
+        let session = Session::load(
+            &path,
+            runandlog_core::ExecOptions::new(path.parent().unwrap()),
+            50,
+        );
+        std::fs::remove_file(&path).unwrap();
+        let (_requests_tx, requests_rx) = mpsc::channel();
+        let (queue_tx, _queue_rx) = mpsc::channel();
+        let queue = Arc::new(Mutex::new(PasswordQueue {
+            accepting: false,
+            requests: queue_tx,
+        }));
+        let app = App::new(session.unwrap(), requests_rx, queue);
+
+        let rendered = app.render_lines();
+        let lines = plain(&rendered.lines);
+        assert_eq!(
+            lines,
+            vec![
+                "# Deploy",
+                "Run from the top.",
+                "",
+                " [1] > Run     Commit",
+                "   Records the change.",
+                "   > git commit",
+                "",
+                "All done.",
+            ]
+        );
+        // The cell starts at its title, so selecting it brings the title on screen.
+        assert_eq!(rendered.spans, vec![(0, 7)]);
+
+        // The text after the last cell belongs to no cell, so paging has to be
+        // able to leave the selected cell behind to reach it (Codex review).
+        let mut app = app;
+        app.viewport = 2;
+        app.follow_selection = false;
+        app.scroll = 7;
+        app.adjust_scroll(&rendered);
+        assert_eq!(app.scroll, 7);
+        // Any other key brings the selected cell back.
+        app.follow_selection = true;
+        app.adjust_scroll(&rendered);
+        assert_eq!(app.scroll, 0);
     }
 
     #[test]

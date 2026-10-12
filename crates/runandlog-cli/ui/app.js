@@ -176,13 +176,19 @@ function render(doc) {
     empty.className = 'empty'
     empty.textContent = 'No shell / sh / bash / zsh code block found.'
     cellsEl.append(empty)
+    appendProse(doc.epilogue)
+    // The text can be long enough to scroll now, so keep the reader's place
+    // the same way as below.
+    cellsEl.scrollTop = scrollTop
     scheduleFind(null)
     return
   }
 
   for (const cell of doc.cells) {
+    appendProse(cell.context)
     cellsEl.append(renderCell(cell))
   }
+  appendProse(doc.epilogue)
   // A result appearing or disappearing changes the height, so the old offset can
   // be past the new end. Assigning it is enough: the browser clamps it to what
   // the list can now scroll, which keeps the top of the view as close to where
@@ -195,6 +201,31 @@ function render(doc) {
   // Every cell is new, so the matches found in the old ones point at text that is
   // no longer on screen.
   scheduleFind(null)
+}
+
+/**
+ * Appends the text written between cells -- headings and paragraphs, as the
+ * backend read them (`ProseView`) -- outside the cells. Nothing is appended when
+ * there is none, so a document of bare commands looks as it did.
+ *
+ * The text is shown as written, inline Markdown and all, and set with
+ * `textContent` like everything else here: it is the document's text, not HTML.
+ */
+function appendProse(blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return
+  }
+  const prose = document.createElement('div')
+  prose.className = 'prose'
+  for (const block of blocks) {
+    const level = Number(block.level)
+    const element = document.createElement(
+      level >= 1 && level <= 6 ? `h${level}` : 'p',
+    )
+    element.textContent = block.text
+    prose.append(element)
+  }
+  cellsEl.append(prose)
 }
 
 function renderCell(cell) {
@@ -241,6 +272,17 @@ function renderCell(cell) {
   button.addEventListener('click', () => runCell(cell.index))
   head.append(button)
 
+  if (cell.heading) {
+    // The heading of the section the cell sits in, so that the cell can be
+    // told by its name and not only by its number. Cut short when the head is
+    // narrow; the tooltip has the whole of it.
+    const heading = document.createElement('span')
+    heading.className = 'heading'
+    heading.textContent = cell.heading
+    heading.title = cell.heading
+    head.append(heading)
+  }
+
   if (cell.out_file) {
     const out = document.createElement('span')
     out.className = 'out'
@@ -268,7 +310,21 @@ function renderCell(cell) {
   command.className = 'command'
   fillCommand(command, cell)
 
-  section.append(head, command)
+  section.append(head)
+
+  if (Array.isArray(cell.notes) && cell.notes.length > 0) {
+    // The paragraphs written right above the command: what it is for.
+    const notes = document.createElement('div')
+    notes.className = 'notes'
+    for (const note of cell.notes) {
+      const paragraph = document.createElement('p')
+      paragraph.textContent = note
+      notes.append(paragraph)
+    }
+    section.append(notes)
+  }
+
+  section.append(command)
 
   if (running === cell.index) {
     // While a cell runs, its live output takes the place of the result of the
