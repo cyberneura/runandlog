@@ -296,10 +296,17 @@ fn token_style(kind: TokenKind) -> Style {
 /// leads into, or below the last cell.
 ///
 /// Headings keep their `#` marks so that their level reads the same way as in the
-/// file; paragraphs are drawn as written, one screen line per line of text.
+/// file; paragraphs are drawn as written, one screen line per line of text, with
+/// a blank line between two paragraphs so that they do not read as one.
 fn prose_lines(blocks: &[Prose]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0
+            && matches!(block, Prose::Paragraph(_))
+            && matches!(blocks[index - 1], Prose::Paragraph(_))
+        {
+            lines.push(Line::from(""));
+        }
         match block {
             Prose::Heading { level, text } => lines.push(Line::from(Span::styled(
                 format!("{} {text}", "#".repeat(usize::from(*level))),
@@ -316,20 +323,24 @@ fn prose_lines(blocks: &[Prose]) -> Vec<Line<'static>> {
     lines
 }
 
-/// The paragraphs written right above a cell's command, drawn under its marker.
+/// The paragraphs written right above a cell's command, drawn under its marker,
+/// a blank line between two of them.
 fn note_lines(notes: &[String]) -> Vec<Line<'static>> {
-    notes
-        .iter()
-        .flat_map(|note| note.lines())
-        .map(|line| {
+    let mut lines = Vec::new();
+    for (index, note) in notes.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.extend(note.lines().map(|line| {
             Line::from(Span::styled(
                 format!("   {line}"),
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::ITALIC),
             ))
-        })
-        .collect()
+        }));
+    }
+    lines
 }
 
 /// A cell's command as drawn: one line per line of the command, each behind a
@@ -1059,6 +1070,27 @@ mod tests {
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn paragraphs_stay_apart() {
+        let blocks = vec![
+            Prose::Heading {
+                level: 2,
+                text: "Step".to_string(),
+            },
+            Prose::Paragraph("First.".to_string()),
+            Prose::Paragraph("Second,\ntwo lines.".to_string()),
+        ];
+        assert_eq!(
+            plain(&prose_lines(&blocks)),
+            vec!["## Step", "First.", "", "Second,", "two lines."]
+        );
+        let notes = vec!["First.".to_string(), "Second.".to_string()];
+        assert_eq!(
+            plain(&note_lines(&notes)),
+            vec!["   First.", "", "   Second."]
+        );
     }
 
     #[test]

@@ -620,7 +620,7 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 ## 検証
 
 ```shell
-cargo test                  # 209 件 (linux での数。/proc を見るテストが 1 件、
+cargo test                  # 210 件 (linux での数。/proc を見るテストが 1 件、
                             #          DISPLAY を見るテストが 3 件ある)
 cargo clippy --all-targets  # 警告ゼロを保つ
 cargo fmt --all --check
