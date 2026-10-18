@@ -3,6 +3,8 @@
 A tool that runs the shell commands written in a Markdown file and writes the
 results back into that same file.
 
+Website: https://www.cyberneura.com/app/runandlog
+
 It exists for a loop that comes up constantly: an AI agent asks a person to run a
 command, the person runs it, and the agent reads the result. Run and Log keeps
 that exchange inside a single file. Like an IPython notebook, command cells and
