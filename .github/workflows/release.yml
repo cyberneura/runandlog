@@ -436,6 +436,7 @@ jobs:
           fi
 
       - name: Publish
+        id: publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
@@ -485,6 +486,7 @@ jobs:
                 case "$(indexed "$name")" in
                   yes)
                     echo "publishing ${name} ${VERSION} reported a failure, but it is in the index"
+                    echo "published=true" >> "$GITHUB_OUTPUT"
                     return
                     ;;
                   no) ;;
@@ -503,7 +505,10 @@ jobs:
             for _ in $(seq 30); do
               sleep 10
               case "$(indexed "$name")" in
-                yes) return ;;
+                yes)
+                  echo "published=true" >> "$GITHUB_OUTPUT"
+                  return
+                  ;;
                 no) ;;
                 *)
                   echo "::error::${name} ${VERSION} was published, but the index could not be read."
@@ -522,7 +527,10 @@ jobs:
       # install yet sends people to fetch something that is not there. Neither of
       # these may fail the run -- the crate is out either way, and a webhook that is
       # down is not a reason to look at a red release.
+      # Only when this run published something: a retry that found both crates
+      # out already must not announce them again.
       - name: Say so
+        if: steps.publish.outputs.published == 'true'
         continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
