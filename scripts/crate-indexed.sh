@@ -24,7 +24,10 @@ esac
 
 body=$(mktemp)
 trap 'rm -f "$body"' EXIT
-status=$(curl -s -o "$body" -w '%{http_code}' "https://index.crates.io/$path" || echo 000)
+# Bounded: a stalled transfer would otherwise hold the plan job, and every job
+# behind it, until its timeout. Timing out reads as unknown, like any failure.
+status=$(curl -s --connect-timeout 10 --max-time 30 -o "$body" -w '%{http_code}' \
+  "https://index.crates.io/$path" || echo 000)
 case "$status" in
   404) echo "no" ;;
   200)
