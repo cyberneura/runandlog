@@ -161,9 +161,9 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      # persist-credentials: false keeps the token out of .git/config. Everything
-      # is pinned to a commit SHA because this job holds the signing certificate:
-      # a moved tag would be enough to take it.
+      # persist-credentials: false keeps the token out of .git/config. Actions
+      # are pinned to a commit SHA: a moved tag would run someone else's code in
+      # the job whose output is what users install.
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -181,10 +181,32 @@ jobs:
       - name: Cache Rust (cargo + target)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }} -p runandlog
+
+      # The bare binary, unsigned. Signing and packaging happen in later jobs that
+      # never run cargo: see `sign`.
+      - name: Upload the binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/runandlog
+          if-no-files-found: error
+
+  # Signing runs apart from the build, on a fresh runner that never runs cargo.
+  # In the build job any dependency's build script runs with the job's rights: it
+  # can put its own `openssl` or `security` first on PATH for the steps after it
+  # (through $GITHUB_PATH), and those steps would then hold the certificate and
+  # its password. Nothing written in one job reaches another except artifacts.
+  sign:
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
       # A missing secret does not merely skip codesign, it goes unnoticed: an
       # unsigned archive would ship as though it had been signed.
       - name: Check macOS signing secrets
-        if: matrix.platform == 'macos-latest'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -206,8 +228,18 @@ jobs:
           fi
           echo "All signing and notarisation secrets are present."
 
+      - name: Download the binary
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: binary-aarch64-apple-darwin
+          path: ${{ runner.temp }}/bin
+
+      # Artifacts do not keep the executable bit.
+      - name: Make it executable
+        run: chmod +x "$RUNNER_TEMP/bin/runandlog"
+
+      # The keychain is deleted as soon as the binary is signed.
       - name: Import Apple Developer certificate
-        if: matrix.platform == 'macos-latest'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -217,7 +249,7 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
+          security set-keychain-settings -t 600 -u build.keychain
           security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
@@ -233,26 +265,22 @@ jobs:
           }
           rm "$RUNNER_TEMP/certificate.p12"
 
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }} -p runandlog
-
       # Notarisation needs the hardened runtime (--options runtime). A bare binary
       # cannot be stapled -- stapling takes a .app, .dmg or .pkg -- so the ticket
       # stays with Apple and Gatekeeper fetches it. That covers a download, and
       # leaves only a first run with no network refused.
       - name: Sign and notarise
-        if: matrix.platform == 'macos-latest'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TARGET: ${{ matrix.target }}
         run: |
-          BIN="target/${TARGET}/release/runandlog"
+          BIN="$RUNNER_TEMP/bin/runandlog"
           codesign --force --options runtime --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
+          security delete-keychain build.keychain
           # notarytool takes a zip, pkg or dmg, so the binary is wrapped only to be
           # submitted. What ships is the tar.gz below; the ticket is bound to the
           # signature, which is the same in either container.
@@ -272,30 +300,17 @@ jobs:
             exit 1
           fi
 
-      - name: Package
-        id: package
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          NAME="runandlog-v${VERSION}-${TARGET}"
-          mkdir -p "dist/$NAME"
-          cp "target/${TARGET}/release/runandlog" "dist/$NAME/"
-          cp README.md "dist/$NAME/"
-          # The licenses travel with the binary as files too, not only inside it
-          # (`runandlog --license`).
-          cp LICENSE THIRD-PARTY-NOTICES.txt "dist/$NAME/"
-          # The archive carries its own directory rather than unpacking into the
-          # current one. The Homebrew cask names that directory in its `binary`
-          # path, since a cask does not descend into it on its own.
-          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
-          echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+      # The signing step deletes the keychain itself; this covers a step that
+      # failed before it got there.
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain build.keychain 2>/dev/null || true
 
-      - name: Upload artifact
+      - name: Upload the signed binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.target }}
-          path: ${{ steps.package.outputs.archive }}
+          name: signed-aarch64-apple-darwin
+          path: ${{ runner.temp }}/bin/runandlog
           if-no-files-found: error
 
   # Every target has to be in hand first. The release is assembled as a draft and
@@ -303,18 +318,50 @@ jobs:
   # after creating, so a failure partway would otherwise leave a published release
   # missing a platform.
   release:
-    needs: [plan, build]
+    needs: [plan, build, sign]
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      # For README, LICENSE and THIRD-PARTY-NOTICES.txt. Nothing is built here.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download the signed macOS binary
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
-          path: dist
-          merge-multiple: true
+          name: signed-aarch64-apple-darwin
+          path: ${{ runner.temp }}/bin/aarch64-apple-darwin
+
+      - name: Download the Linux binary
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: binary-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/bin/x86_64-unknown-linux-gnu
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mkdir -p dist
+          for TARGET in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            NAME="runandlog-v${VERSION}-${TARGET}"
+            mkdir -p "dist/$NAME"
+            install -m 755 "$RUNNER_TEMP/bin/${TARGET}/runandlog" "dist/$NAME/runandlog"
+            cp README.md "dist/$NAME/"
+            # The licenses travel with the binary as files too, not only inside it
+            # (`runandlog --license`).
+            cp LICENSE THIRD-PARTY-NOTICES.txt "dist/$NAME/"
+            # The archive carries its own directory rather than unpacking into the
+            # current one; Homebrew descends into a single top-level directory, and
+            # the cask names it in its `binary` path.
+            tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+            rm -r "dist/$NAME"
+          done
 
       - name: Publish release
         env:
