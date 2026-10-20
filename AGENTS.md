@@ -443,6 +443,9 @@ version を書き換えて push するだけの薄いスクリプトで、手で
   staple できないのでチケットは Apple 側に残る (Gatekeeper がオンラインで引く)。**公証の結果は
   `--output-format json` の `status` で見る** — 提出が完了しさえすれば `notarytool` は成功
   終了しうる。
+  - **証明書のインポートは `cargo build` の後。** keychain のロックが解けている間は、依存
+    クレートの build script が Developer ID で何にでも署名できる。署名したらすぐ keychain を
+    消し、失敗時は `always()` のステップが消す。
 - **Linux は `--no-default-features`。** 既定 feature には Tauri が入り、webkit2gtk に動的
   リンクしたバイナリは同じ webkit を持たない環境で起動しない。ただし glibc には動的リンク
   したままなので「どの Linux でも動く」わけではない。

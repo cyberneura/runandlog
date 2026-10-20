@@ -206,6 +206,12 @@ jobs:
           fi
           echo "All signing and notarisation secrets are present."
 
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }} -p runandlog
+
+      # After the build, never before it: while the keychain is unlocked, any
+      # build script among the dependencies could sign whatever it likes with the
+      # Developer ID. It is deleted again as soon as the binary is signed.
       - name: Import Apple Developer certificate
         if: matrix.platform == 'macos-latest'
         env:
@@ -217,7 +223,7 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
+          security set-keychain-settings -t 600 -u build.keychain
           security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
@@ -232,9 +238,6 @@ jobs:
             exit 1
           }
           rm "$RUNNER_TEMP/certificate.p12"
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }} -p runandlog
 
       # Notarisation needs the hardened runtime (--options runtime). A bare binary
       # cannot be stapled -- stapling takes a .app, .dmg or .pkg -- so the ticket
@@ -253,6 +256,7 @@ jobs:
           codesign --force --options runtime --timestamp \
             --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
+          security delete-keychain build.keychain
           # notarytool takes a zip, pkg or dmg, so the binary is wrapped only to be
           # submitted. What ships is the tar.gz below; the ticket is bound to the
           # signature, which is the same in either container.
@@ -271,6 +275,12 @@ jobs:
             echo "::error::notarisation came back $status"
             exit 1
           fi
+
+      # The signing step deletes the keychain itself; this covers a step that
+      # failed before it got there.
+      - name: Remove the signing keychain
+        if: always() && matrix.platform == 'macos-latest'
+        run: security delete-keychain build.keychain 2>/dev/null || true
 
       - name: Package
         id: package
