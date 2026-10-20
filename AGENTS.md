@@ -464,6 +464,15 @@ version を書き換えて push するだけの薄いスクリプトで、手で
 - **crates.io は sparse index (`index.crates.io`) に聞く。** cargo が解決に使うのは index で、
   web API に出ていても index が追い付いていなければ次の crate のビルドが落ちる。公開済みの
   version は飛ばすので、片方だけ通った後の再実行が続きから進む。
+- **crates.io に出すかは GitHub Release とは別に判定する** (plan ジョブで
+  `scripts/crate-indexed.sh` が index に聞く)。Release が出た後で publish だけ失敗しても、
+  次の push か `workflow_dispatch` で crates ジョブだけが走る。そのとき main は先へ進んでいる
+  ことがあるので、**crates ジョブはリリースタグを `release/` に checkout し**、タグの version が
+  判定した version と一致することを確かめてから publish する。判定スクリプトはワークフロー側の
+  commit のものを使う (スクリプト導入前のタグには無いため)。
+  - `release` が skipped でも走るのは「plan の時点でリリース済みだった」場合だけ。test や
+    build の失敗でも `release` は skipped になるので、`skipped` だけで許すと未リリースの
+    version が crates.io にだけ出る。
 
 ## 実行中の出力のライブ表示
 

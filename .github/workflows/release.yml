@@ -39,6 +39,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.decide.outputs.release }}
+      publish_crate: ${{ steps.crate.outputs.publish }}
     steps:
       # A dispatch names its own ref, and a branch carrying an unreleased version
       # would otherwise be built and published from wherever it sits. Releases come
@@ -96,6 +97,29 @@ jobs:
               exit 1
               ;;
           esac
+
+      # Asked apart from the GitHub Release: if the release went out and a
+      # publish then failed, the next push finds the release done and would
+      # otherwise never publish the crates.
+      - name: Decide whether the crates still need publishing
+        id: crate
+        if: vars.PUBLISH_CRATES == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          publish=false
+          for name in runandlog-core runandlog; do
+            answer=$(scripts/crate-indexed.sh "$name" "$VERSION")
+            case "$answer" in
+              no) publish=true ;;
+              yes) ;;
+              *)
+                echo "::error::could not tell whether ${name} ${VERSION} is on crates.io (${answer}). Not guessing."
+                exit 1
+                ;;
+            esac
+          done
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
   # The gate. Called rather than written out here so that a pull request and a
   # release run the same checks from the same file; being called puts its jobs
@@ -354,18 +378,38 @@ jobs:
 
   # Publishing cannot be undone, so this waits to be switched on with
   # `gh variable set PUBLISH_CRATES --body true` rather than being on by default.
+  #
+  # Runs after a release made in this run, or on its own when the release was
+  # already out before this run. `skipped` alone is not enough for the latter: a
+  # failed test or build skips `release` too, and must stop this as well.
   crates:
     needs: [plan, release]
-    if: needs.plan.outputs.release == 'true' && vars.PUBLISH_CRATES == 'true'
+    if: >-
+      !cancelled()
+      && needs.plan.result == 'success'
+      && needs.plan.outputs.publish_crate == 'true'
+      && (needs.release.result == 'success'
+          || (needs.plan.outputs.release == 'false' && needs.release.result == 'skipped'))
     # On macOS, because `cargo publish` builds what it is about to publish and the
     # default features need a webview. It is there already, where on Linux it
     # would have to be installed and kept up with.
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
+      # Two copies. The workflow's own commit, for scripts/crate-indexed.sh: a tag
+      # cut before the script existed does not have it. And the released tag, in
+      # release/, for what is published: on a retry main may have moved on, and
+      # the crates have to be what the release was built from.
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+
+      - name: Checkout the release
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.plan.outputs.version }}
+          path: release
           persist-credentials: false
 
       - name: Setup Rust
@@ -373,55 +417,33 @@ jobs:
         with:
           toolchain: stable
 
+      # The index was asked about VERSION; a tag pointing at a commit with another
+      # version would publish that one instead, unchecked.
+      - name: Check the tag carries the version
+        working-directory: release
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tagged=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "runandlog") | .version')
+          if [ "$tagged" != "$VERSION" ]; then
+            echo "::error::v${VERSION} points at a commit whose Cargo.toml says ${tagged:-nothing}"
+            exit 1
+          fi
+
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
+        working-directory: release
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
             echo "::error::PUBLISH_CRATES is on but CARGO_REGISTRY_TOKEN is not set. Add it with 'gh secret set CARGO_REGISTRY_TOKEN'."
             exit 1
           fi
 
-          # What cargo resolves against is the sparse index, not the web API, and
-          # the two do not update together. Asking the index is therefore the only
-          # answer that means "the next crate can depend on this one".
-          #
-          # The path nests by name length, and the short cases are not the shape of
-          # the common one. Getting it wrong yields a 404, which reads as "not
-          # published" and would publish a version a second time.
-          index_url() {
-            case ${#1} in
-              1) path="1/$1" ;;
-              2) path="2/$1" ;;
-              3) path="3/${1:0:1}/$1" ;;
-              *) path="${1:0:2}/${1:2:2}/$1" ;;
-            esac
-            printf 'https://index.crates.io/%s' "$path"
-          }
-
-          # Only 200 and 404 are answers. Anything else -- a rate limit, an outage,
-          # a broken connection -- is not evidence of absence.
           indexed() {
-            name=$1
-            body=$(mktemp)
-            status=$(curl -s -o "$body" -w '%{http_code}' "$(index_url "$name")" || echo 000)
-            answer="unknown:$status"
-            case "$status" in
-              404) answer="no" ;;
-              200)
-                # A 200 whose body will not parse is a broken answer, not a "no".
-                if ! jq -e . < "$body" >/dev/null 2>&1; then
-                  answer="unknown:unparsable"
-                elif jq -e --arg v "$VERSION" 'select(.vers == $v)' < "$body" >/dev/null; then
-                  answer="yes"
-                else
-                  answer="no"
-                fi
-                ;;
-            esac
-            rm -f "$body"
-            echo "$answer"
+            "$GITHUB_WORKSPACE/scripts/crate-indexed.sh" "$1" "$VERSION"
           }
 
           # Publishing takes two steps and neither can be undone, so each crate is
