@@ -107,15 +107,19 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          # An index that cannot be read must not hold up the GitHub Release, which
+          # every other job here waits on. "Maybe" sends it to the crates job,
+          # which asks again before each publish and stops there if it still
+          # cannot tell -- after the release is out.
           publish=false
           for name in runandlog-core runandlog; do
             answer=$(scripts/crate-indexed.sh "$name" "$VERSION")
             case "$answer" in
-              no) publish=true ;;
               yes) ;;
+              no) publish=true ;;
               *)
-                echo "::error::could not tell whether ${name} ${VERSION} is on crates.io (${answer}). Not guessing."
-                exit 1
+                echo "::warning::could not tell whether ${name} ${VERSION} is on crates.io (${answer}); the crates job will ask again"
+                publish=true
                 ;;
             esac
           done
