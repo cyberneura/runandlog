@@ -1,0 +1,17 @@
+{
+  "source": "mac-original.png",
+  "body": [
+    100,
+    100,
+    824,
+    824
+  ],
+  "glyph": [
+    395,
+    349,
+    350,
+    326
+  ],
+  "radius": 0.225,
+  "whiteGradientGlyph": true
+}

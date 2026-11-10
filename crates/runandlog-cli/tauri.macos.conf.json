@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "resources": {
+      "icons/Assets.car": "Assets.car"
+    },
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns"
+    ]
+  }
+}

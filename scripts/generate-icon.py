@@ -56,7 +56,7 @@ MARK_COLOR = (0xFF, 0xFF, 0xFF)
 # the mark has room to breathe inside the rounded rectangle.
 MARK_WIDTH = BODY * 0.42
 
-OUT_PATH = Path(__file__).resolve().parent.parent / "crates/runandlog-cli/icons/icon.png"
+OUT_PATH = Path(__file__).resolve().parent.parent / "resources/app-icons/mac-original.png"
 
 
 def rounded_rect_distance(x: float, y: float) -> float:
