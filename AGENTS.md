@@ -385,9 +385,9 @@ GUI は `CellView::heading` / `context` / `notes` と `DocumentView::epilogue` �
 ## アプリアイコン
 
 `crates/runandlog-cli/icons/icon.png` (`tauri.conf.json` の `bundle.icon`)。
-**手で描かずに `scripts/generate-icon.py` で生成する** (標準ライブラリだけで動く。
+**手で描かずに `scripts/generate-icon.py` で固定原画像を生成する** (標準ライブラリだけで動く。
 このリポジトリに画像ツールチェーンは無く、アセット 1 枚のために足す価値も無いため)。
-変更したらスクリプトを直して再生成すること。
+変更したらスクリプトを直して原画像を再生成し、`bash scripts/generate-macos-icons.sh` でサイズ別画像へ反映する。
 
 広く使われている macOS のアイコンテンプレート (Big Sur 以降) の寸法を、スクリプトの
 定数にしてある (CYBERNEURA-DEV-519。**以前のアイコンは 64x64 の角丸なし・余白なしの
@@ -665,3 +665,17 @@ DOC=$(examples/create-test-copy.sh)
 
 Ctrl-C を送るなら `printf '\003'`。ただし **サンドボックス下では pty を割り当てられず
 (`script: openpty: Operation not permitted`) TUI を起動できない**ので、その場合は手で確認する。
+
+## macOS app icon
+
+Run `bash scripts/generate-macos-icons.sh` with Xcode on macOS. Fixed artwork,
+layout measurements, size-specific sources and the verification command are in
+`resources/app-icons/README.md`. Small @1x backgrounds reach the canvas edges;
+the glyph fits inside the central 80%. Larger backgrounds have 10% outer margins.
+Do not replace the generated ICNS with `tauri icon` / `iconutil`: preserve the
+ARGB small entries and the matching Assets.car / CFBundleIconName registration.
+Native rendering is verified by `.github/workflows/macos-icons.yml`.
+
+The distributed CLI is a bare executable: its GUI embeds ICNS and sets
+NSApplication’s icon at startup. Bundle registration applies only to optional
+.app builds; it cannot give a bare binary a System Settings bundle icon.

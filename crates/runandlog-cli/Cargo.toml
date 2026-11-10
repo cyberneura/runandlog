@@ -15,7 +15,7 @@ path = "src/main.rs"
 # default so that `runandlog --gui` works out of the box; packagers who only want
 # the CLI and TUI can build with --no-default-features to drop that requirement.
 default = ["gui"]
-gui = ["dep:tauri", "dep:tauri-build", "dep:serde", "dep:serde_json"]
+gui = ["dep:tauri", "dep:tauri-build", "dep:serde", "dep:serde_json", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
 runandlog-core.workspace = true
@@ -31,3 +31,9 @@ libc = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
+
+# AppKit access for the bare executable's Dock icon.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"], optional = true }
+objc2-foundation = { version = "0.3", features = ["NSData"], optional = true }
