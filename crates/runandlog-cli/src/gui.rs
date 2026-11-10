@@ -804,6 +804,31 @@ fn window_title(path: &Path) -> String {
     format!("Run and Log - {name}")
 }
 
+// Bare CLI executables have no Info.plist; supply the size-specific icon directly.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::AnyThread;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+
+    // setup runs on the main thread, which is where AppKit insists this happen.
+    let Some(marker) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../icons/icon.icns"));
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    // Unsafe only in that AppKit is: the marker already proves the thread, and
+    // the image is one this function just built.
+    unsafe {
+        NSApplication::sharedApplication(marker).setApplicationIconImage(Some(&image));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1195,28 +1220,3 @@ mod display_tests {
         assert!(display_reason(Some(OsStr::new("")), Some(OsStr::new(""))).is_some());
     }
 }
-
-// Bare CLI executables have no Info.plist; supply the size-specific icon directly.
-#[cfg(target_os = "macos")]
-fn set_dock_icon() {
-    use objc2::AnyThread;
-    use objc2_app_kit::{NSApplication, NSImage};
-    use objc2_foundation::{MainThreadMarker, NSData};
-
-    // setup runs on the main thread, which is where AppKit insists this happen.
-    let Some(marker) = MainThreadMarker::new() else {
-        return;
-    };
-    let data = NSData::with_bytes(include_bytes!("../icons/icon.icns"));
-    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
-        return;
-    };
-    // Unsafe only in that AppKit is: the marker already proves the thread, and
-    // the image is one this function just built.
-    unsafe {
-        NSApplication::sharedApplication(marker).setApplicationIconImage(Some(&image));
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_dock_icon() {}
