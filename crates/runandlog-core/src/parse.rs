@@ -584,6 +584,17 @@ fn read_prose(lines: &[Line<'_>], from: usize, to: usize) -> Vec<Prose> {
                 .map_or(lines.len(), |j| j + 1);
             continue;
         }
+        if setext_level(trimmed).is_some() && ends_in_table(&paragraph) {
+            // Under a table, `---` is a rule (and `===` a line of text), not an
+            // underline that would turn the whole table into a heading: GFM ends
+            // a table at the first line without a `|`.
+            if is_thematic_break(trimmed) {
+                flush(&mut paragraph, &mut blocks);
+            } else {
+                paragraph.push(line.trim_end().to_string());
+            }
+            continue;
+        }
         if let Some(level) = setext_level(trimmed)
             && !paragraph.is_empty()
             && line.len() - line.trim_start().len() <= 3
@@ -682,6 +693,202 @@ fn comment_open(text: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// A pipe table found in a paragraph (`split_tables`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    /// The header row's cells.
+    pub header: Vec<String>,
+    /// One alignment per column, from the delimiter row.
+    pub align: Vec<Align>,
+    /// The body rows, each padded or cut to the header's width.
+    pub rows: Vec<Vec<String>>,
+}
+
+/// How a table column is aligned (`:---`, `:---:`, `---:` in the delimiter row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    /// No colon: left to the front end.
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+impl Align {
+    /// The CSS `text-align` value, or "" for `None`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Align::None => "",
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+        }
+    }
+}
+
+/// A run of a paragraph: plain lines, or a pipe table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParagraphPart {
+    /// Lines that are not part of a table, joined with `\n`.
+    Text(String),
+    Table(Table),
+}
+
+/// The most cells a table may have once its rows are padded to the header's
+/// width. Past it the lines are kept as text: a wide header over many short rows
+/// would otherwise cost far more memory (and DOM in the GUI) than the text itself.
+const MAX_TABLE_CELLS: usize = 20_000;
+
+/// Whether the paragraph read so far ends in a pipe table.
+fn ends_in_table(paragraph: &[String]) -> bool {
+    !paragraph.is_empty()
+        && matches!(
+            split_tables(&paragraph.join("\n")).last(),
+            Some(ParagraphPart::Table(_))
+        )
+}
+
+/// Splits a paragraph (`Prose::Paragraph`, a cell's `notes`) into plain runs and
+/// GitHub-style pipe tables, in order. A paragraph without a table comes back as
+/// one `Text`, unchanged.
+///
+/// `read_prose` keeps a table inside the paragraph it sits in (a table has no
+/// blank line around it in many documents), so this is a second pass that the
+/// front ends ask for when they draw tables; the TUI shows the lines as written.
+///
+/// A table is a line with a `|` followed by a delimiter row (`|---|:---:|`) with
+/// the same number of columns, then every following line that has a `|` and does
+/// not start another block (a quote or a list item). Short rows are padded and
+/// long ones cut to the header's width, as GitHub does. Cell text keeps its inline
+/// Markdown; only `\|` becomes `|`. A table of more than `MAX_TABLE_CELLS` cells
+/// is left as text.
+pub fn split_tables(paragraph: &str) -> Vec<ParagraphPart> {
+    let lines: Vec<&str> = paragraph.split('\n').collect();
+    let mut parts = Vec::new();
+    let mut plain: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let header = lines[i].contains('|').then(|| table_row(lines[i]));
+        let align = match (&header, lines.get(i + 1)) {
+            (Some(header), Some(next)) => {
+                delimiter_row(next).filter(|align| align.len() == header.len())
+            }
+            _ => None,
+        };
+        let (Some(header), Some(align)) = (header, align) else {
+            plain.push(lines[i]);
+            i += 1;
+            continue;
+        };
+        let start = i;
+        let mut end = i + 2;
+        while end < lines.len() && lines[end].contains('|') && !starts_block(lines[end]) {
+            end += 1;
+        }
+        if (end - start - 1).saturating_mul(header.len()) > MAX_TABLE_CELLS {
+            plain.extend_from_slice(&lines[start..end]);
+            i = end;
+            continue;
+        }
+        if !plain.is_empty() {
+            parts.push(ParagraphPart::Text(plain.join("\n")));
+            plain.clear();
+        }
+        let rows = lines[start + 2..end]
+            .iter()
+            .map(|line| {
+                let mut cells = table_row(line);
+                cells.resize(header.len(), String::new());
+                cells
+            })
+            .collect();
+        i = end;
+        parts.push(ParagraphPart::Table(Table {
+            header,
+            align,
+            rows,
+        }));
+    }
+    if !plain.is_empty() {
+        parts.push(ParagraphPart::Text(plain.join("\n")));
+    }
+    parts
+}
+
+/// Whether a line opens a block that ends a table: a block quote or a list item
+/// (`-`, `*`, `+`, `1.`, `1)` followed by a space).
+fn starts_block(line: &str) -> bool {
+    let rest = line.trim_start();
+    if rest.starts_with('>') {
+        return true;
+    }
+    let marker = rest.strip_prefix(['-', '*', '+']).or_else(|| {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        (1..=9)
+            .contains(&digits)
+            .then(|| rest[digits..].strip_prefix(['.', ')']))
+            .flatten()
+    });
+    marker.is_some_and(|after| after.starts_with([' ', '\t']))
+}
+
+/// The cells of a table row: split on `|`, with the pipes at either end dropped
+/// and `\|` read as a literal `|`.
+fn table_row(line: &str) -> Vec<String> {
+    let mut row = line.trim();
+    row = row.strip_prefix('|').unwrap_or(row);
+    if !row.ends_with("\\|") {
+        row = row.strip_suffix('|').unwrap_or(row);
+    }
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = row.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                cell.push('|');
+                chars.next();
+            }
+            '|' => cells.push(std::mem::take(&mut cell).trim().to_string()),
+            _ => cell.push(ch),
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
+}
+
+/// The column alignments of a delimiter row, or None when the line is not one.
+/// It needs a `|` somewhere, so that a lone `---` stays the setext heading or
+/// rule `read_prose` took it for rather than a one-column table.
+fn delimiter_row(line: &str) -> Option<Vec<Align>> {
+    if !line.contains('|') {
+        return None;
+    }
+    table_row(line)
+        .iter()
+        .map(|cell| {
+            // At most one colon on each side: `::---` is a typo, not centring.
+            let (left, rest) = match cell.strip_prefix(':') {
+                Some(rest) => (true, rest),
+                None => (false, cell.as_str()),
+            };
+            let (right, dashes) = match rest.strip_suffix(':') {
+                Some(dashes) => (true, dashes),
+                None => (false, rest),
+            };
+            if dashes.is_empty() || !dashes.chars().all(|ch| ch == '-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => Align::Center,
+                (true, false) => Align::Left,
+                (false, true) => Align::Right,
+                (false, false) => Align::None,
+            })
+        })
+        .collect()
 }
 
 /// Splits the text above a cell at its last heading: (what comes before the
@@ -974,6 +1181,115 @@ mod tests {
         let md = "  ```shell\n  date\n  ```\n";
         let doc = Document::parse(md);
         assert_eq!(doc.cells[0].command, "date");
+    }
+
+    fn text(text: &str) -> ParagraphPart {
+        ParagraphPart::Text(text.to_string())
+    }
+
+    fn strings(cells: &[&str]) -> Vec<String> {
+        cells.iter().map(|cell| cell.to_string()).collect()
+    }
+
+    #[test]
+    fn a_pipe_table_is_split_out_of_its_paragraph() {
+        let parts = split_tables(
+            "Dry run:\n| Kind | Pages |\n|---|--:|\n| MEDIUM | 1,576 |\n| RAW |\n| TRIAL | 600 | extra |\nChecked.",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                text("Dry run:"),
+                ParagraphPart::Table(Table {
+                    header: strings(&["Kind", "Pages"]),
+                    align: vec![Align::None, Align::Right],
+                    rows: vec![
+                        strings(&["MEDIUM", "1,576"]),
+                        strings(&["RAW", ""]),
+                        strings(&["TRIAL", "600"]),
+                    ],
+                }),
+                text("Checked."),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_without_outer_pipes_and_with_alignments_is_read() {
+        let parts = split_tables("a | b \\| c | d\n:-- | :-: | --:\n1 | 2 | 3");
+        assert_eq!(
+            parts,
+            vec![ParagraphPart::Table(Table {
+                header: strings(&["a", "b | c", "d"]),
+                align: vec![Align::Left, Align::Center, Align::Right],
+                rows: vec![strings(&["1", "2", "3"])],
+            })]
+        );
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_table_is_kept_as_written() {
+        // A pipe in a sentence, a delimiter row of the wrong width, and a lone
+        // `---` (no pipe) are not tables.
+        for paragraph in [
+            "just text\nwith | pipe",
+            "h1 | h2\n---|---|---\nx",
+            "title\n---",
+            "| a | b |\n| x | y |",
+        ] {
+            assert_eq!(split_tables(paragraph), vec![text(paragraph)]);
+        }
+    }
+
+    #[test]
+    fn a_quote_or_list_item_after_a_table_ends_it() {
+        for after in ["> note | extra", "- note | extra", "2. note | extra"] {
+            let paragraph = format!("| a | b |\n|---|---|\n| 1 | 2 |\n{after}");
+            let parts = split_tables(&paragraph);
+            assert_eq!(parts.len(), 2, "{after}");
+            assert!(matches!(&parts[0], ParagraphPart::Table(table) if table.rows.len() == 1));
+            assert_eq!(parts[1], text(after));
+        }
+    }
+
+    #[test]
+    fn a_delimiter_cell_takes_at_most_one_colon_a_side() {
+        let paragraph = "| a | b |\n|::---|---|";
+        assert_eq!(split_tables(paragraph), vec![text(paragraph)]);
+    }
+
+    #[test]
+    fn a_table_too_big_once_padded_is_kept_as_text() {
+        let header = format!("|{}", " h |".repeat(1000));
+        let delimiter = format!("|{}", "---|".repeat(1000));
+        let rows = "| x |\n".repeat(30);
+        let paragraph = format!("{header}\n{delimiter}\n{rows}after");
+        assert_eq!(split_tables(&paragraph), vec![text(&paragraph)]);
+    }
+
+    #[test]
+    fn a_rule_right_under_a_table_does_not_make_it_a_heading() {
+        let doc =
+            Document::parse("| a | b |\n|---|---|\n| 1 | 2 |\n---\nNext.\n\n```shell\nls\n```\n");
+        let cell = &doc.cells[0];
+        assert_eq!(cell.heading, None);
+        assert_eq!(cell.notes.len(), 2);
+        assert!(matches!(
+            &split_tables(&cell.notes[0])[..],
+            [ParagraphPart::Table(_)]
+        ));
+        assert_eq!(cell.notes[1], "Next.");
+    }
+
+    #[test]
+    fn a_read_prose_paragraph_holding_a_table_splits_into_text_and_table() {
+        let doc = Document::parse("Intro:\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```shell\nls\n```\n");
+        let notes = &doc.cells[0].notes;
+        assert_eq!(notes.len(), 1);
+        let parts = split_tables(&notes[0]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], text("Intro:"));
+        assert!(matches!(&parts[1], ParagraphPart::Table(table) if table.rows.len() == 1));
     }
 
     fn heading(level: u8, text: &str) -> Prose {

@@ -230,8 +230,10 @@ so that a cell can be read with the explanation written for it:
 - Anything before that heading -- the document's title and introduction, say --
   is shown above the cell, and the text after the last cell below it.
 
-Only headings and paragraphs are shown, as written (inline Markdown is not
-rendered). Other code blocks, HTML comments, result blocks and front matter are
+Only headings, paragraphs and pipe tables are shown. Paragraphs are shown as
+written (inline Markdown is not rendered); the GUI draws pipe tables
+(`| a | b |` over `|---|---|`) as tables, while the TUI shows their lines as
+written. Other code blocks, HTML comments, result blocks and front matter are
 left out. This is for display only; it plays no part in running or writing back.
 
 ### Results
