@@ -167,6 +167,13 @@ function setBusy(value) {
  */
 function render(doc) {
   const scrollTop = cellsEl.scrollTop
+  // Tables scroll sideways on their own, and are rebuilt with everything else.
+  // Their offsets are put back in document order, so that a run finishing
+  // elsewhere does not throw a wide table back to its left edge.
+  const tableScrolls = Array.from(
+    cellsEl.querySelectorAll('.table-scroll'),
+    (box) => box.scrollLeft,
+  )
   pathEl.textContent = doc.path
   pathEl.title = doc.path
   cellsEl.replaceChildren()
@@ -177,6 +184,7 @@ function render(doc) {
     empty.textContent = 'No shell / sh / bash / zsh code block found.'
     cellsEl.append(empty)
     appendProse(doc.epilogue)
+    restoreTableScrolls(tableScrolls)
     // The text can be long enough to scroll now, so keep the reader's place
     // the same way as below.
     cellsEl.scrollTop = scrollTop
@@ -189,6 +197,7 @@ function render(doc) {
     cellsEl.append(renderCell(cell))
   }
   appendProse(doc.epilogue)
+  restoreTableScrolls(tableScrolls)
   // A result appearing or disappearing changes the height, so the old offset can
   // be past the new end. Assigning it is enough: the browser clamps it to what
   // the list can now scroll, which keeps the top of the view as close to where
@@ -203,6 +212,13 @@ function render(doc) {
   scheduleFind(null)
 }
 
+/** Puts back the sideways offsets `render` took from the tables, in order. */
+function restoreTableScrolls(offsets) {
+  cellsEl.querySelectorAll('.table-scroll').forEach((box, at) => {
+    box.scrollLeft = offsets[at] ?? 0
+  })
+}
+
 /**
  * Appends the text written between cells -- headings and paragraphs, as the
  * backend read them (`ProseView`) -- outside the cells. Nothing is appended when
@@ -210,6 +226,8 @@ function render(doc) {
  *
  * The text is shown as written, inline Markdown and all, and set with
  * `textContent` like everything else here: it is the document's text, not HTML.
+ * Pipe tables are the one exception to "as written": they are drawn as tables
+ * (`appendParagraph`).
  */
 function appendProse(blocks) {
   if (!Array.isArray(blocks) || blocks.length === 0) {
@@ -219,13 +237,65 @@ function appendProse(blocks) {
   prose.className = 'prose'
   for (const block of blocks) {
     const level = Number(block.level)
-    const element = document.createElement(
-      level >= 1 && level <= 6 ? `h${level}` : 'p',
-    )
-    element.textContent = block.text
-    prose.append(element)
+    if (level >= 1 && level <= 6) {
+      const heading = document.createElement(`h${level}`)
+      heading.textContent = block.text
+      prose.append(heading)
+    } else {
+      appendParagraph(prose, block)
+    }
   }
   cellsEl.append(prose)
+}
+
+/**
+ * Appends a paragraph or table block (`ProseView` with level 0) to `parent`.
+ * Which lines form a table is decided by the backend (`split_tables` in the
+ * core); this only draws what it was given.
+ */
+function appendParagraph(parent, block) {
+  if (block.table) {
+    parent.append(buildTable(block.table))
+    return
+  }
+  const paragraph = document.createElement('p')
+  paragraph.textContent = block.text
+  parent.append(paragraph)
+}
+
+/**
+ * The `<table>` for a table block (`TableView`), in a box that scrolls sideways
+ * when the table is wider than the window, so that a wide table does not widen
+ * the page.
+ */
+function buildTable({ header, align, rows }) {
+  const fill = (row, tag) => {
+    const tr = document.createElement('tr')
+    row.forEach((text, column) => {
+      const cell = document.createElement(tag)
+      cell.textContent = text
+      if (align[column]) {
+        cell.style.textAlign = align[column]
+      }
+      tr.append(cell)
+    })
+    return tr
+  }
+  const table = document.createElement('table')
+  const thead = document.createElement('thead')
+  thead.append(fill(header, 'th'))
+  table.append(thead)
+  if (rows.length > 0) {
+    const tbody = document.createElement('tbody')
+    for (const row of rows) {
+      tbody.append(fill(row, 'td'))
+    }
+    table.append(tbody)
+  }
+  const scroll = document.createElement('div')
+  scroll.className = 'table-scroll'
+  scroll.append(table)
+  return scroll
 }
 
 function renderCell(cell) {
@@ -317,9 +387,7 @@ function renderCell(cell) {
     const notes = document.createElement('div')
     notes.className = 'notes'
     for (const note of cell.notes) {
-      const paragraph = document.createElement('p')
-      paragraph.textContent = note
-      notes.append(paragraph)
+      appendParagraph(notes, note)
     }
     section.append(notes)
   }

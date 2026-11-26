@@ -376,6 +376,20 @@ assembles them (in line with the policy of not adding GUI-specific parsing).
 - Skipped: code fences (including fences inside result blocks), HTML comments (including markers; ones starting or ending mid-line are also removed by `strip_comments`, raised by Codex CLI. However, a `<!--` inside a code span or escaped is not treated as the start of a comment (`comment_open`, raised in Codex PR review — merely quoting the delimiter in prose would otherwise make everything after it disappear. Code spans spanning multiple lines are not tracked)),
   thematic breaks, and a leading YAML front matter. Headings are ATX and setext. Inline Markdown is
   shown as-is without rendering (the GUI uses `textContent`).
+- **Pipe tables are split out of paragraphs by the core's `parse::split_tables`** (CYBERNEURA-DEV-1378).
+  `read_prose` leaves a table inside the paragraph it sits in (tables are often written with no blank line
+  above them), and `split_tables` is a second pass over a paragraph: a line with `|` followed by a delimiter
+  row of the same width starts a table, and every following line with `|` is a row (padded / cut to the
+  header's width, as GitHub does). A delimiter row needs a `|`, so a lone `---` stays a setext heading / rule.
+  Raised by Codex CLI and handled: a quote / list item line ends the table (`starts_block`); `---` right
+  under a table is a rule, not a setext underline that would turn the table into a heading (`ends_in_table`
+  in `read_prose`); a delimiter cell takes at most one colon a side; a table over `MAX_TABLE_CELLS` (20,000)
+  cells once padded stays text; the GUI keeps each table's sideways scroll across re-renders
+  (`restoreTableScrolls`, by document order).
+  The GUI's `ProseView` carries the result as `table` (`TableView`; paragraphs have no `table` key), and
+  `notes` became `Vec<ProseView>` for the same reason. The front end only draws it (`appendParagraph` /
+  `buildTable`, `textContent` per cell, inline Markdown in cells as written). The TUI and `--list` show the
+  lines as written.
 - It is not included in the GUI's find (Cmd+F) targets (find assumes its keys are `pre` elements inside `section.cell`).
 - The TUI does not wrap prose (it is cut off at the screen width, like commands and results).
 - **In the TUI, PageUp / PageDown can scroll away from the selected cell** (`App::follow_selection`,

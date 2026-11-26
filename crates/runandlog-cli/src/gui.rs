@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError, mpsc};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use runandlog_core::{Canceller, Prose, highlight};
+use runandlog_core::{Canceller, ParagraphPart, Prose, highlight, split_tables};
 
 use crate::session::Session;
 
@@ -79,32 +79,75 @@ struct CellView {
     /// The text before that heading, shown above the cell (`Cell::context`).
     context: Vec<ProseView>,
     /// The paragraphs right above the command, shown under the head
-    /// (`Cell::notes`).
-    notes: Vec<String>,
+    /// (`Cell::notes`), with their tables split out (`paragraph_views`).
+    notes: Vec<ProseView>,
 }
 
-/// A heading or paragraph of the text between cells (`runandlog_core::Prose`).
+/// A heading, paragraph or table of the text between cells
+/// (`runandlog_core::Prose`).
 ///
-/// `level` is 0 for a paragraph and 1 to 6 for a heading.
+/// `level` is 0 for a paragraph or table and 1 to 6 for a heading. A table has
+/// empty `text` and its cells in `table`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ProseView {
     level: u8,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table: Option<TableView>,
 }
 
-impl From<&Prose> for ProseView {
-    fn from(block: &Prose) -> ProseView {
-        match block {
-            Prose::Heading { level, text } => ProseView {
-                level: *level,
-                text: text.clone(),
-            },
-            Prose::Paragraph(text) => ProseView {
-                level: 0,
-                text: text.clone(),
-            },
+/// A pipe table in the text (`runandlog_core::Table`). `align` holds CSS
+/// `text-align` values, "" where the column has none.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct TableView {
+    header: Vec<String>,
+    align: Vec<&'static str>,
+    rows: Vec<Vec<String>>,
+}
+
+impl ProseView {
+    fn paragraph(text: &str) -> ProseView {
+        ProseView {
+            level: 0,
+            text: text.to_string(),
+            table: None,
         }
     }
+}
+
+/// The views of the blocks between cells, paragraphs split at their tables.
+fn prose_views(blocks: &[Prose]) -> Vec<ProseView> {
+    blocks
+        .iter()
+        .flat_map(|block| match block {
+            Prose::Heading { level, text } => vec![ProseView {
+                level: *level,
+                text: text.clone(),
+                table: None,
+            }],
+            Prose::Paragraph(text) => paragraph_views(text),
+        })
+        .collect()
+}
+
+/// A paragraph as the window draws it: its plain runs and its tables, in order.
+/// Which lines are a table is decided by the core (`split_tables`), not here.
+fn paragraph_views(text: &str) -> Vec<ProseView> {
+    split_tables(text)
+        .into_iter()
+        .map(|part| match part {
+            ParagraphPart::Text(text) => ProseView::paragraph(&text),
+            ParagraphPart::Table(table) => ProseView {
+                level: 0,
+                text: String::new(),
+                table: Some(TableView {
+                    header: table.header,
+                    align: table.align.iter().map(|align| align.as_str()).collect(),
+                    rows: table.rows,
+                }),
+            },
+        })
+        .collect()
 }
 
 /// A piece of a command and what it is (`runandlog_core::TokenKind::as_str`).
@@ -378,14 +421,18 @@ fn document_view(session: &Session) -> DocumentView {
             out_file: cell.out_file.clone(),
             result: doc.result_text(cell).map(str::to_string),
             heading: cell.heading.clone(),
-            context: cell.context.iter().map(ProseView::from).collect(),
-            notes: cell.notes.clone(),
+            context: prose_views(&cell.context),
+            notes: cell
+                .notes
+                .iter()
+                .flat_map(|note| paragraph_views(note))
+                .collect(),
         })
         .collect();
     DocumentView {
         path: session.path().display().to_string(),
         cells,
-        epilogue: doc.epilogue.iter().map(ProseView::from).collect(),
+        epilogue: prose_views(&doc.epilogue),
     }
 }
 
@@ -1131,21 +1178,43 @@ mod tests {
                 ProseView {
                     level: 1,
                     text: "Deploy".to_string(),
+                    table: None,
                 },
+                ProseView::paragraph("Intro"),
+            ]
+        );
+        assert_eq!(cell.notes, vec![ProseView::paragraph("Records it.")]);
+        assert_eq!(view.epilogue, vec![ProseView::paragraph("Done.")]);
+    }
+
+    #[test]
+    fn the_view_draws_pipe_tables_as_tables() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "doc.md",
+            "Counts:\n| Kind | Rows |\n|---|--:|\n| RAW | 801 |\n\n```shell\ndate\n```\n",
+        );
+        let view = document_view(&session(&path));
+
+        assert_eq!(
+            view.cells[0].notes,
+            vec![
+                ProseView::paragraph("Counts:"),
                 ProseView {
                     level: 0,
-                    text: "Intro".to_string(),
+                    text: String::new(),
+                    table: Some(TableView {
+                        header: vec!["Kind".to_string(), "Rows".to_string()],
+                        align: vec!["", "right"],
+                        rows: vec![vec!["RAW".to_string(), "801".to_string()]],
+                    }),
                 },
             ]
         );
-        assert_eq!(cell.notes, vec!["Records it.".to_string()]);
-        assert_eq!(
-            view.epilogue,
-            vec![ProseView {
-                level: 0,
-                text: "Done.".to_string(),
-            }]
-        );
+        // A paragraph carries no `table` key at all, so the front end reads it as
+        // before.
+        let json = serde_json::to_value(&view.cells[0].notes[0]).unwrap();
+        assert!(json.get("table").is_none());
     }
 
     #[test]

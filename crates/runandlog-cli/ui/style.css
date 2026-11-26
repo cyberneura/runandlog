@@ -392,6 +392,40 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+/* Pipe tables in the prose and in a cell's notes. The box scrolls sideways so
+   that a wide table does not widen the page. */
+.table-scroll {
+  max-width: 100%;
+  margin: 0 0 6px;
+  overflow-x: auto;
+}
+
+.table-scroll table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.table-scroll th,
+.table-scroll td {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  /* break-word, not anywhere: anywhere would let the table shrink every cell to
+     a character's width instead of scrolling. */
+  overflow-wrap: break-word;
+}
+
+.table-scroll th {
+  background: var(--surface);
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.table-scroll td {
+  color: var(--muted);
+}
+
 /* Copy is pushed to the end of the head rather than placed after the last thing
    before it: a cell that writes to a file has an extra label in between, and
    without this the button would sit at a different distance from the edge
