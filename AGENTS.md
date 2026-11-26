@@ -1,670 +1,670 @@
-# Run and Log 開発メモ
+# Run and Log development notes
 
-Markdown 内のシェルコマンドを実行し、結果を同じ Markdown に書き戻すツール。
-仕様と使い方は README.md を参照。ここには開発上の判断と注意点だけを書く。
+A tool that runs the shell commands inside a Markdown file and writes the results back into the same Markdown.
+See README.md for the specification and usage. This file records only development decisions and caveats.
 
-## 言語の方針
+## Language policy
 
-public リポジトリなので、**README・コードコメント・UI 文字列・エラーメッセージはすべて英語**で書く
-(CYBERNEURA-DEV-442 での指示)。**この CLAUDE.md だけは日本語**。エージェント向けの開発メモで、
-他リポジトリでも「ユーザー向け表示は英語、開発者向けドキュメントは日本語」で揃えているため。
+This is a public repository, so **the README, code comments, UI strings, error messages, and all documentation
+(including this AGENTS.md / CLAUDE.md) are written in English** (instructed in CYBERNEURA-DEV-442; extended to
+the agent-facing development notes in CYBERNEURA-DEV-1377).
 
-例外は `parse::is_designation_head` が受け付ける `結果:`。これは UI 出力ではなく
-**入力として許容する綴り**で、日本語で書かれた Markdown を読めるようにするために残している。
+The one exception is `結果:`, accepted by `parse::is_designation_head`. It is not UI output but
+**a spelling accepted as input**, kept so that Markdown written in Japanese can be read.
 
-## 設計の要点
+## Design essentials
 
-- **コアは IO を持たない**。`runandlog-core` はパース (`parse`)・実行 (`exec`)・整形 (`render`)
-  だけを担当し、ファイルの読み書きは `runandlog` クレート (`crates/runandlog-cli/`) の `session` が行う。TUI・非対話実行・
-  将来の GUI が同じコアを共有できるようにするため。
-- **書き戻しは範囲置換だけで行う**。`parse` は結果をバイトオフセットで保持し、`splice` が
-  該当範囲を置き換える。Markdown を再構築しないので、原文の書式がそのまま残る。
-- **結果は HTML コメントのマーカーで挟む**。再実行時に前回の結果を確実に特定して
-  置き換えるため。マーカーが無いと、結果が追記され続けるか、本文を巻き込んで壊す。
-- **結果ブロックの 1 行目にセル番号を書く** (CYBERNEURA-DEV-736)。
-  `Ran result: cell 3 - <日時> (...)`。読み手 (特に AI エージェント) がセルを
-  特定できる唯一の手掛かりで、**見出しは手書きなので番号が無いこともセルと
-  1 対 1 でないこともあり、セルを挿入した時点でずれる**。実害として、エージェントが
-  見出しを 0 始まりで振ってユーザーの見ている番号と 1 ずれたまま会話が進んだ。
-  - **番号は 1 始まり**で、`--list` / `--run N` / TUI / GUI と同じ。
-    **0 始まりにしない** — 番号を口に出すのは人間で、AI の読み取り都合で
-    人間側の UI を曲げない。
-  - **ブロックの特定はマーカーだけで行う** (1 行目は見ない)。番号の無い古い
-    結果ブロックもそのまま置き換わる。回帰テストは
-    `render::tests::a_result_without_a_number_is_replaced_whole`。
-  - **書き戻しのたびに、他のセルの結果ブロックの番号も揃える**
-    (`renumber_result`、Codex レビュー指摘)。番号は位置なので、セルを 1 つ挿入すると
-    それ以降が全部ずれる。既に書かれたブロックは実行時の番号を持ったままなので、
-    **読み手に「この番号を見ろ」と言っておきながら黙って嘘になる** — この行を足した
-    目的そのものが壊れる。ファイル内で何かを 1 つ実行すれば揃う。
-  - **書き換えるのは結果ブロックの 1 行目だけで、しかも自分が書いた形に見える時だけ。**
-    マーカーの内側は runandlog のものなので番号の訂正は利用者の文章を書き換えることに
-    ならないが、手で書き換えられた行は推測せずそのまま残す。
-    **番号を新しく入れる側は `Ran result: ` の先頭一致では足りない**
-    (`Ran result: imported from CI` のような手書きも同じ始まり方をする) ので、
-    続きが `summary_line` の書くタイムスタンプの形かどうかまで見る
-    (`starts_with_timestamp`、Codex レビュー指摘)。既に `cell <数字> - ` が
-    ある側はその綴り自体が署名になるので、そこは形だけで判断してよい。
-- **stdout と stderr は 1 本のパイプで受ける** (`std::io::pipe`)。別々に読んで連結すると
-  出力の順序が壊れ、ログとして読めなくなる。
+- **The core does no IO.** `runandlog-core` is responsible only for parsing (`parse`), execution (`exec`), and formatting (`render`);
+  reading and writing files is done by `session` in the `runandlog` crate (`crates/runandlog-cli/`). This lets the TUI, non-interactive runs,
+  and the future GUI share the same core.
+- **Write-back is done only by range replacement.** `parse` keeps results as byte offsets, and `splice`
+  replaces the corresponding range. Because the Markdown is never rebuilt, the original formatting stays intact.
+- **Results are wrapped in HTML comment markers.** This lets a re-run reliably identify and replace
+  the previous result. Without markers, results would keep being appended, or the replacement would swallow and break the body text.
+- **The first line of a result block carries the cell number** (CYBERNEURA-DEV-736).
+  `Ran result: cell 3 - <date/time> (...)`. This is the only clue a reader (especially an AI agent) has to
+  identify a cell: **headings are hand-written, so they may have no number, may not map
+  1:1 to cells, and drift as soon as a cell is inserted.** In a real incident, an agent
+  numbered the headings from 0, and the conversation continued off by one from the numbers the user was looking at.
+  - **Numbers are 1-based**, the same as `--list` / `--run N` / TUI / GUI.
+    **Do not make them 0-based** — it is humans who say the numbers out loud, and we do not bend
+    the human-facing UI for the convenience of AI readers.
+  - **Blocks are identified by the markers only** (the first line is not looked at). Old result blocks
+    without a number are replaced as-is. The regression test is
+    `render::tests::a_result_without_a_number_is_replaced_whole`.
+  - **On every write-back, the numbers in the result blocks of the other cells are realigned too**
+    (`renumber_result`, raised in Codex review). The number is positional, so inserting one cell
+    shifts every cell after it. Already-written blocks keep the number they had when they ran, so
+    **we would be telling readers "look at this number" while it silently becomes a lie** — destroying
+    the very purpose of adding this line. Running any one thing in the file realigns them.
+  - **Only the first line of a result block is rewritten, and only when it looks like the form we wrote.**
+    The inside of the markers belongs to runandlog, so correcting the number is not rewriting the
+    user's prose, but a line that was edited by hand is left as-is rather than guessed at.
+    **For inserting a number where none exists, a prefix match on `Ran result: ` is not enough**
+    (hand-written lines such as `Ran result: imported from CI` start the same way), so we also check
+    that what follows has the shape of the timestamp that `summary_line` writes
+    (`starts_with_timestamp`, raised in Codex review). Where `cell <digits> - ` is already
+    present, that spelling itself is the signature, so judging by shape alone is fine there.
+- **stdout and stderr are received through a single pipe** (`std::io::pipe`). Reading them separately and
+  concatenating breaks the output order and makes it unreadable as a log.
 
-## 実装上の注意
+## Implementation caveats
 
-- `exec::run` はコマンドを専用のセッション (= 専用のプロセスグループ) で起動し、タイムアウト時はグループごと kill する。
-  シェルだけを kill すると、シェルが起動したコマンドが走り続けたうえパイプも開いたままになり、
-  出力の読み取りが終わらない。タイムアウト無しの場合はこの保護が効かないので、読み取りは
-  `DRAIN_GRACE` で打ち切って読めた分を結果とする。
-- **spawn 後に `Command` を drop してパイプの書き込み端を手放す。** `Command` は
-  `stdout` / `stderr` に渡した書き込み端を保持し続けるので、drop しないと親側にコピーが残り、
-  子が終了しても読み取りスレッドに EOF が来ない。結果、**全実行が毎回 `DRAIN_GRACE` (300ms) を
-  待たされ、報告する実行時間もその分水増しされる**。回帰を防ぐテストが
-  `exec::tests::a_fast_command_does_not_wait_for_the_drain_grace`。
-- `ExecOutcome::duration` はプロセス終了時点で確定させる。drain の待ち時間はコマンドの
-  実行時間ではないので含めない。
-- 出力の取り込みには上限がある (`ExecOptions::max_output_bytes`、既定 8 MiB)。上限を超えても
-  読み捨てるだけで読み取り自体は続ける。読むのをやめるとパイプが詰まってコマンドが止まる。
-- **`out=` や `Result:` で指定された書き出し先は信用しない。** Markdown の中身は AI エージェントが
-  書くこともある untrusted input なので、絶対パスや `..` を含む指定は `render::is_inside_dir` で
-  弾き、Markdown のあるディレクトリの外へ書けないようにしている。
-- 結果ブロックの終了マーカーを探すときはコードフェンスを読み飛ばす (`parse::find_end_marker`)。
-  コマンドの出力自体が終了マーカーと同じ行を含むと、結果ブロックの範囲を取り違えるため。
-- Markdown への書き込みは一時ファイル経由の rename (`session::write_atomically`)。
-  実行中に中断されても元ファイルが半端な状態にならないようにする。書き込み直前に
-  `refresh_before_write` でファイルを読み直し、実行中の外部編集を握り潰さないようにしている。
-- TUI の実行はワーカースレッドに投げる。同期実行にすると長いコマンドで画面が固まる。
-- **Ctrl-C はアプリが拾って明示的にプロセスグループを kill する** (`Canceller`)。コマンドを
-  専用のプロセスグループで起動している以上、端末が前面プロセスグループに送る SIGINT は
-  runandlog にしか届かない。ハンドラを入れないと、runandlog だけが死んでコマンドは生き残り、
-  ユーザーが待っていた出力ごと消える。
-  - 非対話実行 (`main::catch_interrupts`) は SIGINT / SIGTERM をハンドラで受けて**受信した
-    シグナル番号**を記録し、監視スレッドが `Canceller::cancel` を呼ぶ。**ハンドラの中では kill しない**。
-    `cancel` はロックを取るのでハンドラから呼べず、そもそもハンドラはシグナル番号しか受け取れないので
-    `Canceller` に辿り着くには static に置き直す必要がある。
-    終了コードは `128 + signo` (SIGINT なら 130、SIGTERM なら 143)。2 回目のシグナルは
-    書き戻しを待たずに `_exit`。
-  - **セルの前後で見るのはハンドラが直接書く `INTERRUPTED_BY` で、`Canceller` ではない。**
-    監視スレッドは 50ms ごとにしか起きないので、シグナル受信直後は canceller がまだ何も知らない。
-    canceller を見ると、シグナル受信済みなのに次のセルを開始してしまい、下に書いた上書きが起きる。
-    最後のセルの直後にシグナルが来た場合に終了コードが 130 / 143 にならない問題も同じ原因。
-  - **キャンセルのフラグはセルを実行する前にも見る。** 前のセルの書き戻し中に Ctrl-C が届くと、
-    次のセルを開始した直後にキャンセルされ、**出力ゼロの結果がそのセルの前回結果を潰す**。
-    誰も頼んでいない実行で結果を失うことになる。GUI の `run_all` も同じ理由で
-    `stop_requested` をセルの前に見る。
-  - TUI は raw mode で SIGINT 自体が来ないので、Ctrl-C をキーイベントとして受けて cancel する。
-    `q` / `Esc` は従来どおり「終わってから終了」。
-  - `Canceller::cancel` はフラグ→pid の順、`run` は pid→フラグの順に触る。spawn の最中に
-    cancel が来ても、どちらかが必ず相手を見るので取りこぼさない。
-  - **pid は atomic ではなく `Mutex<i32>`。** kill する側は「id を読む→kill する」の間、
-    reap する側は「reap する→id を捨てる」の間、互いを排他する必要がある。
-    読んでから kill するまでスレッドは任意の長さ止まりうるので、その間に子が reap されて
-    pid が再利用されると、**無関係なプロセスグループを kill する**。ロックを取るのは
-    20ms ごとのポーリング 1 回ぶんで、キャンセル要求のポーリング自体は AtomicBool のまま。
-    この代償として `cancel` はシグナルハンドラから呼べない (呼んでいない)。
-  - **シェルが終了してから drain (最大 300ms) が終わるまでの Stop は何も kill しない。**
-    リーダーを reap した後もプロセスグループは子孫が残っていれば存続するが、その時点では
-    「グループが消えて番号が再利用された」のか「元の子孫がまだ属している」のかを区別できない。
-    パイプを掴んだ子孫は生き残る。
-  - **キャンセルされた実行も結果を書き戻す。** 途中まで出た出力を残すのがキャンセルの目的。
+- `exec::run` starts the command in a dedicated session (= a dedicated process group) and kills the whole group on timeout.
+  Killing only the shell leaves the commands the shell started running, and the pipe stays open,
+  so reading the output never finishes. Without a timeout this protection does not apply, so reading is
+  cut off after `DRAIN_GRACE` and whatever was read becomes the result.
+- **After spawn, drop the `Command` to release the write ends of the pipe.** `Command` keeps
+  holding the write ends passed to `stdout` / `stderr`, so unless it is dropped a copy remains in the parent,
+  and the reader thread never gets EOF even after the child exits. As a result **every run waits the full
+  `DRAIN_GRACE` (300ms), and the reported duration is inflated by that much**. The test guarding against
+  regression is `exec::tests::a_fast_command_does_not_wait_for_the_drain_grace`.
+- `ExecOutcome::duration` is fixed at the moment the process exits. The drain wait is not part of the
+  command's execution time, so it is not included.
+- Output capture has a limit (`ExecOptions::max_output_bytes`, default 8 MiB). Past the limit, the output is
+  just discarded while reading continues. If we stopped reading, the pipe would fill up and the command would stall.
+- **Do not trust output destinations given by `out=` or `Result:`.** The Markdown content is untrusted input
+  that may be written by an AI agent, so specifications containing absolute paths or `..` are rejected by
+  `render::is_inside_dir`, preventing writes outside the directory containing the Markdown.
+- When searching for a result block's end marker, code fences are skipped (`parse::find_end_marker`).
+  If the command output itself contains a line identical to the end marker, the extent of the result block would otherwise be misidentified.
+- Writes to the Markdown go through a temporary file and rename (`session::write_atomically`).
+  This keeps the original file from being left half-written if interrupted mid-run. Just before writing,
+  `refresh_before_write` re-reads the file so that external edits made during the run are not silently clobbered.
+- TUI runs are handed to a worker thread. Running synchronously would freeze the screen during long commands.
+- **Ctrl-C is caught by the app, which explicitly kills the process group** (`Canceller`). Because the command
+  runs in its own process group, the SIGINT that the terminal sends to the foreground process group
+  reaches only runandlog. Without a handler, runandlog alone dies and the command survives,
+  taking with it the output the user was waiting for.
+  - Non-interactive runs (`main::catch_interrupts`) catch SIGINT / SIGTERM in a handler, record **the received
+    signal number**, and a watcher thread calls `Canceller::cancel`. **Do not kill inside the handler.**
+    `cancel` takes a lock, so it cannot be called from the handler, and the handler only receives the signal number anyway,
+    so reaching the `Canceller` would require re-homing it in a static.
+    The exit code is `128 + signo` (130 for SIGINT, 143 for SIGTERM). A second signal
+    calls `_exit` without waiting for the write-back.
+  - **What is checked before and after each cell is `INTERRUPTED_BY`, written directly by the handler, not the `Canceller`.**
+    The watcher thread wakes only every 50ms, so right after a signal arrives the canceller does not know anything yet.
+    Checking the canceller would start the next cell even though the signal has already arrived, causing the overwrite described below.
+    The problem of the exit code not becoming 130 / 143 when the signal arrives right after the last cell has the same cause.
+  - **The cancel flag is also checked before running a cell.** If Ctrl-C arrives while the previous cell is being written back,
+    the next cell would be cancelled right after it starts, and **a zero-output result would clobber that cell's previous result**.
+    Results would be lost to a run nobody asked for. The GUI's `run_all` checks
+    `stop_requested` before each cell for the same reason.
+  - The TUI is in raw mode, so SIGINT itself never arrives; Ctrl-C is received as a key event and triggers cancel.
+    `q` / `Esc` keep their existing behaviour: "quit after it finishes".
+  - `Canceller::cancel` touches the flag then the pid; `run` touches the pid then the flag. Even if
+    cancel arrives in the middle of spawn, one of them always sees the other, so nothing is missed.
+  - **The pid is a `Mutex<i32>`, not an atomic.** The killing side ("read the id → kill") and
+    the reaping side ("reap → discard the id") must exclude each other.
+    A thread can be paused for an arbitrary time between reading and killing, so if the child is reaped in between and
+    the pid is reused, **an unrelated process group gets killed**. The lock is held for one
+    poll every 20ms, while the polling for cancel requests itself stays an AtomicBool.
+    The price is that `cancel` cannot be called from a signal handler (and it is not).
+  - **A Stop between the shell exiting and the drain (up to 300ms) finishing kills nothing.**
+    After the leader is reaped, the process group survives as long as descendants remain, but at that point
+    we cannot tell whether "the group is gone and its number was reused" or "the original descendants still belong to it".
+    Descendants holding the pipe survive.
+  - **Cancelled runs also write back their results.** Keeping the output produced so far is the point of cancelling.
 
-## パスワードを求めるコマンド (askpass、CYBERNEURA-DEV-879)
+## Commands that ask for a password (askpass, CYBERNEURA-DEV-879)
 
-- **コマンドは `setsid` で新しいセッションに入れて起動する** (`exec::detach_from_terminal`)。
-  以前の `process_group(0)` だけだと、制御端末は runandlog と同じ端末のまま「前面でない
-  プロセスグループ」になるだけで、**`/dev/tty` を直接読むプログラム (sudo は stdin に関係なく
-  そうする) は SIGTTIN で停止し、キャンセルされるまで永久に待つ**。セッションを分ければ
-  制御端末が無くなり、open が ENXIO で即座に失敗する。回帰テストは
-  `exec::tests::the_command_has_no_terminal_to_wait_on` (端末付きで回さないと差が出ない。
-  `script -qec 'cargo test ...' /dev/null` で確認した)。
-  セッションリーダーはプロセスグループリーダーでもあるので、グループ kill はそのまま効く。
-- **その代わりに askpass ヘルパーを提供する** (`crates/runandlog-cli/src/askpass.rs`)。
-  ヘルパーの実体は runandlog 自身で、一時ディレクトリ (0700) に置いた
-  `runandlog-askpass` という名前の symlink 経由で起動される。`main` は **clap より前に**
-  argv[0] のファイル名を見て振り分ける (ヘルパーに渡るのはプロンプトで Markdown ではない)。
-  ヘルパーは同じディレクトリの Unix ソケットへプロンプトを送り、起動元の runandlog が
-  フロント (非対話 = `/dev/tty` に echo off で、TUI = ステータス行、GUI = ダイアログ) で聞いて返す。
-  - 設定する変数は `SUDO_ASKPASS` / `SSH_ASKPASS` / `GIT_ASKPASS` と、ソケットの場所の
-    `RUNANDLOG_ASKPASS_SOCKET`。**利用者が既に設定している askpass は上書きしない。**
-    **`SSH_ASKPASS_REQUIRE=force` だけは利用者の askpass の有無・既存の値に関わらず常に
-    付ける** (Codex レビュー指摘 2 件、`readpass.c` で確認)。`prefer` は「ディスプレイが
-    あれば」の条件を残すので macOS と SSH 越しでは効かず、`never` は端末の無いコマンドでは
-    「誰にも聞けない」にしかならない。利用者の askpass を残す時も `force` が無ければ
-    ssh はそれを呼ばない。
-  - **sudo は `DISPLAY` / `WAYLAND_DISPLAY` が無いと `-A` 無しではヘルパーを使わない**
-    (sudo の `tgetpass.c`)。macOS と SSH 越しでは `sudo -A` と書いてもらうしかない。
-    `DISPLAY` を偽装すると X に繋ぎに行くプログラムを壊すのでやらない。
-  - **端末の無い非対話実行 (cron / CI) ではヘルパーを出さない。** 出すと sudo のエラーが
-    「askpass が失敗した」になり、本当の原因 (端末も askpass も無い) が読めなくなる。
-  - **プロンプトは `gone` を `PROMPT_POLL` (100ms) ごとに見て、真になったら諦める**
-    (`Prompter` の第 2 引数)。`gone` は「ヘルパーが消えた (コマンドの終了・タイムアウト・
-    Stop)」か「`Askpass` の drop 中」。ヘルパーの生死は**ソケットの読み取りで EOF になるか**で
-    知る。そのためヘルパーはプロンプトを NUL で終端して送り、**書き込み側を閉じずに**答えを
-    待つ (listener は NUL まで読む)。心拍を書いて EPIPE を見る方式は macOS で効かない
-    (相手が閉じた後も write が成功し続け、CI の macOS 脚だけ落ちた)。非対話実行はこれに
-    `interrupt_requested` (Ctrl-C) を足す。
-  - **`Askpass` の drop はプロンプトの終了を待つ** (Codex レビュー指摘)。端末プロンプトは
-    戻るまで echo を切っているので、待たずにプロセスが終わると利用者の端末が echo off の
-    まま残る。端末設定は `RestoreTerminal` の Drop で戻す。
-    既知の穴: プロンプト中に Ctrl-C を 100ms 以内に 2 回押すと、2 回目の `_exit` が
-    復元より先に走りうる (シグナルハンドラで termios を戻す仕組みは入れていない)。
-  - **プロンプトは 1 度に 1 つ** (ソケットの accept を直列に処理する)。フロントは 1 つしか出せない。
-  - **コマンドが終わったら出ているプロンプトは捨てる** (TUI は `decline_prompts`、GUI は
-    `abandon_passwords`)。sender を drop すると helper 側は「断られた」になる。
-    **TUI は表示中のプロンプトだけでなく `password_requests` のキューに残った要求も断る**
-    (Codex レビュー指摘)。最後の tick の後に届いた要求はキューに残り、run all では次のセルが
-    即座に始まるので、次の tick がそれを次のセルの質問として表示してしまう
-    (トークンのおかげで入力は古いヘルパーに届かないが、表示が嘘になる)。
-    **TUI も GUI と同じく受付可否 (`PasswordQueue::accepting`) を送信と同じロックで持つ**
-    (Codex レビュー指摘)。listener は実行の照合をしてからロックを離して prompter を呼ぶので、
-    照合の直後に実行が終わるとドレインの後にキューへ積まれうる。実行の終了は「ロックを取って
-    閉じてからドレイン」、開始は `start_run()` の前に開く。
-    **登録時にはそのロックの下で `gone()` も見る** (TUI の `PasswordQueue::submit`、GUI の
-    `request_password`。Codex CLI 指摘)。「開いている」だけでは足りない — 要求が届く間に
-    自分の実行のキューが閉じられ次の実行のために開き直されていることがあり、開いているのは
-    次の実行のキュー。`gone()` は自分の実行が終わっていれば真になるので、それで区別する。
-    GUI はさらに **`emit` も同じロックの下で行う** (`show_password_request`)。登録と表示の間に
-    `abandon_passwords` が走ると、登録は消えているのにダイアログだけ次のセルの下に出るため。GUI の
-    フロントは `finished` と `runCell` / `runAll` の finally でダイアログを閉じる。
-    GUI は要求に id を振り、終わった要求への遅れた答えが次の要求に当たらないようにしている。
-  - **要求には実行番号が付き、進行中の実行のものしか答えない** (Codex レビュー指摘 2 件)。
-    `Session::start_run()` が run hook (`Askpass::hook`) を通して実行ごとに
-    `RUNANDLOG_ASKPASS_RUN=<n>` を環境に足し、ヘルパーはそれをプロンプトの前に 1 行で送る。
-    `start_run()` が返す `Run` の中にトークン (`RunInProgress`) が入っていて、
-    **コマンドが終わったら (書き戻しの前に) `Run` を drop する** — それで実行が終わり、
-    `current_run` が 0 に戻って以後の要求はすべて断られる。番号を進めるだけだと、
-    セル間・書き戻し中・最後のセルの後に残骸が聞いてきたとき、非対話実行 (端末) には
-    「実行中でなければ断る」ゲートが無いので答えてしまう。前のセルが背景に残したプロセスは
-    前の番号を持ったままなので、次のセルの実行中に聞いてきても断られる
-    (答えると「セル B の質問」として出て、入力がセル A の残骸に渡る)。
-    **`start_run()` は実行 1 回につき 1 回だけ呼び、`Run` はワーカー側でコマンド終了直後に
-    drop する** (TUI / GUI はワーカースレッドの中で、非対話は `run_cell_streaming` の中で)。
-    トークンの Drop は「まだ自分の実行なら」だけ 0 にする
-    (遅れて drop された古いトークンが次の実行を終わらせないため)。
-    **`current_run` は atomic でなく `Mutex<u64>`** (Codex レビュー指摘)。答えの書き込みを
-    このロックの下で行うので、「照合は通ったが書き込む前に実行が終わった」窓が無い —
-    トークンの Drop が返った時点で、その実行の答えは 1 つも送信中でない。書き込みには
-    タイムアウト (`PROMPT_POLL`) があるので、読まなくなったヘルパーがロックを長く握ることもない。
-    到着時の照合だけでは「照合の直後に実行が終わる」競合を塞げない (Codex CLI 指摘) ので、
-    `gone` にも番号の照合を入れて出ているプロンプトを下ろし、答えを返す直前にもう一度照合する。
-    残る穴は、下ろされたプロンプトがフロント (TUI の `password` / GUI のダイアログ) に
-    表示されたまま残ること — 入力はどこにも届かず、そのセルの終了で消える。
-  - **実行中でない時に来た要求は即座に断る** (コマンドが背景に残した子プロセス等)。
-    どのセルの質問か示せないため。GUI は受付可否 (`Passwords::accepting`) を要求の
-    登録と**同じロック**で持つ (Codex レビュー指摘。`busy` を見てから登録すると、その間に
-    `abandon_passwords` が走って終わった実行の要求が残る。`busy` は書き戻し中やセル間も
-    真なので「実行中」の判定にもならない)。
-  - **GUI はフロントの購読が成功してから受け付ける** (`listen_for_passwords`、Codex レビュー
-    指摘)。購読に失敗した縮退モードでは要求を出しても誰も見ないので、即座に断る。
-  - 答えは出力にも Markdown にも入らない。コマンドの stdout に出るのはヘルパーの
-    stdout で、それは sudo 等が読むパイプであって runandlog が取り込むパイプではない。
-- `y/N` の確認や全画面エディタのような「パスワード以外の端末入力」は対象外。pty で走らせて
-  入力を中継する案もあったが、「stdout と stderr を 1 本のパイプで受ける」設計と、
-  出力に制御シーケンスや `\r\n` が混ざることの影響が大きいので採っていない。
+- **Commands are started in a new session via `setsid`** (`exec::detach_from_terminal`).
+  With only the previous `process_group(0)`, the controlling terminal stayed the same as runandlog's and the command merely became
+  a "non-foreground process group", so **programs that read `/dev/tty` directly (sudo does so regardless
+  of stdin) were stopped by SIGTTIN and waited forever until cancelled**. With a separate session there is
+  no controlling terminal, and the open fails immediately with ENXIO. The regression test is
+  `exec::tests::the_command_has_no_terminal_to_wait_on` (it makes no difference unless run with a terminal;
+  verified with `script -qec 'cargo test ...' /dev/null`).
+  A session leader is also a process group leader, so killing the group still works.
+- **Instead, an askpass helper is provided** (`crates/runandlog-cli/src/askpass.rs`).
+  The helper is runandlog itself, started through a symlink named `runandlog-askpass`
+  placed in a temporary directory (0700). `main` dispatches on the file name of argv[0]
+  **before clap** (what the helper receives is a prompt, not Markdown).
+  The helper sends the prompt to a Unix socket in the same directory, and the runandlog that started the command
+  asks through its front end (non-interactive = `/dev/tty` with echo off, TUI = status line, GUI = dialog) and returns the answer.
+  - The variables set are `SUDO_ASKPASS` / `SSH_ASKPASS` / `GIT_ASKPASS`, plus
+    `RUNANDLOG_ASKPASS_SOCKET` for the socket location. **An askpass the user has already set is not overwritten.**
+    **Only `SSH_ASKPASS_REQUIRE=force` is always set, regardless of whether the user has an askpass
+    or an existing value** (two Codex review findings, confirmed in `readpass.c`). `prefer` keeps the
+    "if there is a display" condition, so it has no effect on macOS or over SSH, and `never` just means
+    "nobody can be asked" for a command without a terminal. Even when the user's askpass is kept,
+    ssh will not call it without `force`.
+  - **sudo does not use the helper without `-A` unless `DISPLAY` / `WAYLAND_DISPLAY` is set**
+    (sudo's `tgetpass.c`). On macOS and over SSH the user has no choice but to write `sudo -A`.
+    Faking `DISPLAY` would break programs that try to connect to X, so we do not do it.
+  - **The helper is not offered in non-interactive runs without a terminal (cron / CI).** Offering it would turn sudo's error into
+    "askpass failed", hiding the real cause (there is neither a terminal nor an askpass).
+  - **The prompt checks `gone` every `PROMPT_POLL` (100ms) and gives up once it is true**
+    (the second argument of `Prompter`). `gone` means "the helper has disappeared (the command finished, timed out,
+    or was Stopped)" or "the `Askpass` is being dropped". Whether the helper is alive is detected by
+    **whether reading the socket hits EOF**. For that, the helper sends the prompt terminated by NUL and waits for the answer
+    **without closing its write side** (the listener reads up to the NUL). Writing heartbeats and watching for EPIPE does not work on macOS
+    (writes keep succeeding after the peer has closed; only the macOS leg of CI failed). Non-interactive runs additionally
+    check `interrupt_requested` (Ctrl-C).
+  - **Dropping `Askpass` waits for the prompt to finish** (raised in Codex review). A terminal prompt keeps echo off
+    until it returns, so if the process exited without waiting, the user's terminal would be left with echo off.
+    Terminal settings are restored by the Drop of `RestoreTerminal`.
+    Known hole: pressing Ctrl-C twice within 100ms during a prompt can make the second `_exit`
+    run before the restore (there is no mechanism to restore termios from the signal handler).
+  - **One prompt at a time** (socket accepts are processed serially). The front end can show only one.
+  - **When the command finishes, any visible prompt is discarded** (`decline_prompts` in the TUI,
+    `abandon_passwords` in the GUI). Dropping the sender makes the helper side see "declined".
+    **The TUI declines not only the prompt being shown but also the requests left in the `password_requests` queue**
+    (raised in Codex review). Requests that arrive after the last tick stay in the queue, and with run all the next cell
+    starts immediately, so the next tick would display them as the next cell's question
+    (thanks to the token, the input does not reach the old helper, but the display would be a lie).
+    **Like the GUI, the TUI holds whether it is accepting (`PasswordQueue::accepting`) under the same lock as sending**
+    (raised in Codex review). The listener checks the run, releases the lock, then calls the prompter, so
+    if the run ends right after the check, a request can be queued after the drain. Ending a run means "take the lock,
+    close, then drain"; starting opens it before `start_run()`.
+    **On registration, `gone()` is also checked under that lock** (`PasswordQueue::submit` in the TUI,
+    `request_password` in the GUI; raised by Codex CLI). "It is open" is not enough — while the request is in flight,
+    its own run's queue may have been closed and reopened for the next run, in which case what is open is
+    the next run's queue. `gone()` is true once its own run has finished, which distinguishes the two.
+    The GUI additionally **performs the `emit` under the same lock** (`show_password_request`). If
+    `abandon_passwords` ran between registration and display, the registration would be gone but the dialog alone would appear under the next cell. The GUI
+    front end closes the dialog on `finished` and in the finally of `runCell` / `runAll`.
+    The GUI assigns ids to requests so that a late answer to a finished request does not hit the next one.
+  - **Requests carry a run number, and only those of the run in progress are answered** (two Codex review findings).
+    `Session::start_run()`, through a run hook (`Askpass::hook`), adds
+    `RUNANDLOG_ASKPASS_RUN=<n>` to the environment for each run, and the helper sends it as one line before the prompt.
+    The `Run` returned by `start_run()` contains a token (`RunInProgress`), and
+    **the `Run` is dropped when the command finishes (before the write-back)** — that ends the run,
+    `current_run` goes back to 0, and all later requests are declined. Merely advancing the number would mean
+    that when leftovers ask between cells, during write-back, or after the last cell, non-interactive runs (terminal)
+    would answer, because they have no "decline unless running" gate. Processes left in the background by the previous cell
+    still carry the previous number, so they are declined even if they ask while the next cell is running
+    (answering would show it as "cell B's question" and hand the input to cell A's leftovers).
+    **`start_run()` is called exactly once per run, and the `Run` is dropped on the worker side right after
+    the command finishes** (inside the worker thread for TUI / GUI, inside `run_cell_streaming` for non-interactive).
+    The token's Drop sets it to 0 only "if it is still its own run"
+    (so that an old token dropped late does not end the next run).
+    **`current_run` is a `Mutex<u64>`, not an atomic** (raised in Codex review). Answers are written
+    under this lock, so there is no window where "the check passed but the run ended before writing" —
+    by the time the token's Drop returns, none of that run's answers is in flight. Writes have a
+    timeout (`PROMPT_POLL`), so a helper that stopped reading cannot hold the lock for long.
+    Checking only on arrival cannot close the "run ends right after the check" race (raised by Codex CLI), so
+    `gone` also checks the number to take down a visible prompt, and the number is checked once more right before returning the answer.
+    The remaining hole is that a taken-down prompt may stay displayed in the front end (the TUI's `password` / the GUI's dialog)
+    — the input goes nowhere, and it disappears when that cell finishes.
+  - **Requests that arrive when nothing is running are declined immediately** (e.g. child processes a command left in the background).
+    There is no way to show which cell is asking. The GUI holds whether it is accepting (`Passwords::accepting`) under the
+    **same lock** as request registration (raised in Codex review: if it registered after checking `busy`,
+    `abandon_passwords` could run in between and leave a request from a finished run behind. `busy` is also true
+    during write-back and between cells, so it cannot serve as the "running" check either).
+  - **The GUI accepts requests only after the front end's subscription has succeeded** (`listen_for_passwords`, raised in Codex
+    review). In the degraded mode where subscription failed, nobody would see a request, so it is declined immediately.
+  - Answers go into neither the output nor the Markdown. What appears on the command's stdout is the helper's
+    stdout, which is the pipe read by sudo and the like, not the pipe captured by runandlog.
+- "Terminal input other than passwords", such as `y/N` confirmations or full-screen editors, is out of scope. Running under a pty and
+  relaying input was considered, but it was not adopted because of the conflict with the "stdout and stderr through one pipe" design
+  and the impact of control sequences and `\r\n` mixing into the output.
 
-## 既知の制約: unix 以外は未対応
+## Known limitation: non-unix platforms are not supported
 
-`exec` のプロセス管理は **unix でしか成立していない**。Windows では
-`kill_process_group` がプロセスグループを持てずシェルしか kill できないため
-**タイムアウトが効かず**、生き残った子孫がパイプを掴んだままになる。さらに
-`make_reads_interruptible` も no-op なので、その状態になると読み取りスレッドと
-パイプハンドルが子孫の寿命ぶんリークする (CYBERNEURA-DEV-442 の Codex レビューで
-指摘された)。
+The process management in `exec` **only holds up on unix**. On Windows,
+`kill_process_group` cannot have a process group and can kill only the shell, so
+**timeouts do not work**, and surviving descendants keep holding the pipe. Moreover,
+`make_reads_interruptible` is a no-op, so in that state the reader thread and the
+pipe handles leak for the lifetime of the descendants (pointed out in the Codex review for
+CYBERNEURA-DEV-442).
 
-直すには Windows 側で job object と overlapped read が要るが、**この開発環境では
-ビルドも検証もできない**ため手を付けていない。Windows を対象にするなら、まず
-その環境で検証できる CI を用意すること。
+Fixing it requires job objects and overlapped reads on the Windows side, but **this development environment can
+neither build nor verify that**, so it has not been touched. If Windows is to be targeted, first
+set up CI that can verify on that environment.
 
 ## GUI (Tauri)
 
-`--gui` で Tauri のウインドウを開く (CYBERNEURA-DEV-445 で実装)。
+`--gui` opens a Tauri window (implemented in CYBERNEURA-DEV-445).
 
-- **`runandlog-core` と `session` をそのまま使う。** パース・実行・書き戻しの経路は
-  TUI・非対話実行と完全に同じで、GUI 側には Markdown の仕様が一切無い。
-  ここを分岐させると仕様の追従が破綻するので、GUI 専用のパースを足さないこと。
-- **`gui` は cargo feature** (既定 ON)。Tauri はビルドに webkit2gtk / gtk3 を要求するため、
-  CLI / TUI だけが欲しい配布者は `--no-default-features` で外せる。外したビルドでも
-  `--gui` は受け付けて「この build に GUI は無い」と答える (clap の未知フラグにしない)。
-- **実行はブロッキングワーカーに投げる** (`tauri::async_runtime::spawn_blocking`)。
-  `runandlog_core::run` は完了までブロックするので、コマンドスレッドで直接呼ぶと
-  ウインドウがコマンドの実行時間ぶん固まる。TUI がワーカースレッドを使うのと同じ理由。
-- **`Session` のロックを `await` をまたいで持たない。** またぐと `MutexGuard` が Send でなく
-  コンパイルが通らないうえ、通ったとしても実行中ずっと画面の読み取りを止めてしまう。
-- **同時実行は 1 本に制限する** (`busy` フラグ)。同じファイルを 2 本が書き戻すと、
-  互いの書き込みを「外部編集」と見なして `refresh_before_write` が両方失敗する。
-- **reload も同じ `busy` フラグを取る** (Codex レビューで Critical として指摘)。
-  `apply_outcome` は「実行前に持っていた文書」と実際のファイルを比べて外部編集を検出するが、
-  実行中に reload するとその基準がディスクの現在値に差し替わり、**比較が通ってしまう**。
-  ガードが守ろうとしている当のものでガードが無効化され、古いコマンドの結果が
-  別のセルに書き戻されうる。回帰テストは `reloading_is_refused_while_a_command_is_running`。
-- **Stop は実行ごとに新しい `Canceller` を持たせる** (`GuiState::arm` / `stop`)。使い回すと
-  一度 Stop したフラグが立ちっぱなしになり、次のコマンドが即キャンセルされる。実行が
-  終わったら `arm(None)` で外す。遅れて届いた Stop が次のコマンドに当たらないようにするため。
-  `run_all` はキャンセルされたセルで打ち切る (`RunReport::cancelled`)。
-- **GUI の操作状態 (`busy` / `stop_requested` / `Canceller`) は 1 つの `Mutex<Operation>` で扱う。**
-  別々の atomic にすると「走っているか」「Stop を覚える」「コマンドを kill する」の間に
-  操作の終了と次の操作の開始が割り込め、**前の操作の Stop が次の操作の 1 セル目に当たる**。
-- **`Canceller` を外している間の Stop は `stop_requested` フラグで拾う。** `Canceller` は
-  コマンドが走っている間しか存在しないが、フロントは `runandlog://started` で Stop を有効にした後、
-  操作が終わるまで有効なままにする (セル間でも押せる)。`run_all` のセル間 (書き戻しの実 IO を挟む
-  ms オーダーの窓) に押された Stop は、フラグが無いとどこにも残らず、**「止めた」と表示しながら
-  バッチが走り続ける**。
-  フラグは `acquire` (操作の開始) でクリアする。
-  Stop でバッチが終わったことは `BatchReport::stopped` で返す。キャンセルされた実行が 1 つも
-  無いまま終わる場合があるため、`RunReport` からは読み取れない。
-- **フロントは `listen` の購読が終わるまでボタンを有効にしない。** Stop は
-  `runandlog://started` を受けて初めて有効になるので、購読前に実行を始められると
-  **コマンドが走っている間ずっと Stop が押せない**。購読は all-or-nothing で扱う
-  (`Promise.allSettled` → 一部でも失敗したら成功したぶんを unlisten する)。半分だけ
-  購読された状態を作らないため。
-- **購読に失敗しても縮退して開く。** capability 不足などで `listen` が拒否されたら、
-  ドキュメントを読んでボタンを有効にし、理由をステータスに出す。ここで固まらせると
-  ウインドウが何もできない箱になる。この状態では `started` が来ないので、**Stop は
-  busy に合わせて有効にする** (既定はタイムアウト無しなので、押せないと長いコマンドを
-  ウインドウから止められない)。早すぎる Stop はバックエンドが「何も走っていない」と
-  返すだけで無害。
-- **再描画のたびにセル一覧のスクロール位置を保存して戻す** (CYBERNEURA-DEV-717)。`render` は
-  `replaceChildren` で一覧を丸ごと作り直す。子が 0 個になった瞬間に一覧はスクロールできなくなり、
-  ブラウザが `scrollTop` を 0 に丸めるので、**セルを 1 つ実行するたびに読み手が文書の先頭へ
-  飛ばされていた**。結果が増減して高さが変わっても、代入した値はブラウザが可能な範囲に
-  丸めてくれる。
-- **ライブ出力の末尾へのスクロールは DOM に入れた後で行う。** 組み立て中の要素は文書に
-  属しておらず高さが 0 なので、`renderCell` の中で `scrollTop` を書いても何も起きない。
-- **実行中のセルは、ボタンの文言だけでなく見た目でも分かるようにする** (同 717)。
-  枠線のアクセント色 + 明滅するハロー (`cell-pulse`) と、セル頭の回転するリング (`spinner`)。
-  **`prefers-reduced-motion: reduce` では両方のアニメーションを止める** (色と静止したハローで
-  区別は付く)。動きは目的だが、動きが理由でウインドウを使えなくなる人がいる。
-- **中間色にはアクセントと同じ色相を少しだけ乗せる** (同 717)。素のグレーは彩度ゼロで、
-  青いアクセントの隣では画面が無効化されているように見える。彩度を上げるのは数ポイントで、
-  明度は元の関係 (ページ < カード、ヘッダー/結果は中間) を保つ。`--muted` の
-  コントラスト比は明暗どちらも 4.5:1 以上を維持すること。
-- **セル頭は状態で色を変える** (CYBERNEURA-DEV-895)。未実行は従来のまま、実行中は
-  `--head-running` (アクセントの薄い色)、実行済み (結果を持つセル。Run / Re-run の
-  ラベルと同じ判定) は `--head-done` (色相を少しだけ残したグレー) で、番号を薄くし
-  コマンドを `opacity: 0.5` にする。**実行済みのコマンドだけは 4.5:1 を意図的に下回る** —
-  低コントラストにすることが依頼の要件で、未実行・実行中のセルは元のコントラストを保つ。
-- **フロントは innerHTML を使わない。** コマンドとその出力は任意のテキストで、
-  HTML として流し込むとドキュメントがウインドウ内でスクリプトを実行できてしまう。
-  `textContent` と DOM 生成だけで組む。
-- **capability を置かないとコアプラグインのコマンドが拒否される** (`capabilities/default.json`)。
-  `invoke_handler` に登録した自前コマンドは capability 無しでも通るので、**`event.listen` だけが
-  静かに失敗する**。実機で開くまで気付かなかった。与えるのは `core:event:default` だけで、
-  window / webview / menu / path は使っていない。
-- ウインドウは `tauri.conf.json`、フロントの実体は `crates/runandlog-cli/ui/`
-  (素の HTML / CSS / JS。node のビルド工程を持たないので `withGlobalTauri` を有効にしている)。
-- **セルごとの Copy ボタン** (CYBERNEURA-DEV-735)。コマンドをクリップボードへ写し、
-  3 秒だけラベルがチェックに変わる。
-  - **写した状態はモジュール変数 (`copied`) に持つ。** ボタンに持たせると、書き戻しの
-    たびに来る再描画 (`render` は全セルを作り直す) でチェックが黙って消える。
-  - **ラベルの書き換えは DOM に直接行い、再描画しない。** 再描画すると、別のセルが
-    実行中だったときにそのライブ出力を捨てることになる。
-  - **Copy は busy でも無効にしない** (Run とは違う)。文書を読むだけで何も変えない。
-  - **クリップボードは `navigator.clipboard` だけを使う。** ボタン 1 つのために
-    clipboard プラグイン (Rust の依存 + capability) を足さない。どちらの webview も
-    secure origin で配信するので存在するが、拒否された場合は握り潰さずステータスに出す
-    (押しても何も起きないボタンにしない)。
-  - **`writeText` は click から同期的に呼ぶ** (await をまたがない)。WebKit
-    (macOS の WKWebView / WebKitGTK = このアプリの両ターゲット) は、押した操作が
-    user activation として生きている間しかクリップボードへの書き込みを許さない。
-    **press を直列化して前の書き込みの完了後に呼ぶ形にすると、待っている間に
-    activation が切れて `NotAllowedError` になる** (許可プロンプトが開いていると特に)。
-    一度そう書いて Codex に指摘された。同時に押された 2 つのどちらがチェックを持つかより、
-    押しても何も起きない press が出る方が悪い。
-  - **2 つの press が同時に飛んだときは「最後に応答した方」が勝つ。** クリップボードに
-    残るのはプラットフォームが最後に書いた方で、promise の解決がそれを知る唯一の手掛かり。
-    押した順で決めない (押した順と書き込まれた順は一致しない)。
-  - **`copyGeneration` は press を数えるためのものではない。** reload のときだけ進めて、
-    応答待ちの press を捨てるために使う。`forgetCopied` は**チェックが出ていなくても
-    必ず進める** — 応答待ちの press は画面に何も出していないので、進めないと reload の
-    後に生き残り、入れ替わったセルへチェックを付ける。
-  - **`reload` は `forgetCopied` を 2 回呼ぶ。** invoke の前と、応答が返って描画する
-    直前。Copy は reload 中も押せるので、**応答待ちの間に押された press は 1 回目より
-    後の世代を持つ**。2 回目が無いと、その press が入れ替わった後のセルを掴む。
-  - **グリフは U+2750 (`❐`)。** コピーらしい U+29C9 (`⧉`) や U+2398 (`⎘`) は Linux の
-    webview のフォールバックフォントに無く、豆腐になる (リモート Chrome で実測)。
-  - ボタンには `min-width` を入れてある。`✓ Copied` は `❐ Copy` より約 16px 広く、
-    右端に寄せたボタンでは押した瞬間に左端が動くのがそのまま見える。
-- **検索 (Cmd+F / Linux・Windows は Ctrl+F)** (CYBERNEURA-DEV-947)。WKWebView にはページ内検索が
-  無いので自前の検索バーを持つ。対象は各セルの `pre.command` と `pre.result` (実行中は `pre.live`)。
-  - **ハイライトは CSS Custom Highlight API (`CSS.highlights` + `::highlight()`) で塗る。**
-    `<mark>` で包むと、トークンの span を跨ぐ一致で DOM を割ることになり、全セルを作り直す
-    `render` と、チャンクごとに `textContent` を書き換える `appendLive` の両方で毎回やり直しになる。
-    Highlight API は DOM に触らないので、どちらも検索の存在を知らなくてよい。API が無い webview
-    (macOS 14.2 / Safari 17.2 未満) は塗れないだけで、件数・移動・スクロールは動く。
-  - **再検索は `scheduleFind` で次のフレームにまとめる。** `render` の後は全体、`appendLive` の後は
-    そのブロックだけ (`findAgainIn`、一致を差し替える)。ライブ出力は 20ms 刻みで来るので、
-    チャンクごとに全文書を走査しない。再検索ではスクロールしない (読んでいる場所を出力に
-    引っ張られないため)。現在の一致は (セル, command/result, 開始オフセット) のキーで引き直す。
-    **ライブ出力のオフセットは「この実行で出力された全体」の位置** (`liveDropped` を足す)。
-    末尾 20000 文字に切り詰めるたびに `live` 内のオフセットは動くため。
-    **実行が終わってライブ出力が結果に置き換わった時は、オフセットではなく「出力の末尾からの
-    文字数」で引き直す** (`restoreCurrent`、Codex PR レビュー指摘 3 件)。結果は要約行とフェンスが
-    前に付く (出力をファイルに出したセルはリンクだけになる) のでオフセットが対応しないが、出力が
-    末尾 (閉じフェンス `outputEnd` の手前) に来るのはライブ表示と同じ。ライブ側は末尾の改行を
-    数えない (`render::normalize` が落とす)。切り捨て量はブロック要素自身
-    (`data-dropped`、`liveBase`) に本文と同時に書く。`liveDropped` は終了時の再描画より先に
-    リセットされ、一致を見つけた時点の値は次の出力で古くなるため (どちらも Codex PR レビュー指摘)。**一致の数で数えない** — 一覧は 5000 件で切れるうえ、
-    結果には要約行・フェンスの一致が増える。
-  - **一致は正規表現 (`giu`) で探す。** 小文字化したコピー同士の比較は、`İ` のように長さが
-    変わる文字でオフセットがずれる。
-  - 一致は `FIND_MAX_MATCHES` (5000) で打ち切り、件数に `+` を付ける。Range は webview が
-    DOM の変更に追従させ続けるので、1 文字の検索で数十万件を作らない。
-  - **IME の変換確定の Enter は次の一致に進まない** (`isComposing` / keyCode 229)。
-  - macOS は Cmd、それ以外は Ctrl。macOS の Ctrl+F はキャレット移動なので奪わない。
-    Tauri の既定メニューは Cmd+F / Cmd+G を持たないので keydown がそのまま届く。
-    **ネイティブメニューに Find を足すなら、アクセラレータと DOM の keydown が二重に
-    発火しないようにすること** (足していない)。TUI の検索は未実装。
+- **Use `runandlog-core` and `session` as they are.** The parse, run, and write-back paths are
+  exactly the same as the TUI and non-interactive runs, and the GUI side has no knowledge of the Markdown specification at all.
+  Branching here would make keeping up with the specification fall apart, so do not add GUI-specific parsing.
+- **`gui` is a cargo feature** (on by default). Tauri requires webkit2gtk / gtk3 to build, so
+  distributors who only want the CLI / TUI can drop it with `--no-default-features`. Even in builds without it,
+  `--gui` is accepted and answers "this build has no GUI" (it is not left as an unknown clap flag).
+- **Runs are handed to a blocking worker** (`tauri::async_runtime::spawn_blocking`).
+  `runandlog_core::run` blocks until completion, so calling it directly on the command thread would freeze the
+  window for as long as the command runs. Same reason the TUI uses a worker thread.
+- **Do not hold the `Session` lock across an `await`.** Holding it across makes the `MutexGuard` non-Send and
+  compilation fails, and even if it compiled, it would block reads of the screen for the whole run.
+- **Concurrent runs are limited to one** (the `busy` flag). If two runs wrote back the same file,
+  each would treat the other's write as an "external edit" and `refresh_before_write` would fail for both.
+- **Reload takes the same `busy` flag too** (flagged as Critical in Codex review).
+  `apply_outcome` detects external edits by comparing "the document held before the run" with the actual file,
+  but reloading during a run replaces that baseline with the current contents on disk, **so the comparison passes**.
+  The guard is disabled by the very thing it is meant to protect, and an old command's result could
+  be written back into a different cell. The regression test is `reloading_is_refused_while_a_command_is_running`.
+- **Stop gets a fresh `Canceller` for each run** (`GuiState::arm` / `stop`). Reusing one would
+  leave the flag set once Stop was pressed, and the next command would be cancelled immediately. When a run
+  finishes, it is removed with `arm(None)`, so that a late-arriving Stop does not hit the next command.
+  `run_all` stops at a cancelled cell (`RunReport::cancelled`).
+- **The GUI's operation state (`busy` / `stop_requested` / `Canceller`) is handled by a single `Mutex<Operation>`.**
+  With separate atomics, the end of one operation and the start of the next could slip in between "is it running",
+  "remember the Stop", and "kill the command", and **the previous operation's Stop would hit the first cell of the next operation**.
+- **A Stop while the `Canceller` is detached is caught by the `stop_requested` flag.** The `Canceller` exists
+  only while a command is running, but the front end, after enabling Stop on `runandlog://started`,
+  keeps it enabled until the operation finishes (it can be pressed between cells too). A Stop pressed between cells of `run_all` (a window
+  on the order of ms that includes the real IO of write-back) would, without the flag, be recorded nowhere, and **the batch would keep running
+  while showing "stopped"**.
+  The flag is cleared by `acquire` (the start of an operation).
+  That the batch ended due to Stop is returned in `BatchReport::stopped`. It can end without a single
+  cancelled run, so it cannot be read from `RunReport`.
+- **The front end does not enable buttons until the `listen` subscription has completed.** Stop becomes
+  enabled only upon receiving `runandlog://started`, so if a run could start before subscribing,
+  **Stop could not be pressed for the whole time the command runs**. Subscription is all-or-nothing
+  (`Promise.allSettled` → if any part fails, unlisten the ones that succeeded), so that a half-subscribed
+  state is never created.
+- **Even if subscription fails, open in degraded mode.** If `listen` is refused, e.g. for lack of a capability,
+  read the document, enable the buttons, and show the reason in the status. Freezing here would turn
+  the window into a box that can do nothing. In this state `started` never arrives, so **Stop is
+  enabled to follow busy** (the default is no timeout, so if it could not be pressed, a long command could not be
+  stopped from the window). A premature Stop is harmless — the backend just answers
+  "nothing is running".
+- **On every re-render, save and restore the scroll position of the cell list** (CYBERNEURA-DEV-717). `render`
+  rebuilds the whole list with `replaceChildren`. The moment it has zero children the list can no longer scroll,
+  and the browser clamps `scrollTop` to 0, so **every time a cell was run the reader was thrown back to the top of
+  the document**. Even when results grow or shrink and the height changes, the browser clamps the assigned value
+  to the possible range.
+- **Scrolling live output to the end is done after inserting it into the DOM.** An element under construction
+  does not belong to the document and has zero height, so writing `scrollTop` inside `renderCell` does nothing.
+- **A running cell is made recognisable visually, not just by the button label** (same 717).
+  Accent-coloured border + a pulsing halo (`cell-pulse`), and a spinning ring at the cell head (`spinner`).
+  **With `prefers-reduced-motion: reduce`, both animations are stopped** (the colour and a static halo still
+  distinguish it). Motion is the point, but some people cannot use the window because of motion.
+- **Neutral colours get a slight tint of the accent hue** (same 717). Plain grey has zero saturation and,
+  next to a blue accent, makes the screen look disabled. Saturation is raised by only a few points, and
+  lightness keeps the original relationships (page < card, header/result in between). Keep the contrast ratio of
+  `--muted` at 4.5:1 or more in both light and dark.
+- **The cell head changes colour by state** (CYBERNEURA-DEV-895). Not yet run: unchanged; running:
+  `--head-running` (a light accent colour); run (a cell that has a result — the same check as the Run / Re-run
+  label): `--head-done` (grey with a little hue left), with a faded number and
+  the command at `opacity: 0.5`. **Only the commands of run cells intentionally fall below 4.5:1** —
+  low contrast is a requirement of the request; cells that are not yet run or are running keep their original contrast.
+- **The front end does not use innerHTML.** Commands and their output are arbitrary text, and
+  injecting them as HTML would let a document run scripts inside the window.
+  Build everything with `textContent` and DOM creation only.
+- **Without a capability, core plugin commands are refused** (`capabilities/default.json`).
+  Our own commands registered with `invoke_handler` pass without a capability, so **only `event.listen`
+  fails silently**. This went unnoticed until the app was opened on a real machine. Only `core:event:default` is granted;
+  window / webview / menu / path are not used.
+- The window is defined in `tauri.conf.json`, and the front end lives in `crates/runandlog-cli/ui/`
+  (plain HTML / CSS / JS. There is no node build step, so `withGlobalTauri` is enabled).
+- **Per-cell Copy button** (CYBERNEURA-DEV-735). Copies the command to the clipboard, and
+  the label changes to a check mark for 3 seconds.
+  - **The copied state is kept in a module variable (`copied`).** If kept on the button, the check would
+    silently disappear on the re-render that comes with every write-back (`render` rebuilds every cell).
+  - **The label is rewritten directly in the DOM, without re-rendering.** Re-rendering would discard
+    the live output of another cell if one was running.
+  - **Copy is not disabled while busy** (unlike Run). It only reads the document and changes nothing.
+  - **Only `navigator.clipboard` is used for the clipboard.** We do not add the clipboard plugin
+    (a Rust dependency + capability) for a single button. Both webviews serve from a
+    secure origin, so it exists, but if it is refused, the error is shown in the status rather than swallowed
+    (so it never becomes a button that does nothing when pressed).
+  - **`writeText` is called synchronously from the click** (without crossing an await). WebKit
+    (macOS's WKWebView / WebKitGTK = both targets of this app) allows clipboard writes only while the press is
+    still alive as a user activation.
+    **If presses are serialised so each call happens after the previous write completes, the activation expires
+    while waiting and the call fails with `NotAllowedError`** (especially when a permission prompt is open).
+    It was once written that way and Codex pointed it out. A press that does nothing is worse than
+    being unsure which of two simultaneous presses gets the check mark.
+  - **When two presses are in flight at once, "the one that responded last" wins.** What remains on the clipboard
+    is whatever the platform wrote last, and promise resolution is the only clue to that.
+    Do not decide by press order (press order and write order do not match).
+  - **`copyGeneration` is not for counting presses.** It advances only on reload, and is used to
+    discard presses awaiting a response. `forgetCopied` **always advances it, even when no check mark is
+    showing** — a press awaiting a response has shown nothing on screen, so if it were not advanced, it would
+    survive the reload and put a check mark on a cell that has been replaced.
+  - **`reload` calls `forgetCopied` twice**: before the invoke, and right before rendering once the response
+    returns. Copy can be pressed during reload, so **a press made while awaiting the response carries a generation
+    later than the first call**. Without the second call, that press would grab the cell after the replacement.
+  - **The glyph is U+2750 (`❐`).** More copy-like glyphs such as U+29C9 (`⧉`) and U+2398 (`⎘`) are missing from the
+    fallback fonts of the Linux webview and render as tofu (measured in remote Chrome).
+  - The button has a `min-width`. `✓ Copied` is about 16px wider than `❐ Copy`, and
+    on a right-aligned button the left edge visibly jumps the moment it is pressed.
+- **Find (Cmd+F / Ctrl+F on Linux and Windows)** (CYBERNEURA-DEV-947). WKWebView has no in-page find,
+  so we have our own find bar. It targets each cell's `pre.command` and `pre.result` (`pre.live` while running).
+  - **Highlights are painted with the CSS Custom Highlight API (`CSS.highlights` + `::highlight()`).**
+    Wrapping in `<mark>` would split the DOM for matches that span token spans, and would have to be redone every time by both
+    `render`, which rebuilds all cells, and `appendLive`, which rewrites `textContent` per chunk.
+    The Highlight API does not touch the DOM, so neither needs to know that find exists. Webviews without the API
+    (older than macOS 14.2 / Safari 17.2) just cannot paint; counting, navigation, and scrolling still work.
+  - **Re-searching is batched into the next frame by `scheduleFind`.** After `render` the whole document, after `appendLive`
+    only that block (`findAgainIn`, which swaps the matches). Live output arrives in 20ms steps, so
+    the whole document is not scanned per chunk. Re-searching does not scroll (so that the place being read is not
+    dragged along by the output). The current match is looked up again by the key (cell, command/result, start offset).
+    **Offsets in live output are positions within "everything output in this run"** (adding `liveDropped`),
+    because offsets within `live` shift every time it is truncated to the last 20000 characters.
+    **When a run finishes and the live output is replaced by the result, the match is looked up again by "the number of characters from the
+    end of the output" rather than by offset** (`restoreCurrent`, three Codex PR review findings). The result is preceded by a summary
+    line and a fence (a cell whose output went to a file becomes just a link), so offsets do not correspond, but the output
+    sitting at the end (before the closing fence `outputEnd`) is the same as in the live view. The live side does not count the trailing
+    newline (`render::normalize` drops it). The amount truncated is written onto the block element itself
+    (`data-dropped`, `liveBase`) at the same time as the text, because `liveDropped` is reset before the re-render at the end,
+    and the value at the time the match was found becomes stale with the next output (both raised in Codex PR review). **Do not count by number of matches** — the list is cut off at 5000, and
+    the result adds matches in the summary line and fences.
+  - **Matches are searched with a regular expression (`giu`).** Comparing lower-cased copies shifts offsets with characters
+    whose length changes, such as `İ`.
+  - Matches are cut off at `FIND_MAX_MATCHES` (5000), with `+` appended to the count. The webview keeps Ranges
+    tracking DOM changes, so a one-character search must not create hundreds of thousands of them.
+  - **The Enter that commits an IME conversion does not advance to the next match** (`isComposing` / keyCode 229).
+  - Cmd on macOS, Ctrl elsewhere. On macOS Ctrl+F moves the caret, so it is not taken over.
+    Tauri's default menu has no Cmd+F / Cmd+G, so the keydown arrives as-is.
+    **If Find is added to the native menu, make sure the accelerator and the DOM keydown do not both
+    fire** (it has not been added). Find in the TUI is not implemented.
 
-**Tauri のウインドウは開けないが、フロントの検証はできる。** `ui/` は素の HTML / CSS / JS
-なので、`window.__TAURI__` を `{core:{invoke}, event:{listen}}` の形でスタブしたページと
-一緒に HTTP で配り、リモート Chrome (agent-browser) に読ませれば DOM・CSS・スクロール・
-タイマーを実測できる。`agent-browser set media dark` で明暗も切り替えられる。
-**サーバーは `--bind 127.0.0.1` か LAN のアドレスで立て、検証が終わったら必ず止める。**
-Rust 側の検証 (ビルドと `cargo test`) はそれとは別に必要。実機 (macOS) で開く確認だけは
-動作確認できる環境で行うこと。
+**The Tauri window cannot be opened here, but the front end can be verified.** `ui/` is plain HTML / CSS / JS,
+so serve it over HTTP together with a page that stubs `window.__TAURI__` in the shape `{core:{invoke}, event:{listen}}`,
+and have remote Chrome (agent-browser) load it to measure DOM, CSS, scrolling, and
+timers. `agent-browser set media dark` switches between light and dark too.
+**Bind the server with `--bind 127.0.0.1` or a LAN address, and always stop it when verification is done.**
+Rust-side verification (build and `cargo test`) is still needed separately. Only the check of opening it on a real machine (macOS)
+must be done in an environment where it can actually run.
 
-## セルの周りの文章の表示 (CYBERNEURA-DEV-1047)
+## Showing the prose around cells (CYBERNEURA-DEV-1047)
 
-見出しや段落を TUI / GUI / `--list` に出す。**解析はコアの `parse::read_prose` だけで行い**、
-GUI は `CellView::heading` / `context` / `notes` と `DocumentView::epilogue` を受け取って
-組むだけ (GUI 専用のパースを足さない方針どおり)。
+Headings and paragraphs are shown in the TUI / GUI / `--list`. **Parsing is done only by the core's `parse::read_prose`**;
+the GUI just receives `CellView::heading` / `context` / `notes` and `DocumentView::epilogue` and
+assembles them (in line with the policy of not adding GUI-specific parsing).
 
-- **区切りは「前のセル (結果ブロック・`Result:` 段落を含む) の直後から、このセルのフェンスまで」**。
-  その範囲の最後の見出しを `heading` (セル頭に出す)、それより前を `context` (セルの外、上に出す)、
-  後ろの段落を `notes` (セルの中、コマンドの上に出す) に分ける。範囲に見出しが無ければ全部 `notes`。
-  最後のセルより後ろは `Document::epilogue`。
-- **見出しは「直前の範囲にあるもの」だけ。** 同じ見出しの下に 2 つ目のセルがあっても、
-  2 つ目には見出しを出さない (文書上もそのセルの直前に見出しは無いので)。
-- 読み飛ばすもの: コードフェンス (結果ブロック内のフェンスも)、HTML コメント (マーカー含む。行の途中から始まる・終わるものも `strip_comments` で外す。Codex CLI 指摘。ただしコードスパン内とエスケープされた `<!--` はコメントの開始と見なさない (`comment_open`、Codex PR レビュー指摘。文章中で区切りを引用しただけで以降が消えるため。複数行にまたがるコードスパンは追わない))、
-  区切り線、先頭の YAML front matter。見出しは ATX と setext。インライン Markdown は
-  レンダリングせずそのまま出す (GUI は `textContent`)。
-- GUI の検索 (Cmd+F) の対象には入れていない (検索のキーが `section.cell` 内の `pre` 前提のため)。
-- TUI は文章を折り返さない (コマンド・結果と同じく画面幅で切れる)。
-- **TUI の PageUp / PageDown は選択中のセルから離れてスクロールできる** (`App::follow_selection`、
-  Codex PR レビュー指摘)。以前は `adjust_scroll` が毎回選択中のセルの先頭へ引き戻していたので、
-  どのセルにも属さない最後の文章 (`epilogue`) に届かなかった。他のキーを押すと追従に戻る。
+- **The span is "from right after the previous cell (including its result block and `Result:` paragraph) up to this cell's fence".**
+  The last heading in that span becomes `heading` (shown at the cell head), what precedes it becomes `context` (shown outside the cell, above it),
+  and the paragraphs after it become `notes` (shown inside the cell, above the command). If the span has no heading, everything is `notes`.
+  Everything after the last cell is `Document::epilogue`.
+- **A heading is only "one in the immediately preceding span".** Even if a second cell sits under the same heading,
+  the second cell does not show the heading (in the document, too, there is no heading right before that cell).
+- Skipped: code fences (including fences inside result blocks), HTML comments (including markers; ones starting or ending mid-line are also removed by `strip_comments`, raised by Codex CLI. However, a `<!--` inside a code span or escaped is not treated as the start of a comment (`comment_open`, raised in Codex PR review — merely quoting the delimiter in prose would otherwise make everything after it disappear. Code spans spanning multiple lines are not tracked)),
+  thematic breaks, and a leading YAML front matter. Headings are ATX and setext. Inline Markdown is
+  shown as-is without rendering (the GUI uses `textContent`).
+- It is not included in the GUI's find (Cmd+F) targets (find assumes its keys are `pre` elements inside `section.cell`).
+- The TUI does not wrap prose (it is cut off at the screen width, like commands and results).
+- **In the TUI, PageUp / PageDown can scroll away from the selected cell** (`App::follow_selection`,
+  raised in Codex PR review). Previously `adjust_scroll` pulled back to the top of the selected cell every time,
+  so the final prose belonging to no cell (`epilogue`) could not be reached. Pressing any other key resumes following.
 
-## アプリアイコン
+## App icon
 
-`crates/runandlog-cli/icons/icon.png` (`tauri.conf.json` の `bundle.icon`)。
-**手で描かずに `scripts/generate-icon.py` で固定原画像を生成する** (標準ライブラリだけで動く。
-このリポジトリに画像ツールチェーンは無く、アセット 1 枚のために足す価値も無いため)。
-変更したらスクリプトを直して原画像を再生成し、`bash scripts/generate-macos-icons.sh` でサイズ別画像へ反映する。
+`crates/runandlog-cli/icons/icon.png` (`bundle.icon` in `tauri.conf.json`).
+**Do not draw it by hand; generate the fixed source image with `scripts/generate-icon.py`** (it runs on the standard library only;
+this repository has no image toolchain, and adding one for a single asset is not worth it).
+To change it, fix the script, regenerate the source image, and propagate it to the per-size images with `bash scripts/generate-macos-icons.sh`.
 
-広く使われている macOS のアイコンテンプレート (Big Sur 以降) の寸法を、スクリプトの
-定数にしてある (CYBERNEURA-DEV-519。**以前のアイコンは 64x64 の角丸なし・余白なしの
-単色正方形**で、Dock で他のアイコンより大きく・四角く見えていた):
+The dimensions of the widely used macOS icon template (Big Sur and later) are encoded as constants in the
+script (CYBERNEURA-DEV-519. **The previous icon was a 64x64 single-colour square with no rounded corners
+and no margin**, and looked bigger and squarer than other icons in the Dock):
 
-- canvas 1024x1024 に対し、**本体は 824x824 を中央に置く**。四辺に 100px (約 10%) の
-  透明な余白が残る。テンプレートに従ったアイコン同士が同じ大きさに見えるのはこの余白の
-  ぶんで、**canvas いっぱいに描くと隣のアイコンより大きく描かれる** — これが
-  「四角くて変」の正体。影やバッジが乗る場所でもある。
-- **角丸は本体の 22.5%** (185.4px)。Apple の実物は円弧ではなく連続曲率の squircle だが、
-  この半径の円弧近似がテンプレートのグリッドで、実際に見えるサイズでは見分けが付かない。
-- 上記 3 つ (canvas / 本体 / 角丸) 以外 — グラデーション・ハイライト・再生マーク — は
-  このアプリの意匠なので自由に変えてよい。
+- On a 1024x1024 canvas, **the body is 824x824, centred**. A transparent margin of 100px (about 10%)
+  remains on all four sides. Icons following the template look the same size because of this margin,
+  and **drawing to fill the canvas makes it render larger than the neighbouring icons** — that is
+  what made it look "square and odd". It is also where shadows and badges go.
+- **The corner radius is 22.5% of the body** (185.4px). Apple's real shape is a continuous-curvature squircle rather than circular arcs,
+  but circular arcs of this radius are the template's grid, and at the sizes actually seen they are indistinguishable.
+- Everything other than those three (canvas / body / corner radius) — gradient, highlight, play mark — is
+  this app's design and may be changed freely.
 
-生成後の確認は、**アルファの範囲を数えて寸法を検算する**のが確実
-(本体の範囲が 100..923 の 824x824 になっているか)。ヘッドレスなので Dock での
-見え方は確認できないが、縮小して暗い背景に合成すれば小サイズの潰れは見られる。
+After generating, the reliable check is **to count the alpha extent and verify the dimensions**
+(whether the body spans 100..923, i.e. 824x824). Running headless, the look in the Dock
+cannot be checked, but scaling down and compositing over a dark background shows whether small sizes get crushed.
 
 ## CI (GitHub Actions)
 
-`.github/workflows/test.yml` が **PR のチェックであると同時にリリースの門番**。
-`workflow_call` と `pull_request` の両方を持たせて 1 本にしてある。
+`.github/workflows/test.yml` is **both the PR check and the gatekeeper for releases**.
+It has both `workflow_call` and `pull_request`, so it is a single workflow.
 
-- **`release.yml` は `uses:` でこれを呼び、`build` を `needs: test` にしている。**
-  呼び出した再利用ワークフローの job は**呼び出し元と同じ run に入る**ので `needs` が効く。
-  同じ push で起動する別ワークフローにすると `needs` で依存させられず、テストが赤くても
-  リリースは普通に進む (方針: cyberneura-github-actions の `docs/build-requires-tests.md`)。
-- **matrix は `release.yml` の build matrix と feature まで揃える。** macOS は既定 feature
-  (GUI 込み) で、Linux は `--no-default-features`。逆にすると「配布しないコードを検査して、
-  配布するコードを検査しない」ことになる。GUI のテストは macOS の脚でだけ走る。
-- **`test` job は `needs: plan` + リリース時だけ**という条件にしてある。version を変えない
-  main への push でテストが走らないが、そこは PR 側の起動が埋める。
-- `cargo fmt --check` は OS にも feature にも依存しないので ubuntu の脚だけで走らせる。
+- **`release.yml` calls it via `uses:` and makes `build` `needs: test`.**
+  The jobs of a called reusable workflow **join the same run as the caller**, so `needs` works.
+  As a separate workflow triggered by the same push, it could not be depended on via `needs`, and the release
+  would proceed normally even with red tests (policy: `docs/build-requires-tests.md` in cyberneura-github-actions).
+- **The matrix matches `release.yml`'s build matrix down to the features.** macOS uses the default features
+  (including the GUI), and Linux uses `--no-default-features`. The other way round would "test code that is not shipped
+  and not test code that is shipped". GUI tests run only on the macOS leg.
+- **The `test` job is conditioned on `needs: plan` + release only.** Tests do not run on pushes to main
+  that do not change the version, but that gap is filled by the PR-side trigger.
+- `cargo fmt --check` depends on neither OS nor features, so it runs only on the ubuntu leg.
 
-## リリース
+## Releases
 
-**`Cargo.toml` の version を main で変えると、それがリリースになる。** ワークフローは
-**main への push すべて**と `workflow_dispatch` で起動し、**その version が既にリリース済みか
-どうか**だけで実行するか決める。`scripts/release.sh [patch|minor|major]` は
-version を書き換えて push するだけの薄いスクリプトで、手で Cargo.toml を編集して push しても同じ。
+**Changing the version in `Cargo.toml` on main makes that a release.** The workflow
+is triggered by **every push to main** and by `workflow_dispatch`, and decides whether to run solely by **whether that version has already
+been released**. `scripts/release.sh [patch|minor|major]` is a thin script that just
+rewrites the version and pushes; editing Cargo.toml by hand and pushing does the same.
 
-- **paths フィルタは付けない。** `Cargo.toml` に絞ると安く済むが、ビルドや workflow や
-  コードの不具合で失敗したリリースを「原因を直して push」で再試行できなくなる (その修正は
-  Cargo.toml を触らない)。判定は checkout と API 1 回で済むので、絞る価値より安い。
-- **判定は「diff で version が変わったか」ではなく「その version が公開済みか」。** squash /
-  rebase / 直 push で diff の形は変わるが、公開済みかどうかは変わらない。この判定にすると
-  **何度実行しても安全**になり、失敗したリリースは原因を直して push すればそのまま続きになる
-  (version を上げ直す必要が無い)。
-- **公開済み判定は 404 だけを「未公開」と読む。** rate limit や障害を未公開と読むと、公開済みの
-  version をもう一度ビルドして publish しにいく。
-- **mac は arm64 のみ、既定 feature (GUI 込み) で Developer ID 署名 + 公証。** cask は
-  quarantine を付けるので、署名も公証も無いと受け取った側の初回起動が止まる。素のバイナリは
-  staple できないのでチケットは Apple 側に残る (Gatekeeper がオンラインで引く)。**公証の結果は
-  `--output-format json` の `status` で見る** — 提出が完了しさえすれば `notarytool` は成功
-  終了しうる。
-  - **署名は build とは別の `sign` ジョブで行う。** build ジョブでは依存クレートの build script
-    がジョブの権限で動き、`$GITHUB_PATH` に書けば後続ステップの `openssl` / `security` を
-    差し替えられる (証明書とパスワードを持つステップ)。`sign` は新しいランナーで素のバイナリを
-    artifact で受け取り、cargo を一切動かさずに署名・公証し、すぐ keychain を消す。梱包は
-    `release` ジョブがリポジトリを checkout して行う。
-- **Linux は `--no-default-features`。** 既定 feature には Tauri が入り、webkit2gtk に動的
-  リンクしたバイナリは同じ webkit を持たない環境で起動しない。ただし glibc には動的リンク
-  したままなので「どの Linux でも動く」わけではない。
-- **Release は draft で作ってアセット数を数えてから公開する。** `gh release create` は先に
-  Release を作ってからアップロードするので、途中で失敗すると公開済みで中身の欠けた Release が
-  残る。**残った draft は次の実行が消して作り直す** (公開済みには触らない)。draft は
-  `/releases` の列挙で探す — **`releases/tags/{tag}` は draft を返さない** (draft に tag は
-  まだ無い) ので、tag で引くと同じ名前の draft が 2 つできる。
-- **Homebrew cask はこのリポジトリでは触らない。** `cyberneura/homebrew-tap` 側の workflow が
-  毎時、各プロジェクトの最新 Release を見て cask を更新する。各プロジェクトから tap へ push する
-  形にすると、**tap に書ける token を全プロジェクトに配る**ことになるため。
-- **crates.io はリポジトリ変数で有効化する** (`gh variable set PUBLISH_CRATES --body true`)。
-  secrets は `if:` で参照できないので変数で分岐する。`CARGO_REGISTRY_TOKEN` が要る。
-- **`runandlog` の publish は `--no-verify`。** 検証はパッケージを展開してビルドすることだが、
-  その最中に `tauri-build` が `gen/schemas/` をソースディレクトリに書くため、cargo が
-  「build script が OUT_DIR の外を書き換えた」として拒否する (v0.3.0 の publish が実際にこれで
-  落ちた)。検証を戻す先が無いので、**同じ run の build ジョブ**が同じ commit・同じ feature・
-  同じ OS でビルドしていることをもって代える。`runandlog-core` は従来どおり検証する。
-- **crates.io は sparse index (`index.crates.io`) に聞く。** cargo が解決に使うのは index で、
-  web API に出ていても index が追い付いていなければ次の crate のビルドが落ちる。公開済みの
-  version は飛ばすので、片方だけ通った後の再実行が続きから進む。
-- **crates.io に出すかは GitHub Release とは別に判定する** (plan ジョブで
-  `scripts/crate-indexed.sh` が index に聞く)。Release が出た後で publish だけ失敗しても、
-  次の push か `workflow_dispatch` で crates ジョブだけが走る。そのとき main は先へ進んでいる
-  ことがあるので、**crates ジョブはリリースタグを `release/` に checkout し**、タグの version が
-  判定した version と一致することを確かめてから publish する。判定スクリプトはワークフロー側の
-  commit のものを使う (スクリプト導入前のタグには無いため)。
-  - `release` が skipped でも走るのは「plan の時点でリリース済みだった」場合だけ。test や
-    build の失敗でも `release` は skipped になるので、`skipped` だけで許すと未リリースの
-    version が crates.io にだけ出る。
+- **No paths filter.** Restricting to `Cargo.toml` would be cheaper, but a release that failed because of a bug in the build, the workflow, or
+  the code could no longer be retried by "fix the cause and push" (that fix does not
+  touch Cargo.toml). The check costs one checkout and one API call, cheaper than what filtering would save.
+- **The check is "has that version been published", not "did the diff change the version".** Squash /
+  rebase / direct push change the shape of the diff, but not whether it has been published. With this check,
+  **running it any number of times is safe**, and a failed release resumes as soon as the cause is fixed and pushed
+  (no need to bump the version again).
+- **The published check reads only 404 as "not published".** Reading a rate limit or an outage as not published would
+  build and publish an already-published version again.
+- **mac is arm64 only, default features (including the GUI), Developer ID signed + notarized.** The cask
+  adds quarantine, so without signing and notarization the recipient's first launch is blocked. A bare binary
+  cannot be stapled, so the ticket stays on Apple's side (Gatekeeper fetches it online). **Check the notarization result
+  via `status` in `--output-format json`** — `notarytool` can exit successfully as long as the
+  submission completed.
+  - **Signing is done in a `sign` job separate from build.** In the build job, the build scripts of dependency crates
+    run with the job's permissions, and by writing to `$GITHUB_PATH` they could replace `openssl` / `security` for later
+    steps (the steps that hold the certificate and password). `sign` receives the bare binary as an artifact on a fresh runner,
+    signs and notarizes it without running cargo at all, and deletes the keychain right away. Packaging is done by the
+    `release` job, which checks out the repository.
+- **Linux uses `--no-default-features`.** The default features include Tauri, and a binary dynamically
+  linked against webkit2gtk will not start in environments without the same webkit. It is still dynamically linked
+  against glibc, though, so it does not "run on any Linux".
+- **The Release is created as a draft, and published after counting the assets.** `gh release create` creates the
+  Release first and uploads afterwards, so a failure midway leaves a published Release with missing contents.
+  **A leftover draft is deleted and recreated by the next run** (published ones are not touched). Drafts are found
+  by listing `/releases` — **`releases/tags/{tag}` does not return drafts** (a draft has no tag
+  yet), so looking up by tag would create two drafts with the same name.
+- **The Homebrew cask is not touched in this repository.** A workflow in `cyberneura/homebrew-tap`
+  checks each project's latest Release hourly and updates the cask. Having each project push to the tap
+  would mean **handing a token that can write to the tap to every project**.
+- **crates.io publishing is enabled by a repository variable** (`gh variable set PUBLISH_CRATES --body true`).
+  Secrets cannot be referenced in `if:`, so the branch is on a variable. `CARGO_REGISTRY_TOKEN` is required.
+- **`runandlog` is published with `--no-verify`.** Verification means unpacking the package and building it,
+  but during that `tauri-build` writes `gen/schemas/` into the source directory, so cargo
+  refuses with "build script modified files outside OUT_DIR" (the v0.3.0 publish actually failed
+  this way). There is nowhere to restore verification to, so it is substituted by the fact that **the build job of the same run**
+  builds the same commit with the same features on the same OS. `runandlog-core` is verified as before.
+- **crates.io is queried through the sparse index (`index.crates.io`).** cargo resolves through the index, and
+  even if a crate shows up on the web API, the build of the next crate fails if the index has not caught up. Already-published
+  versions are skipped, so a re-run after only one of them succeeded continues from where it stopped.
+- **Whether to publish to crates.io is decided separately from the GitHub Release** (in the plan job,
+  `scripts/crate-indexed.sh` asks the index). Even if only the publish fails after the Release is out,
+  the next push or a `workflow_dispatch` runs just the crates job. By then main may have moved on,
+  so **the crates job checks out the release tag into `release/`** and confirms that the tag's version matches the
+  decided version before publishing. The check script used is the one from the workflow's
+  commit (tags from before the script was introduced do not have it).
+  - It runs even when `release` is skipped only in the case "it was already released at plan time". `release` is also
+    skipped on test or build failures, so allowing it on `skipped` alone would publish an unreleased
+    version to crates.io only.
 
-## 実行中の出力のライブ表示
+## Live display of output during a run
 
-`exec::run_streaming` (CYBERNEURA-DEV-567)。`run_cancellable` に「出力が届くたびに呼ばれる
-コールバック」を足しただけのもので、`run` / `run_cancellable` はこれに委譲する。
+`exec::run_streaming` (CYBERNEURA-DEV-567). It is just `run_cancellable` plus "a callback invoked
+whenever output arrives"; `run` / `run_cancellable` delegate to it.
 
-- **コールバックは専用スレッド (`report_output`) で呼ぶ。** リーダースレッドから呼ぶと、
-  描画が遅れたぶんパイプの読み取りが止まり **パイプが詰まってコマンドが止まる**。かといって
-  ポーリングループから呼ぶと、**タイムアウトとキャンセルの検出がコールバックの後ろに並ぶ**
-  (誰も読んでいないパイプへ print するフロントエンドで実際に詰まる。Codex レビューの指摘)。
-  どちらでもない場所に置いて、遅いフロントエンドが失うのは表示の鮮度だけにしてある。
-  回帰テストは `a_front_end_that_blocks_does_not_hold_up_the_timeout`。
-  - 刻みは `POLL_INTERVAL` (20ms)。終了は done チャンネルの sender を drop して即座に起こす
-    (ポーリング待ちを実行ごとに払わないため)。
-  - **最後の 1 回だけは join 後に呼び出し側のスレッドで流す** (公開ドキュメントにも明記。
-    同時に 2 スレッドから呼ばれることは無いが、**常に同じスレッドとは限らない**ので、
-    コールバックの状態はクロージャに持たせる — thread-local に置かない)。 残りの出力と最終 `output` は同じロックで
-    1 つのスナップショットから作る (割り込まれると両者が食い違う) が、**コールバックはロックを
-    離してから呼ぶ**。DRAIN_GRACE 超過時はリーダースレッドがまだ動いており、ロックを持ったまま
-    遅いコールバックを呼ぶとリーダーが mutex で止まる = パイプが drain されなくなる。
-  - コールバックは thread に渡すので `+ Send` が要る。パニックは `resume_unwind` で
-    呼び出し側に返す (見えないスレッドで握り潰さない)。
-- **チャンクを連結すると `ExecOutcome::output` と完全に一致する。** フロントは「途中経過を
-  出す → 最後に結果を出す」を何も突き合わせずに書ける。この不変条件のために:
-  - `decode_ready` は**読み取り境界で切れた文字を保留する** (`Utf8Error::error_len() == None`)。
-    その場で U+FFFD にすると、最終出力 (`from_utf8_lossy`) には無い置換文字が途中経過にだけ現れる。
-  - 逆に**絶対に文字になれないバイトはその場で置換する**。続きを待つと表示が実行中ずっと止まる。
-  - ループの最後に、未報告のバイト (保留中の断片を含む) を lossy で 1 回流す。
-- 各フロントの使い方:
-  - **非対話実行** (`main::print_as_it_arrives`) は届いたそばから書いて**毎回明示的に
-    flush** する。stdout は端末なら行バッファ、リダイレクトならブロックバッファなので、
-    改行の無い進捗行はライブ表示の本命なのにバッファに残る。
-    **`print!` は使わない。** stdout が閉じている (`| head` 等) と panic するマクロで、
-    このコールバックは実行の内側から呼ばれるため、**結果を Markdown に書き戻す前に**
-    panic が飛び出してコマンドを走らせ損になる (Codex の PR レビュー指摘)。
-    `write_all` で書き、失敗したらその実行の残りは黙って捨てる
-    (テスト: `printing_gives_up_quietly_once_the_output_has_nowhere_to_go`)。
-  - **TUI** はワーカーから mpsc でチャンクを送り、描画スレッドが `try_recv` で拾う
-    (`collect_output`)。ロック共有にするとワーカーが描画を待ちうる。表示は
-    `live::LiveOutput` の末尾 3 行で、**行数は常に固定**。出力のたびに高さが変わると
-    下のセルが動いて読めない。
-  - **GUI** は `runandlog://output` イベント (`{index, text}`)。フロントは再描画せず
-    `pre.live` の `textContent` を直接更新する (毎秒何度も全セルを作り直さないため)。
-    `index` を必ず見て、**走っているセル以外のチャンクは捨てる** (直前の実行の最後の
-    チャンクが次のセルの下に出るのを防ぐ)。`runandlog://document` を受けた時点で
-    ライブ表示を捨てる — 結果が書き戻された後なので、残すと新しい結果が隠れる。
-- **ライブ表示は記録ではないので、どの層でも上限を持つ**: `LiveOutput` は 16KiB、
-  GUI の 1 チャンクは 64KiB、フロントの保持は 20000 文字。全量は実行終了時に Markdown へ
-  書き戻されるので、捨てても失われない。**末尾を切る時は文字を割らない**
-  (Rust は `live::tail` が char boundary、JS は下位サロゲートを 1 つ進める)。
-- **`max_output_bytes` (既定 8MiB) に達するとライブ表示も止まる。** リーダーがそこから先を
-  読み捨てるためで、`output` が伸びなくなるのと同じ理由・同じ地点。Codex の PR レビューで
-  「ライブ表示だけ末尾を流し続けるべきでは」と指摘されたが、**採らない**: 上の
-  「チャンクの連結 = 最終出力」が崩れ、結果に載らないテキストを表示することになる。
-  8MiB を超えた時点で結果自体が切り捨てられている (`truncated`)。
+- **The callback is invoked on a dedicated thread (`report_output`).** Invoking it from the reader thread would
+  stall pipe reads for as long as rendering lags, so **the pipe fills up and the command stalls**. Invoking it
+  from the polling loop instead would **queue timeout and cancel detection behind the callback**
+  (a front end printing to a pipe nobody reads actually gets stuck; pointed out in Codex review).
+  It is placed in neither, so a slow front end loses only the freshness of the display.
+  The regression test is `a_front_end_that_blocks_does_not_hold_up_the_timeout`.
+  - The tick is `POLL_INTERVAL` (20ms). Termination wakes it immediately by dropping the sender of the done channel
+    (so the polling wait is not paid on every run).
+  - **Only the final call is made on the caller's thread after join** (also stated in the public docs.
+    It is never called from two threads at once, but **it is not always the same thread**, so
+    keep the callback's state in the closure — do not put it in a thread-local). The remaining output and the final `output` are built
+    from one snapshot under the same lock (if interrupted, the two would disagree), but **the callback is invoked after
+    releasing the lock**. When DRAIN_GRACE is exceeded the reader thread is still running, and invoking a slow callback while
+    holding the lock would block the reader on the mutex = the pipe would no longer be drained.
+  - The callback is passed to a thread, so it needs `+ Send`. Panics are returned to the caller with
+    `resume_unwind` (not swallowed on an invisible thread).
+- **Concatenating the chunks exactly equals `ExecOutcome::output`.** Front ends can write "show progress →
+  show the result at the end" without reconciling anything. For this invariant:
+  - `decode_ready` **holds back characters split at a read boundary** (`Utf8Error::error_len() == None`).
+    Turning them into U+FFFD on the spot would make replacement characters appear only in the progress, not in the final output (`from_utf8_lossy`).
+  - Conversely, **bytes that can never form a character are replaced on the spot**. Waiting for more would freeze the display for the whole run.
+  - At the end of the loop, the unreported bytes (including a held-back fragment) are flushed once, lossily.
+- How each front end uses it:
+  - **Non-interactive runs** (`main::print_as_it_arrives`) write as soon as output arrives and **flush explicitly
+    every time**. stdout is line-buffered on a terminal and block-buffered when redirected, so
+    progress lines without a newline — the main thing live display is for — would stay in the buffer.
+    **Do not use `print!`.** It is a macro that panics when stdout is closed (`| head` etc.), and
+    this callback is invoked from inside the run, so the panic would escape **before the results are written back
+    to the Markdown**, wasting the command run (raised in Codex PR review).
+    Write with `write_all`, and if that fails, silently discard the rest of that run
+    (test: `printing_gives_up_quietly_once_the_output_has_nowhere_to_go`).
+  - **TUI**: the worker sends chunks over mpsc, and the render thread picks them up with `try_recv`
+    (`collect_output`). With a shared lock the worker could end up waiting on rendering. The display is the
+    last 3 lines of `live::LiveOutput`, and **the number of lines is always fixed**. If the height changed with every
+    output, the cells below would move and be unreadable.
+  - **GUI**: the `runandlog://output` event (`{index, text}`). The front end does not re-render but updates
+    `textContent` of `pre.live` directly (so as not to rebuild every cell many times per second).
+    It always checks `index` and **discards chunks for any cell other than the running one** (preventing the last
+    chunk of the previous run from appearing under the next cell). On receiving `runandlog://document`,
+    the live display is discarded — the result has been written back by then, so keeping it would hide the new result.
+- **Live display is not a record, so every layer has a cap**: `LiveOutput` is 16KiB,
+  one GUI chunk is 64KiB, and the front end keeps 20000 characters. The full output is written back to the Markdown when
+  the run ends, so nothing is lost by discarding. **When trimming the tail, do not split characters**
+  (in Rust `live::tail` respects char boundaries; in JS a low surrogate advances by one).
+- **When `max_output_bytes` (default 8MiB) is reached, the live display stops too.** This is because the reader discards everything
+  past that point — the same reason, and the same point, at which `output` stops growing. In Codex PR review it was
+  suggested that "the live display alone should keep streaming the tail", but **this is not adopted**: it would break the
+  "concatenation of chunks = final output" invariant above and display text that does not end up in the result.
+  Past 8MiB the result itself is truncated (`truncated`).
 
-## セルの色 (TUI)
+## Cell colours (TUI)
 
-「このセッションで実行が終わったセル」を色で区別する (CYBERNEURA-DEV-567)。
-待機=緑 / 実行中=黄 / 完了=青 / 失敗=赤で、完了・失敗はコマンド行も暗くする。
+"Cells whose run finished in this session" are distinguished by colour (CYBERNEURA-DEV-567).
+Waiting = green / running = yellow / done = blue / failed = red, and done and failed cells also have their command line dimmed.
 
-- **ファイルに結果が残っていることは「実行済み」ではない。** 昨日実行した文書を開いたときに
-  全セルが完了色になっては、`a` (run all) がどこまで進んだかという肝心の情報が読めない。
-  判定は `App::finished` (このセッションで実行したセルの index → 成否) だけで行う。
-- **reload では `finished` を捨てる。** 再読み込み後の index は同じセルを指すとは限らない。
+- **Having results left in the file does not mean "run".** If every cell showed the done colour when opening a document
+  that was run yesterday, the crucial information — how far `a` (run all) has progressed — would be unreadable.
+  The check uses only `App::finished` (index of a cell run in this session → success/failure).
+- **`finished` is discarded on reload.** After reloading, an index does not necessarily point to the same cell.
 
-## コマンドのシンタックスハイライト (CYBERNEURA-DEV-889)
+## Command syntax highlighting (CYBERNEURA-DEV-889)
 
-`runandlog_core::highlight` がコマンドをトークン (種類 + バイト範囲) に切り、TUI と GUI の
-両方がそれで色を付ける。
+`runandlog_core::highlight` splits a command into tokens (kind + byte range), and both the TUI and the GUI
+colour it from those.
 
-- **字句解析はコアに 1 つだけ置く。** GUI は `CellView::tokens` (種類名 + テキスト) を受け取って
-  `tok-<kind>` の span を組むだけで、JS 側にシェルの知識を持たせない。GUI 専用のパースを
-  足さない方針 (上の GUI 節) と同じ理由。
-- **パーサーではなく字句解析器で、失敗しない。** 対象は編集途中の Markdown なので、閉じていない
-  引用符・`${`・here-document も含めて**トークンは常に全文を隙間なく覆う**。この不変条件を
-  疑似乱数入力で検査するテスト (`any_text_is_covered_without_panicking`) がある。
-  フロントは連結がコマンドと一致しない時は素のテキストに戻す (色を失っても本文は失わない)。
-- 依存 (syntect / tree-sitter 等) を足さなかったのは、配布バイナリと
-  THIRD-PARTY-NOTICES を大きくしてまで欲しい精度ではないため。色分けは「どれがプログラム名か・
-  どこまでが文字列か」を拾える程度で十分。
-- **コマンド位置の判定**: 行頭・`|` `&&` `;` `(` 等の後・`then` `do` 等の予約語の後・
-  `$(` `<(` `>(` と開きバッククォートの後・`NAME=value` の後。**リダイレクト先の語は
-  コマンド位置を消費しない** (`> out.txt echo hi` の `echo` がコマンド。Codex CLI 指摘)。
-  **置換・サブシェルは `nesting` のスタックで開閉を追い、閉じたら開く前の状態に戻す**
-  (`A=$(date) env` の `env` がコマンド、`echo $(date) x` の `x` は引数。Codex CLI 指摘)。
-  here-document の本文は文字列扱い (本文の `rm -rf` をコマンド色にしないため)。
-  **`case` は `cases` のスタックで「パターン位置か分岐本体か」を追う** (`in` と `;;` の後が
-  パターン、`)` の後が本体。Codex PR レビュー指摘)。追わないと本体のコマンドが無色になり、
-  次のパターンがコマンド色になる。**パターン中の置換 (`$(printf x))`) の `)` でパターンを
-  終わらせないよう、`Case::depth` に case を開いた時の `nesting` の深さを持つ。**
-  `time -p cmd` の `-p` は `time` のオプションで、コマンド位置を消費しない (`after_time`)。
-  **`Nest` は外側の `for` / `case` の進行 (`stage` / `case_pending`) も退避・復元する**
-  (`case $(printf y) in` の `in` に届かせるため)。**算術 (`$((` / `((`) の中は括弧・`;` を
-  含めてコマンド位置にしない** (`Nest::arithmetic`。`$(( (total + 1) * 2 ))` の `total` や
-  `for ((i = 0; i < n; i++))` の `i` をコマンド色にしない。算術中の改行も同じ)。case パターン内の
-  `<(` もネストを開く。いずれも Codex PR レビュー指摘。
-  **`Nest::expression` は「中にコマンドが無い」枠の総称で、算術・`[[ ... ]]`・配列値
-  `name=(...)` がこれ**。中では `(` `&&` `;` 改行のどれもコマンド位置にしない
-  (`[[ -f a && -f b ]]` の `-f` や `items=(one two)` の `one` をコマンド色にしない)。
-- Codex の PR レビューはシェル文法の端の指摘を毎回 2 件ずつ出し続けた (6 往復)。
-  **字句解析器で bash の全文法は追わない** — 目的は読みやすさで、誤りは色 1 つで済む。
-  新しい指摘は「よく書かれる形か」で採否を決めること。
-- **既知の制約: 二重引用符の中は丸ごと文字列色** (`"$(date)"` の `date` もコマンド色に
-  ならない)。誤った色ではなく「色が付かない」だけなので見送った (Codex PR レビュー 7 件目)。
-  やるなら `double_quoted_len` と `word_len` を、引用符の中で `$(` / バッククォートの
-  ネストと内側の引用符 (`"$(echo ")")"`) を追えるように作り直す必要があり、トークンが全文を
-  覆う不変条件を壊しやすい。やる時は `any_text_is_covered_without_panicking` を必ず通すこと。
-  **語の途中で閉じた置換の後ろは同じ語の続き** (`word_continues`。`PATH=$(pwd)/bin env` の
-  `/bin` を新しい語として扱うとコマンド位置を食い、`env` が無色になる)。
-  **関数定義 (`NAME()` / `function NAME`) は名前を変数色にし、本体をコマンド位置にする**
-  (`(` をサブシェルとして読むと `{` 以降が無色になる)。どちらも Codex PR レビュー指摘。
-- **TUI は完了・失敗したセルでは色を付けない** (従来どおり単色の暗色)。色を戻すと、
-  run all の進み具合を見せるための減光が効かなくなる。
-- GUI の色は明暗それぞれ `--card` に対して 4.5:1 以上 (CSS 変数 `--tok-*`)。
+- **There is exactly one lexer, in the core.** The GUI receives `CellView::tokens` (kind name + text) and
+  just builds `tok-<kind>` spans; the JS side has no knowledge of the shell. Same reason as the policy of
+  not adding GUI-specific parsing (the GUI section above).
+- **It is a lexer, not a parser, and it never fails.** The input is Markdown in the middle of being edited, so including unclosed
+  quotes, `${`, and here-documents, **the tokens always cover the whole text with no gaps**. A test
+  checks this invariant with pseudo-random input (`any_text_is_covered_without_panicking`).
+  When the concatenation does not match the command, the front end falls back to plain text (losing colour, but never the text).
+- Dependencies (syntect / tree-sitter etc.) were not added because the accuracy is not worth enlarging the distributed binary and
+  THIRD-PARTY-NOTICES. Colouring only needs to pick out "which word is the program name and
+  where a string ends".
+- **Determining command position**: start of line; after `|` `&&` `;` `(` etc.; after reserved words such as `then` `do`;
+  after `$(` `<(` `>(` and an opening backquote; after `NAME=value`. **The word that is a redirect target does not
+  consume the command position** (in `> out.txt echo hi`, `echo` is the command; raised by Codex CLI).
+  **Substitutions and subshells are tracked open/close with the `nesting` stack, and on close the state from before the open is restored**
+  (in `A=$(date) env`, `env` is the command; in `echo $(date) x`, `x` is an argument; raised by Codex CLI).
+  The body of a here-document is treated as a string (so that `rm -rf` in the body is not coloured as a command).
+  **`case` tracks "pattern position or branch body" with the `cases` stack** (after `in` and `;;` is a
+  pattern, after `)` is the body; raised in Codex PR review). Without tracking, commands in the body would be uncoloured and
+  the next pattern would be coloured as a command. **So that the `)` of a substitution inside a pattern (`$(printf x))`) does not end
+  the pattern, `Case::depth` holds the `nesting` depth at the time the case was opened.**
+  In `time -p cmd`, `-p` is an option of `time` and does not consume the command position (`after_time`).
+  **`Nest` also saves and restores the progress of the enclosing `for` / `case` (`stage` / `case_pending`)**
+  (so that the `in` of `case $(printf y) in` is reached). **Inside arithmetic (`$((` / `((`), nothing — including parentheses and `;` —
+  becomes a command position** (`Nest::arithmetic`; so that `total` in `$(( (total + 1) * 2 ))` and
+  `i` in `for ((i = 0; i < n; i++))` are not coloured as commands. Newlines inside arithmetic likewise). `<(` inside a case pattern
+  also opens a nest. All raised in Codex PR review.
+  **`Nest::expression` is the umbrella for "contexts with no commands inside": arithmetic, `[[ ... ]]`, and array values
+  `name=(...)`**. Inside, none of `(` `&&` `;` or newline becomes a command position
+  (so that `-f` in `[[ -f a && -f b ]]` and `one` in `items=(one two)` are not coloured as commands).
+- Codex PR review kept producing two shell-grammar edge cases every round (6 rounds).
+  **The lexer does not try to follow the full bash grammar** — the goal is readability, and a mistake costs one colour.
+  Decide on new findings by "is this a commonly written form".
+- **Known limitation: everything inside double quotes is string-coloured** (`date` in `"$(date)"` is not coloured as
+  a command either). It is not a wrong colour, just "no colour", so it was deferred (Codex PR review, 7th finding).
+  Doing it would require rebuilding `double_quoted_len` and `word_len` to track nesting of `$(` / backquotes
+  and inner quotes (`"$(echo ")")"`) inside quotes, which easily breaks the invariant that tokens cover
+  the whole text. If you do it, `any_text_is_covered_without_panicking` must pass.
+  **What follows a substitution closed mid-word continues the same word** (`word_continues`; treating `/bin` in
+  `PATH=$(pwd)/bin env` as a new word would eat the command position and leave `env` uncoloured).
+  **Function definitions (`NAME()` / `function NAME`) colour the name as a variable and make the body a command position**
+  (reading `(` as a subshell would leave everything from `{` uncoloured). Both raised in Codex PR review.
+- **The TUI does not colour done or failed cells** (a single dim colour, as before). Restoring colour would
+  defeat the dimming that shows the progress of run all.
+- GUI colours are at least 4.5:1 against `--card` in both light and dark (CSS variables `--tok-*`).
 
-## ライセンス表示 (CYBERNEURA-DEV-880)
+## License notices (CYBERNEURA-DEV-880)
 
-`LICENSE` (MIT、Cyberneura) と、配布バイナリに入る crate のライセンスを並べた
-`THIRD-PARTY-NOTICES.txt` をリポジトリ直下に置いている。バイナリには両方を埋め込み、
-`runandlog --license` と GUI のメニュー (macOS はアプリメニューの About の直下、
-それ以外は Help の About の直下) の **Third-Party Licenses** で表示する。
+`LICENSE` (MIT, Cyberneura) and `THIRD-PARTY-NOTICES.txt`, which lists the licenses of the crates included in the
+distributed binary, are placed at the repository root. Both are embedded in the binary and shown by
+`runandlog --license` and by **Third-Party Licenses** in the GUI menu (on macOS directly below About in the app menu,
+elsewhere directly below About in Help).
 
-- **依存を足す・上げる時は `scripts/generate-third-party-notices.sh` を流し直して
-  コミットする。** `tests/third_party_notices.rs` が「直接依存が Cargo.lock の version で
-  載っているか」「載っている crate が全部 Cargo.lock にあるか」を見るので、忘れると
-  `cargo test` が落ちる。Dependabot の PR も notices を更新しないので、マージ前に同じ
-  ブランチで再生成する。cargo-about (`cargo install cargo-about --locked --features cli`) と
-  python3 が要る。生成には数分かかる (clearlydefined への問い合わせ)。
-- **cargo-about は 2 回走らせてマージする。** リリースは macOS (aarch64、既定 feature = GUI 込み)
-  と Linux (x86_64、`--no-default-features`) で feature まで違い、cargo-about は 1 回の実行で
-  feature を 1 組しか取れない。両ターゲットを既定 feature で 1 回に流すと、どちらの配布物にも
-  入らない GTK / WebKit の crate が載る。release.yml の build matrix を変えたらスクリプトも揃える。
-- **自分の crate (runandlog / runandlog-core) はスクリプトで除外している。** crates.io に
-  公開しているので `publish = false` を付けられず、cargo-about の `[private] ignore` が効かない。
-- **`accepted` (about.toml) を勝手に広げない。** GPL / LGPL / AGPL 系が出たら配布条件が変わるので
-  人間に確認する。
-- **埋め込みは crate 内の symlink 経由** (`crates/runandlog-cli/LICENSE` と
-  `THIRD-PARTY-NOTICES.txt` はリポジトリ直下への symlink)。crates.io に出すのは crate の
-  ディレクトリだけなので、`include_str!("../../../...")` のようにパッケージの外を指すと
-  `cargo package` 後のビルドが通らない。cargo は symlink の中身を普通のファイルとして
-  パッケージに入れる (`cargo package --list` と .crate の中身で確認済み)。
-- ライセンスのウインドウ (`ui/licenses.html`) には capability を付けていない。呼ぶのは自前の
-  `third_party_notices` コマンドだけで、それは capability 無しで通る。
-- **FILE 引数は `Option<PathBuf>` + `required_unless_present = "license"`。** clap の
-  `exclusive = true` だけでは必須の位置引数の検査を外せず、`runandlog --license` が
-  「FILE が無い」で落ちた。`exclusive` は「`--license` と他の引数の同時指定を拒否する」ために
-  残している。
+- **When adding or upgrading dependencies, re-run `scripts/generate-third-party-notices.sh` and
+  commit the result.** `tests/third_party_notices.rs` checks "are the direct dependencies listed with their Cargo.lock
+  versions" and "are all listed crates present in Cargo.lock", so forgetting this makes
+  `cargo test` fail. Dependabot PRs do not update the notices either, so regenerate on the same
+  branch before merging. Requires cargo-about (`cargo install cargo-about --locked --features cli`) and
+  python3. Generation takes a few minutes (queries to clearlydefined).
+- **cargo-about is run twice and the results merged.** Releases differ down to the features between macOS (aarch64, default features = including the GUI)
+  and Linux (x86_64, `--no-default-features`), and a single cargo-about run can only take
+  one set of features. Running both targets in one pass with the default features would list GTK / WebKit crates that
+  ship in neither distribution. If you change release.yml's build matrix, align the script too.
+- **Our own crates (runandlog / runandlog-core) are excluded by the script.** They are published to crates.io,
+  so `publish = false` cannot be set, and cargo-about's `[private] ignore` does not apply.
+- **Do not widen `accepted` (about.toml) on your own.** If GPL / LGPL / AGPL-family licenses appear, the distribution terms change, so
+  check with a human.
+- **Embedding goes through symlinks inside the crate** (`crates/runandlog-cli/LICENSE` and
+  `THIRD-PARTY-NOTICES.txt` are symlinks to the repository root). Only the crate's
+  directory is published to crates.io, so pointing outside the package, as in `include_str!("../../../...")`,
+  makes the build after `cargo package` fail. cargo packages the contents of symlinks as regular files
+  (confirmed with `cargo package --list` and the contents of the .crate).
+- The license window (`ui/licenses.html`) has no capability. It calls only our own
+  `third_party_notices` command, which passes without a capability.
+- **The FILE argument is `Option<PathBuf>` + `required_unless_present = "license"`.** clap's
+  `exclusive = true` alone cannot lift the check for a required positional argument, and `runandlog --license`
+  failed with "FILE is missing". `exclusive` is kept to "reject `--license` given together with
+  other arguments".
 
-## 未実装 / 今後
+## Not implemented / future work
 
-- GUI で完了したセルを色分けする (今のところ TUI だけの機能)。
+- Colour done cells in the GUI (currently a TUI-only feature).
 
-## 検証
+## Verification
 
 ```shell
-cargo test                  # 210 件 (linux での数。/proc を見るテストが 1 件、
-                            #          DISPLAY を見るテストが 3 件ある)
-cargo clippy --all-targets  # 警告ゼロを保つ
+cargo test                  # 210 tests (count on linux; 1 test looks at /proc,
+                            #          3 tests look at DISPLAY)
+cargo clippy --all-targets  # keep it at zero warnings
 cargo fmt --all --check
 ```
 
-手で動かす時は `examples/run-example.sh` を使う。`examples/exam.md` の使い捨てコピーを
-gitignore 下 (`examples/scratch/`) に作ってからそれを実行するので、**何回動かしても
-ワーキングツリーが汚れない**。実行は結果ファイルもドキュメントの隣に書くので、サンプルを
-直接動かしてはいけない。引数はそのまま渡る。
+To run it by hand, use `examples/run-example.sh`. It creates a throwaway copy of `examples/exam.md`
+under a gitignored directory (`examples/scratch/`) and runs that, so **however many times you run it,
+the working tree stays clean**. A run also writes result files next to the document, so never run the sample
+directly. Arguments are passed through as-is.
 
 ```shell
 examples/run-example.sh --run-all
-RUNANDLOG=./target/release/runandlog examples/run-example.sh --list  # 既存のバイナリで
+RUNANDLOG=./target/release/runandlog examples/run-example.sh --list  # with an existing binary
 ```
 
-コピーを作るだけなら `examples/create-test-copy.sh` (パスを stdout に出す)。下の pty 起動の
-ように、実行を自分で組み立てたい時に使う。
+To just create a copy, use `examples/create-test-copy.sh` (prints the path to stdout). Use it when you want to
+assemble the run yourself, as in the pty launch below.
 
-TUI は端末が必要なので自動テストの対象外。手で確認する場合は pty を割り当てて起動する。
+The TUI needs a terminal, so it is outside automated testing. To check it by hand, allocate a pty and launch it.
 
 ```shell
 DOC=$(examples/create-test-copy.sh)
-# GNU (linux)。パスは環境変数で渡して内側で quote する (パスに空白が入ると壊れるため)
+# GNU (linux). Pass the path via an environment variable and quote it inside (it breaks if the path contains spaces)
 (sleep 1; printf 'q'; sleep 1) | DOC="$DOC" script -qec 'stty rows 30 cols 100; ./target/debug/runandlog "$DOC"' /dev/null
-# BSD (macOS)。-c は無い
+# BSD (macOS). There is no -c
 (sleep 1; printf 'q'; sleep 1) | script -q /dev/null ./target/debug/runandlog "$DOC"
 ```
 
-Ctrl-C を送るなら `printf '\003'`。ただし **サンドボックス下では pty を割り当てられず
-(`script: openpty: Operation not permitted`) TUI を起動できない**ので、その場合は手で確認する。
+To send Ctrl-C, use `printf '\003'`. However, **under a sandbox a pty cannot be allocated
+(`script: openpty: Operation not permitted`) and the TUI cannot be launched**, so in that case check by hand.
 
 ## macOS app icon
 
